@@ -1,0 +1,610 @@
+package handlers
+
+import (
+	"database/sql"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/zangwp/yub-wpanel/database"
+	"github.com/zangwp/yub-wpanel/executor"
+	"github.com/zangwp/yub-wpanel/models"
+
+	"github.com/gin-gonic/gin"
+)
+
+type SecurityHandler struct{}
+
+var securitySettingsApplyMu sync.Mutex
+
+var (
+	applyFail2banSettings             = executor.ApplyFail2banSettings
+	applyRateLimitSettings            = executor.ApplyRateLimitSettings
+	ensureLogMap                      = executor.EnsureLogMap
+	regenerateAllSitesNginx           = executor.RegenerateAllSitesNginx
+	websiteIDsForCDNRealIPGroup       = executor.WebsiteIDsForCDNRealIPGroup
+	restoreCDNRealIPGroupWithBindings = executor.RestoreCDNRealIPGroupWithBindings
+)
+
+func (h *SecurityHandler) GetSettings(c *gin.Context) {
+	db := database.GetDB()
+	rows, err := db.Query("SELECT id, skey, svalue, description, updated_at FROM security_settings")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse("查询失败"))
+		return
+	}
+	defer rows.Close()
+
+	var settings []models.SecuritySetting
+	for rows.Next() {
+		var s models.SecuritySetting
+		if err := rows.Scan(&s.ID, &s.Key, &s.Value, &s.Description, &s.UpdatedAt); err != nil {
+			continue
+		}
+		if s.Key == "fail2ban_bantime" {
+			s.Value = "600"
+		}
+		settings = append(settings, s)
+	}
+	if settings == nil {
+		settings = []models.SecuritySetting{}
+	}
+
+	c.JSON(http.StatusOK, models.SuccessResponse(settings))
+}
+
+func (h *SecurityHandler) UpdateSettings(c *gin.Context) {
+	var raw map[string]interface{}
+	if err := c.ShouldBindJSON(&raw); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse("参数错误"))
+		return
+	}
+
+	db := database.GetDB()
+
+	normalized := make(map[string]string)
+	for key, val := range raw {
+		strVal, ok, err := normalizeSecuritySetting(key, val)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, models.ErrorResponse(err.Error()))
+			return
+		}
+		if !ok {
+			continue
+		}
+		normalized[key] = strVal
+	}
+
+	if err := applySecuritySettings(db, normalized); err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse(err.Error()))
+		return
+	}
+
+	c.JSON(http.StatusOK, models.SuccessResponse(gin.H{"message": "安全设置已更新"}))
+}
+
+var sqliSettingKeys = []string{
+	"wp_sqli_block_enabled", "wp_sqli_autoban_enabled",
+	"wp_sqli_ban_threshold", "wp_sqli_ban_window_seconds",
+}
+
+func hasSQLiSettings(settings map[string]string) bool {
+	for _, key := range sqliSettingKeys {
+		if _, ok := settings[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func applySecuritySettings(db *sql.DB, settings map[string]string) error {
+	if len(settings) == 0 {
+		return nil
+	}
+	securitySettingsApplyMu.Lock()
+	defer securitySettingsApplyMu.Unlock()
+
+	old := make(map[string]string, len(settings))
+	for key := range settings {
+		var value string
+		if err := db.QueryRow(`SELECT svalue FROM security_settings WHERE skey=?`, key).Scan(&value); err != nil {
+			return fmt.Errorf("读取安全设置失败")
+		}
+		old[key] = value
+	}
+	if err := writeSecuritySettings(db, settings); err != nil {
+		return fmt.Errorf("安全设置保存失败")
+	}
+	applyErr := applySecuritySettingsRuntime(settings)
+	if applyErr == nil {
+		return nil
+	}
+	if rollbackErr := writeSecuritySettings(db, old); rollbackErr != nil {
+		return fmt.Errorf("安全设置应用失败，数据库回滚失败: %v；原始错误: %v", rollbackErr, applyErr)
+	}
+	if rollbackRuntimeErr := restoreSecuritySettingsRuntime(settings); rollbackRuntimeErr != nil {
+		return fmt.Errorf("安全设置应用失败，设置已回滚但服务器配置恢复不完整: %v；原始错误: %v", rollbackRuntimeErr, applyErr)
+	}
+	return fmt.Errorf("安全设置应用失败，已恢复修改前设置: %v", applyErr)
+}
+
+func restoreSecuritySettingsRuntime(settings map[string]string) error {
+	var restoreErrors []error
+	if _, ok := settings["wp_security_log_whitelist"]; ok {
+		if err := ensureLogMap(); err != nil {
+			restoreErrors = append(restoreErrors, fmt.Errorf("Nginx 日志规则恢复失败: %w", err))
+		}
+	}
+	if hasSQLiSettings(settings) {
+		if err := regenerateAllSitesNginx(); err != nil {
+			restoreErrors = append(restoreErrors, fmt.Errorf("SQL 注入防护恢复失败: %w", err))
+		}
+	}
+	if hasSQLiSettings(settings) || needsFail2banApply(settings) {
+		if err := applyFail2banSettings(); err != nil {
+			restoreErrors = append(restoreErrors, fmt.Errorf("Fail2ban 配置恢复失败: %w", err))
+		}
+	}
+	if needsRateLimitApply(settings) {
+		if err := applyRateLimitSettings(); err != nil {
+			restoreErrors = append(restoreErrors, fmt.Errorf("Nginx 限速配置恢复失败: %w", err))
+		}
+	}
+	return errors.Join(restoreErrors...)
+}
+
+func writeSecuritySettings(db *sql.DB, settings map[string]string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	for key, value := range settings {
+		if _, err := tx.Exec(`UPDATE security_settings SET svalue=?,updated_at=CURRENT_TIMESTAMP WHERE skey=?`, value, key); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func applySecuritySettingsRuntime(settings map[string]string) error {
+	if _, ok := settings["wp_security_log_whitelist"]; ok {
+		if err := ensureLogMap(); err != nil {
+			return fmt.Errorf("Nginx 日志规则应用失败: %w", err)
+		}
+	}
+	if hasSQLiSettings(settings) {
+		if err := regenerateAllSitesNginx(); err != nil {
+			return fmt.Errorf("SQL 注入防护应用失败: %w", err)
+		}
+	}
+	if hasSQLiSettings(settings) || needsFail2banApply(settings) {
+		if err := applyFail2banSettings(); err != nil {
+			return fmt.Errorf("Fail2ban 配置应用失败: %w", err)
+		}
+	}
+	if needsRateLimitApply(settings) {
+		if err := applyRateLimitSettings(); err != nil {
+			return fmt.Errorf("Nginx 限速配置应用失败: %w", err)
+		}
+	}
+	return nil
+}
+
+func needsFail2banApply(settings map[string]string) bool {
+	for _, key := range []string{"fail2ban_maxretry", "fail2ban_findtime", "auto_whitelist_enabled", "whitelist_ips"} {
+		if _, ok := settings[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func needsRateLimitApply(settings map[string]string) bool {
+	for _, key := range []string{"rate_limit_enabled", "rate_limit_rpm", "rate_limit_burst", "bot_limit_enabled", "bot_limit_rpm", "bot_limit_burst"} {
+		if _, ok := settings[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *SecurityHandler) RefreshWhitelist(c *gin.Context) {
+	executor.GoSafe(refreshOfficialWhitelist)
+
+	c.JSON(http.StatusOK, models.SuccessResponse(gin.H{"message": "白名单刷新任务已提交"}))
+}
+
+func (h *SecurityHandler) ImportGooglebotRanges(c *gin.Context) {
+	var req struct {
+		IPRanges string `json:"ip_ranges"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse("参数错误"))
+		return
+	}
+	ips, err := executor.NormalizeOfficialIPRanges(req.IPRanges)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse("Googlebot IP 段格式不正确: "+err.Error()))
+		return
+	}
+	db := database.GetDB()
+	keys := []string{"googlebot_ips", "googlebot_ips_source", "googlebot_ips_last_success_at", "googlebot_ips_last_error", "official_whitelist_ips"}
+	old := make(map[string]string, len(keys))
+	for _, key := range keys {
+		var value string
+		_ = db.QueryRow(`SELECT svalue FROM security_settings WHERE skey = ?`, key).Scan(&value)
+		old[key] = value
+	}
+	now := time.Now().UTC().Format("2006-01-02 15:04:05")
+	googleRaw := strings.Join(ips, "\n")
+	var cloudflareRaw, bingRaw string
+	_ = db.QueryRow(`SELECT svalue FROM security_settings WHERE skey = 'cloudflare_realip_ips'`).Scan(&cloudflareRaw)
+	_ = db.QueryRow(`SELECT svalue FROM security_settings WHERE skey = 'bingbot_ips'`).Scan(&bingRaw)
+	official := strings.TrimSpace(strings.Join([]string{cloudflareRaw, googleRaw, bingRaw}, "\n"))
+	updates := map[string]string{
+		"googlebot_ips":                 googleRaw,
+		"googlebot_ips_source":          "manual",
+		"googlebot_ips_last_success_at": now,
+		"googlebot_ips_last_error":      "",
+		"official_whitelist_ips":        official,
+	}
+	for key, value := range updates {
+		if _, err := db.Exec(`INSERT INTO security_settings (skey, svalue, description, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+			ON CONFLICT(skey) DO UPDATE SET svalue = excluded.svalue, updated_at = excluded.updated_at`, key, value, "Googlebot 手动导入与状态"); err != nil {
+			c.JSON(http.StatusInternalServerError, models.ErrorResponse("保存失败"))
+			return
+		}
+	}
+	rollback := func() {
+		for key, value := range old {
+			_, _ = db.Exec(`UPDATE security_settings SET svalue = ?, updated_at = CURRENT_TIMESTAMP WHERE skey = ?`, value, key)
+		}
+	}
+	if err := applyFail2banSettings(); err != nil {
+		rollback()
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse("Fail2ban 白名单应用失败，已回滚: "+err.Error()))
+		return
+	}
+	if err := executor.EnsureLogMap(); err != nil {
+		rollback()
+		_ = applyFail2banSettings()
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse("搜索引擎验证规则应用失败，已回滚: "+err.Error()))
+		return
+	}
+	c.JSON(http.StatusOK, models.SuccessResponse(gin.H{"message": fmt.Sprintf("已导入 %d 条 Googlebot 官方 IP 段", len(ips))}))
+}
+
+func (h *SecurityHandler) ListCDNRealIPGroups(c *gin.Context) {
+	groups, err := executor.ListCDNRealIPGroups()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse("查询 CDN 配置组失败"))
+		return
+	}
+	c.JSON(http.StatusOK, models.SuccessResponse(groups))
+}
+
+func (h *SecurityHandler) CreateCDNRealIPGroup(c *gin.Context) {
+	var req struct {
+		Name        string `json:"name"`
+		HeaderName  string `json:"header_name"`
+		IPRanges    string `json:"ip_ranges"`
+		Enabled     *bool  `json:"enabled"`
+		Description string `json:"description"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse("参数错误"))
+		return
+	}
+
+	name, header, ranges, enabled, desc, err := normalizeCDNRealIPGroupPayload(req.Name, req.HeaderName, req.IPRanges, req.Enabled, req.Description)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse(err.Error()))
+		return
+	}
+	res, err := database.GetDB().Exec(`INSERT INTO cdn_realip_groups (name, provider, header_name, ip_ranges, builtin, enabled, description)
+		VALUES (?, 'custom', ?, ?, 0, ?, ?)`, name, header, ranges, boolToInt(enabled), desc)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse("创建 CDN 配置组失败"))
+		return
+	}
+	if err := applyFail2banSettings(); err != nil {
+		id, idErr := res.LastInsertId()
+		if idErr != nil {
+			c.JSON(http.StatusInternalServerError, models.ErrorResponse("CDN 配置组已创建，但 Fail2ban 白名单应用失败，且数据库回滚失败: "+idErr.Error()+"；原始错误: "+err.Error()))
+			return
+		}
+		if _, rollbackErr := database.GetDB().Exec(`DELETE FROM cdn_realip_groups WHERE id = ? AND builtin = 0`, id); rollbackErr != nil {
+			c.JSON(http.StatusInternalServerError, models.ErrorResponse("CDN 配置组已创建，但 Fail2ban 白名单应用失败，且数据库回滚失败: "+rollbackErr.Error()+"；原始错误: "+err.Error()))
+			return
+		}
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse("CDN 配置组未创建，Fail2ban 白名单应用失败，已回滚: "+err.Error()))
+		return
+	}
+	c.JSON(http.StatusOK, models.SuccessResponse(gin.H{"message": "CDN 配置组已创建"}))
+}
+
+func (h *SecurityHandler) UpdateCDNRealIPGroup(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse("无效的配置组ID"))
+		return
+	}
+	group, err := executor.GetCDNRealIPGroup(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, models.ErrorResponse("CDN 配置组不存在"))
+		return
+	}
+	if group.Builtin {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse("内置 CDN 配置组不可修改"))
+		return
+	}
+
+	var req struct {
+		Name        string `json:"name"`
+		HeaderName  string `json:"header_name"`
+		IPRanges    string `json:"ip_ranges"`
+		Enabled     *bool  `json:"enabled"`
+		Description string `json:"description"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse("参数错误"))
+		return
+	}
+	name, header, ranges, enabled, desc, err := normalizeCDNRealIPGroupPayload(req.Name, req.HeaderName, req.IPRanges, req.Enabled, req.Description)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse(err.Error()))
+		return
+	}
+	if _, err := database.GetDB().Exec(`UPDATE cdn_realip_groups
+		SET name = ?, header_name = ?, ip_ranges = ?, enabled = ?, description = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ?`, name, header, ranges, boolToInt(enabled), desc, id); err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse("保存 CDN 配置组失败"))
+		return
+	}
+	if err := applyFail2banSettings(); err != nil {
+		if _, rollbackErr := database.GetDB().Exec(`UPDATE cdn_realip_groups
+			SET name = ?, header_name = ?, ip_ranges = ?, enabled = ?, description = ?, updated_at = CURRENT_TIMESTAMP
+			WHERE id = ?`, group.Name, group.HeaderName, group.IPRanges, boolToInt(group.Enabled), group.Description, id); rollbackErr != nil {
+			c.JSON(http.StatusInternalServerError, models.ErrorResponse("CDN 配置组已保存，但 Fail2ban 白名单应用失败，且数据库回滚失败: "+rollbackErr.Error()+"；原始错误: "+err.Error()))
+			return
+		}
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse("CDN 配置组未生效，Fail2ban 白名单应用失败，已回滚: "+err.Error()))
+		return
+	}
+	if err := regenerateAllSitesNginx(); err != nil {
+		if _, rollbackErr := database.GetDB().Exec(`UPDATE cdn_realip_groups
+			SET name = ?, header_name = ?, ip_ranges = ?, enabled = ?, description = ?, updated_at = CURRENT_TIMESTAMP
+			WHERE id = ?`, group.Name, group.HeaderName, group.IPRanges, boolToInt(group.Enabled), group.Description, id); rollbackErr != nil {
+			c.JSON(http.StatusInternalServerError, models.ErrorResponse("CDN 配置组已保存，但部分网站 Nginx 配置更新失败，且数据库回滚失败: "+rollbackErr.Error()+"；原始错误: "+err.Error()))
+			return
+		}
+		if rollbackErr := reapplyCDNRealIPRuntime(); rollbackErr != nil {
+			c.JSON(http.StatusInternalServerError, models.ErrorResponse("CDN 配置组已保存，但部分网站 Nginx 配置更新失败，且回滚失败: "+rollbackErr.Error()+"；原始错误: "+err.Error()))
+			return
+		}
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse("CDN 配置组未生效，部分网站 Nginx 配置更新失败，已回滚: "+err.Error()))
+		return
+	}
+	c.JSON(http.StatusOK, models.SuccessResponse(gin.H{"message": "CDN 配置组已保存"}))
+}
+
+func (h *SecurityHandler) DeleteCDNRealIPGroup(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse("无效的配置组ID"))
+		return
+	}
+	group, err := executor.GetCDNRealIPGroup(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, models.ErrorResponse("CDN 配置组不存在"))
+		return
+	}
+	if group.Builtin {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse("内置 CDN 配置组不可删除"))
+		return
+	}
+	boundWebsiteIDs, err := websiteIDsForCDNRealIPGroup(id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse("读取 CDN 配置组绑定网站失败"))
+		return
+	}
+	if _, err := database.GetDB().Exec(`DELETE FROM cdn_realip_groups WHERE id = ?`, id); err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse("删除 CDN 配置组失败"))
+		return
+	}
+	if err := applyFail2banSettings(); err != nil {
+		if restoreErr := restoreCDNRealIPGroupWithBindings(group, boundWebsiteIDs); restoreErr != nil {
+			c.JSON(http.StatusInternalServerError, models.ErrorResponse("CDN 配置组已删除，但 Fail2ban 白名单应用失败，且数据库回滚失败: "+restoreErr.Error()+"；原始错误: "+err.Error()))
+			return
+		}
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse("CDN 配置组未删除，Fail2ban 白名单应用失败，已回滚: "+err.Error()))
+		return
+	}
+	if err := regenerateAllSitesNginx(); err != nil {
+		if restoreErr := restoreCDNRealIPGroupWithBindings(group, boundWebsiteIDs); restoreErr != nil {
+			c.JSON(http.StatusInternalServerError, models.ErrorResponse("CDN 配置组已删除，但部分网站 Nginx 配置更新失败，且数据库回滚失败: "+restoreErr.Error()+"；原始错误: "+err.Error()))
+			return
+		}
+		if rollbackErr := reapplyCDNRealIPRuntime(); rollbackErr != nil {
+			c.JSON(http.StatusInternalServerError, models.ErrorResponse("CDN 配置组已删除，但部分网站 Nginx 配置更新失败，且回滚失败: "+rollbackErr.Error()+"；原始错误: "+err.Error()))
+			return
+		}
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse("CDN 配置组未删除，部分网站 Nginx 配置更新失败，已回滚: "+err.Error()))
+		return
+	}
+	c.JSON(http.StatusOK, models.SuccessResponse(gin.H{"message": "CDN 配置组已删除"}))
+}
+
+func reapplyCDNRealIPRuntime() error {
+	if err := applyFail2banSettings(); err != nil {
+		return fmt.Errorf("Fail2ban 回滚失败: %w", err)
+	}
+	if err := regenerateAllSitesNginx(); err != nil {
+		return fmt.Errorf("Nginx 回滚失败: %w", err)
+	}
+	return nil
+}
+
+func refreshOfficialWhitelist() {
+	executor.GlobalQueue.Enqueue(executor.TaskRefreshWhitelist, nil)
+}
+
+func normalizeCDNRealIPGroupPayload(name, headerName, rawRanges string, enabled *bool, description string) (string, string, string, bool, string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" || len(name) > 50 || strings.ContainsAny(name, "\r\n\t") {
+		return "", "", "", false, "", fmt.Errorf("CDN 配置组名称格式不正确")
+	}
+	header, err := executor.NormalizeCDNRealIPHeader(headerName)
+	if err != nil {
+		return "", "", "", false, "", err
+	}
+	ranges, err := executor.NormalizeCDNRealIPRanges(rawRanges)
+	if err != nil {
+		return "", "", "", false, "", err
+	}
+	isEnabled := true
+	if enabled != nil {
+		isEnabled = *enabled
+	}
+	description = strings.TrimSpace(description)
+	if len(description) > 200 {
+		return "", "", "", false, "", fmt.Errorf("备注过长")
+	}
+	return name, header, executor.JoinCDNRealIPRanges(ranges), isEnabled, description, nil
+}
+
+func normalizeSecuritySetting(key string, val interface{}) (string, bool, error) {
+	switch key {
+	case "fail2ban_maxretry":
+		return normalizeRange(key, val, 1, 20)
+	case "fail2ban_findtime":
+		return normalizeRange(key, val, 10, 3600)
+	case "fail2ban_bantime":
+		fixed, _, err := normalizeRange(key, val, 600, 600)
+		if err != nil {
+			return "", false, fmt.Errorf("首次封禁时长已固定为600秒")
+		}
+		_ = fixed
+		return "", false, nil
+	case "rate_limit_rpm":
+		return normalizeRange(key, val, 10, 600)
+	case "rate_limit_burst":
+		return normalizeRange(key, val, 5, 600)
+	case "bot_limit_rpm":
+		return normalizeRange(key, val, 5, 300)
+	case "bot_limit_burst":
+		return normalizeRange(key, val, 5, 300)
+	case "wp_sqli_ban_threshold":
+		return normalizeRange(key, val, 1, 50)
+	case "wp_sqli_ban_window_seconds":
+		return normalizeRange(key, val, 60, 3600)
+	case "auto_whitelist_enabled", "rate_limit_enabled", "bot_limit_enabled", "wp_sqli_block_enabled", "wp_sqli_autoban_enabled":
+		v, err := normalizeBool(val)
+		return v, true, err
+	case "whitelist_ips":
+		v, ok := val.(string)
+		if !ok {
+			return "", false, fmt.Errorf("白名单格式不正确")
+		}
+		v = strings.TrimSpace(v)
+		if err := validateWhitelistIPs(v); err != nil {
+			return "", false, err
+		}
+		return v, true, nil
+	case "wp_security_log_whitelist":
+		v, ok := val.(string)
+		if !ok {
+			return "", false, fmt.Errorf("WordPress安全日志白名单格式不正确")
+		}
+		patterns, err := executor.NormalizeWPSecurityLogWhitelist(v)
+		if err != nil {
+			return "", false, err
+		}
+		return strings.Join(patterns, "\n"), true, nil
+	default:
+		return "", false, nil
+	}
+}
+
+func normalizeRange(key string, val interface{}, min int, max int) (string, bool, error) {
+	n, err := normalizeInt(val)
+	if err != nil {
+		return "", false, fmt.Errorf("%s 必须是数字", key)
+	}
+	if n < min || n > max {
+		return "", false, fmt.Errorf("%s 必须在 %d-%d 之间", key, min, max)
+	}
+	return strconv.Itoa(n), true, nil
+}
+
+func normalizeInt(val interface{}) (int, error) {
+	switch v := val.(type) {
+	case string:
+		return strconv.Atoi(strings.TrimSpace(v))
+	case float64:
+		if v != float64(int(v)) {
+			return 0, fmt.Errorf("invalid int")
+		}
+		return int(v), nil
+	default:
+		return 0, fmt.Errorf("invalid int")
+	}
+}
+
+func normalizeBool(val interface{}) (string, error) {
+	switch v := val.(type) {
+	case bool:
+		if v {
+			return "true", nil
+		}
+		return "false", nil
+	case string:
+		v = strings.TrimSpace(v)
+		if v == "true" || v == "false" {
+			return v, nil
+		}
+	}
+	return "", fmt.Errorf("开关值不正确")
+}
+
+func boolToInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}
+
+func validateWhitelistIPs(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	lines := strings.Split(raw, "\n")
+	if len(lines) > 500 {
+		return fmt.Errorf("白名单数量过大")
+	}
+	for _, line := range lines {
+		item := strings.TrimSpace(line)
+		if item == "" {
+			continue
+		}
+		if strings.ContainsAny(item, " \t\r") {
+			return fmt.Errorf("白名单 %s 格式不正确", item)
+		}
+		if strings.Contains(item, "/") {
+			if _, _, err := net.ParseCIDR(item); err != nil {
+				return fmt.Errorf("白名单 %s 格式不正确", item)
+			}
+			continue
+		}
+		if net.ParseIP(item) == nil {
+			return fmt.Errorf("白名单 %s 格式不正确", item)
+		}
+	}
+	return nil
+}

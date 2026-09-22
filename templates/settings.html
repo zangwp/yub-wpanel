@@ -1,0 +1,943 @@
+{{template "base" .}}
+{{define "settings_content"}}
+<div x-data="panelSettings()" x-init="fetchSettings()">
+    <h2 class="text-xl font-bold text-white mb-6">{{t .Lang "nav.settings"}}</h2>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-8 mb-6">
+        <div class="card">
+            <h3 class="text-lg font-semibold text-white mb-4">{{t .Lang "settings.account_security"}}</h3>
+
+            <div class="mb-4 p-3 rounded" style="background-color: #0f172a;">
+                <p class="text-xs text-blue-400 font-medium mb-2">{{t .Lang "settings.basic_auth_title"}}</p>
+                <p class="text-xs text-gray-500 mb-3">{{t .Lang "settings.basic_auth_desc"}}</p>
+                <div class="mb-3">
+                    <label class="text-xs text-gray-400">{{t .Lang "auth.username"}}</label>
+                    <input type="text" x-model="basicAuthUser" class="input-field text-sm py-1.5 mt-1">
+                </div>
+                <div>
+                    <label class="text-xs text-gray-400">{{t .Lang "settings.password_keep"}}</label>
+                    <input type="password" x-model="pw.basic" class="input-field text-sm py-1.5 mt-1" placeholder="{{t .Lang "settings.leave_unchanged_placeholder"}}" autocomplete="new-password">
+                </div>
+            </div>
+
+            <div class="mb-4 p-3 rounded" style="background-color: #0f172a;">
+                <p class="text-xs text-green-400 font-medium mb-2">{{t .Lang "settings.web_login_title"}}</p>
+                <p class="text-xs text-gray-500 mb-3">{{t .Lang "settings.web_login_desc"}}</p>
+                <div class="mb-3">
+                    <label class="text-xs text-gray-400">{{t .Lang "auth.username"}}</label>
+                    <input type="text" x-model="username" class="input-field text-sm py-1.5 mt-1">
+                </div>
+                <div>
+                    <label class="text-xs text-gray-400">{{t .Lang "settings.password_keep"}}</label>
+                    <input type="password" x-model="pw.old" class="input-field text-sm py-1.5 mt-1" placeholder="{{t .Lang "settings.current_password_placeholder"}}" autocomplete="current-password">
+                    <div class="flex space-x-2 mt-2">
+                        <input type="password" x-model="pw.new1" class="input-field flex-1 text-sm py-1.5" placeholder="{{t .Lang "settings.new_password_placeholder"}}" autocomplete="new-password">
+                        <input type="password" x-model="pw.new2" class="input-field flex-1 text-sm py-1.5" placeholder="{{t .Lang "settings.confirm_new_password_placeholder"}}">
+                    </div>
+                </div>
+            </div>
+
+            <button @click="saveAccount" :disabled="accountSaving" class="btn-primary w-full" x-text="accountSaving ? t('settings.saving') : t('settings.save_account_settings')"></button>
+            <p class="text-xs text-yellow-400 mt-2" x-show="accountSaved">{{t .Lang "settings.account_saved_logout"}}</p>
+        </div>
+
+        <div class="card">
+            <h3 class="text-lg font-semibold text-white mb-4">{{t .Lang "settings.server_settings"}}</h3>
+
+            <div class="mb-4">
+                <label class="label">{{t .Lang "settings.panel_title"}}</label>
+                <div class="flex space-x-2">
+                    <input type="text" x-model="panelTitle" class="input-field flex-1">
+                    <button @click="saveBasic" class="btn-primary text-sm">{{t .Lang "settings.save"}}</button>
+                </div>
+            </div>
+
+            <div class="mb-4">
+                <label class="label">{{t .Lang "settings.timezone"}}</label>
+                <select x-model="timezone" @change="saveServerSetting('timezone', timezone)" class="input-field">
+                    <option value="Asia/Shanghai">Asia/Shanghai (UTC+8)</option>
+                    <option value="Asia/Tokyo">Asia/Tokyo (UTC+9)</option>
+                    <option value="Asia/Singapore">Asia/Singapore (UTC+8)</option>
+                    <option value="Asia/Hong_Kong">Asia/Hong_Kong (UTC+8)</option>
+                    <option value="America/New_York">America/New_York (UTC-5)</option>
+                    <option value="America/Los_Angeles">America/Los_Angeles (UTC-8)</option>
+                    <option value="America/Chicago">America/Chicago (UTC-6)</option>
+                    <option value="Europe/London">Europe/London (UTC+0)</option>
+                    <option value="Europe/Berlin">Europe/Berlin (UTC+1)</option>
+                    <option value="Europe/Paris">Europe/Paris (UTC+1)</option>
+                    <option value="Australia/Sydney">Australia/Sydney (UTC+10)</option>
+                    <option value="UTC">UTC</option>
+                </select>
+                <div class="flex items-center justify-between mt-1">
+                    <p class="text-xs text-gray-400">{{t .Lang "settings.server_time"}}<span x-text="serverTime" class="text-white font-mono"></span></p>
+                    <div class="flex items-center space-x-2">
+                        <span class="text-xs" :class="ntpSynced ? 'text-green-400' : 'text-yellow-400'" x-text="ntpSynced ? t('settings.ntp_synced') : t('settings.ntp_not_synced')"></span>
+                        <button @click="syncNTP()" class="text-xs py-0.5 px-2 rounded" style="background-color: #1e3a5f; color: #93c5fd;">{{t .Lang "settings.sync"}}</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="mb-4">
+                <label class="label">{{t .Lang "settings.hostname"}}</label>
+                <div class="flex space-x-2">
+                    <input type="text" x-model="hostname" class="input-field flex-1">
+                    <button @click="saveServerSetting('hostname', hostname)" :disabled="!hostname" class="btn-primary text-sm">{{t .Lang "settings.save"}}</button>
+                </div>
+            </div>
+
+            <div class="mb-4">
+                <label class="label">{{t .Lang "settings.github_proxy"}}</label>
+                <p class="text-xs text-gray-500 mb-2">{{t .Lang "settings.github_proxy_help"}}</p>
+                <div class="flex space-x-2">
+                    <input type="text" x-model="githubProxy" placeholder="https://your-github-proxy.example" class="input-field flex-1">
+                    <button @click="testProxy()" :disabled="proxyTesting" class="btn-secondary text-sm" x-text="proxyTesting ? t('settings.testing') : t('settings.test')"></button>
+                    <button @click="saveServerSetting('github_proxy', githubProxy)" class="btn-primary text-sm">{{t .Lang "settings.save"}}</button>
+                </div>
+                <p x-show="proxyResult" class="text-xs mt-2" :class="proxyOk ? 'text-green-400' : 'text-red-400'" x-text="proxyResult"></p>
+            </div>
+
+            <hr class="my-4 border-gray-700">
+
+            <div x-data="versionCheck()" x-init="scheduleCheck()">
+                <div class="flex items-center justify-between mb-2">
+                    <span class="text-sm text-gray-400">{{t .Lang "settings.panel_version"}}</span>
+                    <span class="text-sm text-white font-mono" x-text="currentVersion"></span>
+                </div>
+                <div x-show="hasUpdate" class="mb-3 p-3 rounded" style="background-color: #064e3b; border: 1px solid #059669;">
+                    <p class="text-sm text-green-300">{{t .Lang "settings.new_version_prefix"}} <span x-text="latestVersion" class="font-bold"></span> {{t .Lang "settings.new_version_suffix"}}</p>
+                    <pre x-text="releaseNotes" class="text-xs text-gray-400 mt-2 max-h-32 overflow-y-auto whitespace-pre-wrap"></pre>
+                </div>
+                <div class="flex items-center space-x-3">
+                    <button @click="checkUpdate()" :disabled="checking" class="btn-secondary text-xs" x-text="checking ? t('settings.checking') : t('settings.check_updates')"></button>
+                    <button @click="doUpdate()" x-show="hasUpdate" :disabled="updating" class="btn-primary text-xs" x-text="updating ? t('settings.updating') : t('settings.update_now')"></button>
+                </div>
+                <div x-show="updating || updateStatus.running || updateStatus.completed || updateStatus.error" class="mt-3 p-3 rounded" style="background-color: #0f172a; border: 1px solid #1e293b;">
+                    <div class="flex items-center justify-between mb-2">
+                        <span class="text-xs" :class="updateStatus.error ? 'text-red-400' : 'text-gray-300'" x-text="updateStatusText()"></span>
+                        <span class="text-xs text-gray-500" x-text="progressLabel()"></span>
+                    </div>
+                    <div class="h-2 rounded overflow-hidden" style="background-color: #020617;">
+                        <div class="h-full transition-all duration-300" :style="'width: ' + progressPercent() + '%; background-color: ' + (updateStatus.error ? '#dc2626' : '#059669')"></div>
+                    </div>
+                    <div x-show="updateStatus.stage === 'download_binary' && updateStatus.has_total" class="flex justify-between mt-2 text-xs text-gray-500">
+                        <span x-text="formatBytes(updateStatus.downloaded_bytes || 0)"></span>
+                        <span x-text="formatBytes(updateStatus.total_bytes || 0)"></span>
+                    </div>
+                    <p x-show="updating && !updateStatus.error && !updateStatus.completed" class="text-xs text-yellow-500 mt-2">{{t .Lang "settings.update_do_not_close"}}</p>
+                </div>
+                <p x-show="updateError" class="text-xs text-red-400 mt-2" x-text="updateError"></p>
+            </div>
+
+            <div class="mt-4 p-3 rounded" style="background-color: #0f172a; border: 1px solid #1e293b;">
+                <div class="flex items-center justify-between mb-3">
+                    <div>
+                        <p class="text-sm text-gray-300">{{t .Lang "settings.auto_update"}}</p>
+                        <p class="text-xs text-gray-500">{{t .Lang "settings.auto_update_help"}}</p>
+                    </div>
+                    <label class="flex items-center space-x-2 text-sm text-gray-300 cursor-pointer">
+                        <input type="checkbox" x-model="autoUpdate.enabled" @change="saveAutoUpdate">
+                        <span x-text="autoUpdate.enabled ? t('settings.enabled') : t('settings.disabled')"></span>
+                    </label>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <div>
+                        <label class="label">{{t .Lang "settings.update_mode"}}</label>
+                        <select x-model="autoUpdate.mode" @change="saveAutoUpdate" class="input-field text-sm">
+                            <option value="patch_only">{{t .Lang "settings.patch_only"}}</option>
+                            <option value="all_stable">{{t .Lang "settings.all_stable"}}</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="label">{{t .Lang "settings.update_window"}}</label>
+                        <input type="text" x-model="autoUpdate.window" @change="saveAutoUpdate" class="input-field text-sm" placeholder="03:00-05:00">
+                    </div>
+                    <div>
+                        <label class="label">{{t .Lang "settings.release_delay_minutes"}}</label>
+                        <input type="number" x-model="autoUpdate.delay" @change="saveAutoUpdate" min="1" max="1440" class="input-field text-sm">
+                    </div>
+                    <div>
+                        <label class="label">{{t .Lang "settings.signature_timeout_minutes"}}</label>
+                        <input type="number" x-model="autoUpdate.signatureTimeout" @change="saveAutoUpdate" min="5" max="1440" class="input-field text-sm">
+                    </div>
+                </div>
+                <div class="mt-3 text-xs text-gray-500 space-y-1">
+                    <p>{{t .Lang "settings.last_status"}}<span class="text-gray-300" x-text="autoUpdate.lastStatus || t('settings.no_data')"></span> <span x-text="autoUpdate.lastStage ? '(' + autoUpdate.lastStage + ')' : ''"></span></p>
+                    <p x-show="autoUpdate.lastTarget">{{t .Lang "settings.target_version"}}<span class="text-gray-300" x-text="autoUpdate.lastTarget"></span></p>
+                    <p x-show="autoUpdate.lastError" class="text-red-400" x-text="autoUpdate.lastError"></p>
+                    <p x-show="autoUpdate.lastSuccess">{{t .Lang "settings.last_success"}}<span x-text="autoUpdate.lastSuccess"></span> <span x-text="autoUpdate.lastSuccessVersion"></span></p>
+                </div>
+            </div>
+
+            <hr class="my-4 border-gray-700">
+
+            <div x-data="systemUpdate()" x-init="init()">
+                <div class="flex items-center justify-between mb-2">
+                    <span class="text-sm text-gray-400">{{t .Lang "settings.system_updates"}}</span>
+                        <span class="text-sm text-white font-mono" x-show="checked && count > 0" x-text="t('settings.available_count', { count })"></span>
+                    <span class="text-xs text-gray-500" x-show="checked && count === 0">{{t .Lang "settings.up_to_date"}}</span>
+                </div>
+                <div x-show="count > 0" class="mb-3 space-y-2">
+                    <template x-for="pkg in packages" :key="pkg.name">
+                        <div class="flex items-center justify-between p-2 rounded" style="background-color: #0f172a; border: 1px solid #1e293b;">
+                            <div class="flex items-center space-x-2">
+                                <span class="text-sm text-white font-mono" x-text="pkg.name"></span>
+                                <span class="text-xs" :class="pkg.repo.includes('security') ? 'text-red-400' : 'text-gray-500'" x-text="pkg.repo"></span>
+                            </div>
+                            <div class="flex items-center space-x-3">
+                                <span class="text-xs text-gray-400" x-text="pkg.version"></span>
+                                <a :href="'https://packages.debian.org/trixie/' + pkg.name" target="_blank" class="text-xs text-blue-400 hover:text-blue-300" title="{{t .Lang "settings.package_detail_title"}}">{{t .Lang "settings.query"}}</a>
+                            </div>
+                        </div>
+                    </template>
+                    <p class="text-xs text-gray-500 mt-2">{{t .Lang "settings.system_update_help"}}</p>
+                </div>
+                <div class="flex items-center space-x-3">
+                    <button @click="check()" :disabled="checking || updating" class="btn-secondary text-xs" x-text="checking ? t('settings.checking') : t('settings.refresh')"></button>
+                    <button @click="doUpdate()" x-show="count > 0" :disabled="updating" class="btn-primary text-xs" x-text="updating ? t('settings.updating') : t('settings.one_click_update')"></button>
+                </div>
+                <p x-show="count > 0" class="text-xs text-yellow-500 mt-2">{{t .Lang "settings.system_update_warning"}}</p>
+                <p x-show="msg" class="text-sm mt-2" :class="ok ? 'text-green-400' : 'text-red-400'" x-text="msg"></p>
+            </div>
+        </div>
+    </div>
+
+    <div class="mb-6">
+        <div class="card" x-data="wpPackage()" x-init="fetchStatus()">
+            <h3 class="text-lg font-semibold text-white mb-4">{{t .Lang "settings.wp_package"}}</h3>
+            <p class="text-xs text-gray-500 mb-4">{{t .Lang "settings.wp_package_help"}}</p>
+
+            <div>
+                <div class="p-3 rounded mb-4" style="background-color: #0f172a;">
+                    <div class="flex items-center justify-between mb-2">
+                        <span class="text-xs text-gray-400">{{t .Lang "settings.local_package_status"}}</span>
+                <span class="text-xs font-medium" :class="pkg.available ? 'text-green-400' : 'text-yellow-400'" x-text="pkg.available ? t('settings.package_ready') : t('settings.package_not_installed')"></span>
+                    </div>
+                    <template x-if="pkg.available">
+                        <div class="space-y-1">
+                            <div class="flex items-center justify-between">
+                                <span class="text-xs text-gray-500">{{t .Lang "settings.wp_package_version"}}</span>
+                                <span class="text-xs text-white font-mono" x-text="pkg.version || '--'"></span>
+                            </div>
+                            <div class="flex items-center justify-between">
+                                <span class="text-xs text-gray-500">{{t .Lang "settings.file_size"}}</span>
+                                <span class="text-xs text-white" x-text="pkg.size_text"></span>
+                            </div>
+                            <div class="flex items-center justify-between">
+                                <span class="text-xs text-gray-500">{{t .Lang "settings.updated_at"}}</span>
+                                <span class="text-xs text-white" x-text="pkg.updated_at"></span>
+                            </div>
+                        </div>
+                    </template>
+                    <template x-if="!pkg.available">
+                        <p class="text-xs text-yellow-400">{{t .Lang "settings.local_package_missing"}}</p>
+                    </template>
+                </div>
+
+                <div class="flex items-center space-x-3">
+                    <button @click="downloadPkg()" :disabled="downloading" class="btn-secondary text-sm" x-text="downloading ? t('settings.downloading') : t('settings.online_download')"></button>
+                    <label class="btn-primary text-sm cursor-pointer" :class="uploading ? 'opacity-50 cursor-not-allowed' : ''">
+                        <span x-text="uploading ? t('settings.uploading') : t('settings.upload_package')"></span>
+                        <input type="file" accept=".zip" class="hidden" @change="uploadPkg($event)" :disabled="uploading">
+                    </label>
+                    <button x-show="pkg.available" @click="deletePkg()" :disabled="deleting" class="text-sm py-1.5 px-3 rounded" style="background-color: #7f1d1d; color: #fca5a5;" x-text="deleting ? t('settings.deleting') : t('settings.delete')"></button>
+                    <button @click="fetchStatus()" class="text-xs py-1 px-2 rounded" style="background-color: #1e3a5f; color: #93c5fd;">{{t .Lang "settings.refresh"}}</button>
+                </div>
+                <p x-show="msg" class="text-xs mt-2" :class="msgOk ? 'text-green-400' : 'text-red-400'" x-text="msg"></p>
+
+                <div class="mt-4 p-3 rounded" style="background-color: #0f172a; border: 1px solid #1e293b;">
+                    <div class="flex items-center justify-between mb-2">
+                        <div>
+                            <p class="text-sm text-gray-300">{{t .Lang "settings.wp_package_auto_check"}}</p>
+                            <p class="text-xs text-gray-500">{{t .Lang "settings.wp_package_auto_check_help"}}</p>
+                        </div>
+                        <label class="flex items-center space-x-2 text-sm text-gray-300 cursor-pointer">
+                            <input type="checkbox" x-model="autoCheck.enabled" @change="saveAutoCheck">
+                            <span x-text="autoCheck.enabled ? t('settings.enabled') : t('settings.disabled')"></span>
+                        </label>
+                    </div>
+                    <div class="text-xs text-gray-500 space-y-1">
+                        <p>{{t .Lang "settings.wp_package_last_check"}}
+                            <span class="text-gray-300" x-text="autoCheck.lastCheckAt || t('settings.wp_package_never_checked')"></span>
+                            <span x-show="autoCheck.lastStatus" :class="autoCheck.lastStatus === 'failed' ? 'text-red-400' : 'text-gray-400'" x-text="autoCheckStatusText()"></span>
+                        </p>
+                        <p x-show="autoCheck.lastError" class="text-red-400" x-text="autoCheck.lastError"></p>
+                        <p x-show="autoCheck.remoteVersion">{{t .Lang "settings.wp_package_remote_version"}}<span class="text-gray-300" x-text="autoCheck.remoteVersion"></span></p>
+                    </div>
+                </div>
+            </div>
+		</div>
+
+	</div>
+
+    <div class="card mb-6" x-data="dbBackup()" x-init="init()">
+        <div class="flex items-center justify-between mb-4">
+            <h3 class="text-lg font-semibold text-white">{{t .Lang "settings.panel_db_backup"}}</h3>
+            <div class="flex items-center space-x-2">
+                <button @click="doBackup()" :disabled="backingUp || restoring" class="btn-primary text-sm" x-text="backingUp ? t('settings.backing_up') : t('settings.backup_now')"></button>
+            </div>
+        </div>
+        <p class="text-gray-400 text-xs mb-2">{{t .Lang "settings.panel_db_backup_help"}}</p>
+        <p class="text-yellow-500/80 text-xs mb-4">{{t .Lang "settings.panel_db_backup_warning"}}</p>
+        <div class="overflow-x-auto">
+            <table class="w-full">
+                <thead class="border-b border-gray-700">
+                    <tr>
+                        <th class="table-header">{{t .Lang "settings.backup_time"}}</th>
+                        <th class="table-header">{{t .Lang "settings.filename"}}</th>
+                        <th class="table-header">{{t .Lang "settings.size"}}</th>
+                        <th class="table-header">{{t .Lang "settings.actions"}}</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <template x-for="b in backups" :key="b.filename">
+                        <tr class="border-b border-gray-700/50">
+                            <td class="table-cell text-sm" x-text="b.created_at"></td>
+                            <td class="table-cell text-xs font-mono" x-text="b.filename"></td>
+                            <td class="table-cell text-sm" x-text="b.size_text"></td>
+                            <td class="table-cell">
+                                <button @click="doDownload(b.filename)" class="btn-primary text-xs py-1 px-2">{{t .Lang "settings.download"}}</button>
+                                <button @click="doRestore(b.filename)" :disabled="restoring" class="btn-warning text-xs py-1 px-2 ml-1">{{t .Lang "settings.restore"}}</button>
+                                <button @click="doDelete(b.filename)" :disabled="restoring" class="btn-danger text-xs py-1 px-2 ml-1">{{t .Lang "settings.delete"}}</button>
+                            </td>
+                        </tr>
+                    </template>
+                    <tr x-show="backups.length === 0">
+                        <td colspan="4" class="table-cell text-center text-gray-500 py-6">{{t .Lang "settings.no_backup_records"}}</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="card" x-data="operationLogs()" x-init="fetchLogs()">
+        <h3 class="text-lg font-semibold text-white mb-4">{{t .Lang "settings.recent_operation_logs"}}</h3>
+        <div class="overflow-x-auto">
+            <table class="w-full">
+                <thead class="border-b border-gray-700">
+                    <tr>
+                        <th class="table-header">{{t .Lang "settings.time"}}</th>
+                        <th class="table-header">{{t .Lang "settings.operation"}}</th>
+                        <th class="table-header">{{t .Lang "settings.target"}}</th>
+                        <th class="table-header">{{t .Lang "settings.status"}}</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <template x-for="log in logs" :key="log.id">
+                        <tr class="border-b border-gray-700/50">
+                            <td class="table-cell text-xs" x-text="fmtTime(log.created_at)"></td>
+                            <td class="table-cell text-sm" x-text="log.operation"></td>
+                            <td class="table-cell text-sm" x-text="log.target || '--'"></td>
+                            <td class="table-cell">
+                                <span :class="statusClass(log.status)" x-text="statusText(log.status)"></span>
+                            </td>
+                        </tr>
+                    </template>
+                    <tr x-show="logs.length === 0">
+                        <td colspan="4" class="table-cell text-center text-gray-500 py-8">{{t .Lang "settings.no_operation_logs"}}</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        <div x-show="logTotal > 0" class="flex items-center justify-between mt-4 pt-3 border-t border-gray-700/50">
+                <span class="text-sm text-gray-400" x-text="t('settings.total_records', { count: logTotal })"></span>
+            <div class="flex items-center space-x-1" x-show="logTotalPages > 1">
+                <button @click="logGoPage(logPage-1)" :disabled="logPage <= 1" class="px-3 py-1 text-sm rounded bg-gray-700 hover:bg-gray-600 disabled:opacity-40 disabled:cursor-not-allowed">{{t .Lang "settings.prev_page"}}</button>
+                <template x-for="p in logPageNumbers" :key="p">
+                    <button @click="logGoPage(p)" :class="p === logPage ? 'bg-blue-600 text-white' : 'bg-gray-700 hover:bg-gray-600'" class="px-3 py-1 text-sm rounded" x-text="p"></button>
+                </template>
+                <button @click="logGoPage(logPage+1)" :disabled="logPage >= logTotalPages" class="px-3 py-1 text-sm rounded bg-gray-700 hover:bg-gray-600 disabled:opacity-40 disabled:cursor-not-allowed">{{t .Lang "settings.next_page"}}</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+function wpPackage() {
+    return {
+        pkg: { available: false, size_text: '', updated_at: '', version: '' },
+        autoCheck: { enabled: true, lastCheckAt: '', lastStatus: '', lastError: '', remoteVersion: '' },
+        downloading: false,
+        uploading: false,
+        deleting: false,
+        msg: '',
+        msgOk: false,
+        async fetchStatus() {
+            try {
+                const r = await api('/settings/wp-package');
+                if (r.success) {
+                    this.pkg = r.data;
+                    const ac = r.data.auto_check || {};
+                    this.autoCheck.enabled = ac.wp_package_auto_check_enabled !== 'false';
+                    this.autoCheck.lastCheckAt = ac.wp_package_last_check_at || '';
+                    this.autoCheck.lastStatus = ac.wp_package_last_check_status || '';
+                    this.autoCheck.lastError = ac.wp_package_last_check_error || '';
+                    this.autoCheck.remoteVersion = ac.wp_package_last_remote_version || '';
+                }
+            } catch(e) {}
+        },
+        autoCheckStatusText() {
+            const map = {
+                up_to_date: t('settings.wp_package_check_status_up_to_date'),
+                updated: t('settings.wp_package_check_status_updated'),
+                failed: t('settings.wp_package_check_status_failed'),
+            };
+            return map[this.autoCheck.lastStatus] ? '(' + map[this.autoCheck.lastStatus] + ')' : '';
+        },
+        async saveAutoCheck() {
+            try {
+                await api('/settings', { method: 'PUT', body: { wp_package_auto_check_enabled: this.autoCheck.enabled ? 'true' : 'false' } });
+                showToast(t('settings.updated'), 'success');
+            } catch(e) { showToast(e.message, 'error'); }
+        },
+        async downloadPkg() {
+            this.downloading = true;
+            this.msg = '';
+            try {
+                const r = await api('/settings/wp-package/download', { method: 'POST' });
+                this.msgOk = r.success;
+                this.msg = r.data?.message || t('settings.package_download_complete');
+                if (r.success) this.fetchStatus();
+            } catch(e) { this.msgOk = false; this.msg = e.message; }
+            this.downloading = false;
+        },
+        async deletePkg() {
+            if (!await confirmModal(t('settings.confirm_delete_local_wp_package'))) return;
+            this.deleting = true;
+            this.msg = '';
+            try {
+                const r = await api('/settings/wp-package', { method: 'DELETE' });
+                this.msgOk = r.success;
+                this.msg = r.data?.message || t('settings.deleted');
+                if (r.success) this.fetchStatus();
+            } catch(e) { this.msgOk = false; this.msg = e.message; }
+            this.deleting = false;
+        },
+        async uploadPkg(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            if (!file.name.toLowerCase().endsWith('.zip')) {
+                showToast(t('settings.zip_only'), 'error');
+                event.target.value = '';
+                return;
+            }
+            this.uploading = true;
+            this.msg = '';
+            const prefix = document.body.dataset.panelPrefix || '';
+            const formData = new FormData();
+            formData.append('file', file);
+            try {
+                const resp = await fetch(prefix + '/api/settings/wp-package/upload', {
+                    method: 'POST',
+                    headers: { 'X-CSRF-Token': document.querySelector('meta[name="csrf-token"]')?.content || '' },
+                    body: formData,
+                });
+                const r = await resp.json();
+                if (r.success) {
+                    this.msgOk = true;
+                    this.msg = r.data?.message || t('settings.upload_success');
+                    this.fetchStatus();
+                } else {
+                    this.msgOk = false;
+                    this.msg = r.message || t('settings.upload_failed');
+                }
+            } catch(e) { this.msgOk = false; this.msg = (t('settings.upload_failed') + ': ' + e.message); }
+            this.uploading = false;
+            event.target.value = '';
+        }
+    }
+}
+function panelSettings() {
+    return {
+        panelTitle: 'YUB WPanel',
+        username: '',
+        basicAuthUser: '',
+        githubProxy: '',
+        timezone: '',
+        hostname: '',
+        serverTime: '',
+        serverTimeBase: 0,
+        serverTimeFetchedAt: 0,
+        ntpSynced: false,
+        proxyTesting: false,
+        proxyResult: '',
+        proxyOk: false,
+        accountSaving: false,
+        accountSaved: false,
+        autoUpdate: {
+            enabled: false,
+            mode: 'patch_only',
+            window: '03:00-05:00',
+            delay: 15,
+            signatureTimeout: 120,
+            lastTarget: '',
+            lastStatus: '',
+            lastStage: '',
+            lastError: '',
+            lastSuccess: '',
+            lastSuccessVersion: ''
+        },
+        pw: { old: '', new1: '', new2: '', basic: '' },
+        async fetchSettings() {
+            try {
+                const r = await api('/settings');
+                if (r.success) {
+                    this.panelTitle = r.data.panel_title || 'YUB WPanel';
+                    this.username = r.data.username || '';
+                    this.basicAuthUser = r.data.basic_auth_user || '';
+                    this.githubProxy = r.data.github_proxy || '';
+                    this.timezone = r.data.timezone || '';
+                    this.hostname = r.data.hostname || '';
+                    this.ntpSynced = r.data.ntp_synced || false;
+                    if (r.data.server_time) {
+                        this.serverTimeBase = r.data.server_time;
+                        this.serverTimeFetchedAt = Date.now();
+                    }
+                    const au = r.data.panel_auto_update || {};
+                    this.autoUpdate.enabled = au.panel_auto_update_enabled === 'true';
+                    this.autoUpdate.mode = au.panel_auto_update_mode || 'patch_only';
+                    this.autoUpdate.window = au.panel_auto_update_window || '03:00-05:00';
+                    this.autoUpdate.delay = Number(au.panel_auto_update_release_delay_minutes || 15);
+                    this.autoUpdate.signatureTimeout = Number(au.panel_auto_update_signature_timeout_minutes || 120);
+                    this.autoUpdate.lastTarget = au.panel_auto_update_last_target_version || '';
+                    this.autoUpdate.lastStatus = au.panel_auto_update_last_status || '';
+                    this.autoUpdate.lastStage = au.panel_auto_update_last_stage || '';
+                    this.autoUpdate.lastError = au.panel_auto_update_last_error || '';
+                    this.autoUpdate.lastSuccess = au.panel_auto_update_last_success_at || '';
+                    this.autoUpdate.lastSuccessVersion = au.panel_auto_update_last_success_version || '';
+                }
+            } catch(e) {}
+            this.tickTime();
+            setInterval(() => this.tickTime(), 1000);
+        },
+        tickTime() {
+            if (this.serverTimeBase) {
+                const elapsed = Date.now() - this.serverTimeFetchedAt;
+                const d = new Date(this.serverTimeBase + elapsed);
+                const opts = { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false };
+                if (this.timezone) opts.timeZone = this.timezone;
+                try {
+                    this.serverTime = d.toLocaleString('zh-CN', opts);
+                } catch (e) {
+                    delete opts.timeZone;
+                    this.serverTime = d.toLocaleString('zh-CN', opts);
+                }
+            }
+        },
+        async saveAccount() {
+            const body = {};
+
+            if (this.basicAuthUser) body.basic_auth_user = this.basicAuthUser;
+            if (this.pw.basic && this.pw.basic.length >= 8) body.basic_auth_password = this.pw.basic;
+            else if (this.pw.basic && this.pw.basic.length < 8) { showToast(t('settings.basic_auth_password_min_length'), 'error'); return; }
+
+            if (this.username) body.username = this.username;
+            if (this.pw.new1 || this.pw.new2) {
+                if (!this.pw.old) { showToast(t('settings.current_password_required'), 'error'); return; }
+                if (this.pw.new1 !== this.pw.new2) { showToast(t('settings.passwords_not_match'), 'error'); return; }
+                if (this.pw.new1.length < 8) { showToast(t('settings.new_password_min_length'), 'error'); return; }
+                body.old_password = this.pw.old;
+                body.new_password = this.pw.new1;
+            }
+
+            if (Object.keys(body).length === 0) { showToast(t('settings.no_changes'), 'info'); return; }
+
+            this.accountSaving = true;
+            try {
+                await api('/settings', { method: 'PUT', body });
+                this.accountSaved = true;
+                this.pw = { old: '', new1: '', new2: '', basic: '' };
+                showToast(t('settings.account_saved_please_relogin'), 'success');
+                setTimeout(async () => {
+                    try { await api('/auth/logout', { method: 'POST' }); } catch(e) {}
+                    window.location.href = (document.body.dataset.panelPrefix || '') + '/login';
+                }, 1500);
+            } catch(e) { showToast(e.message, 'error'); this.accountSaving = false; }
+        },
+        async syncNTP() {
+            try {
+                const r = await api('/settings', { method: 'PUT', body: { ntp_sync: true } });
+                showToast(r.data?.message || t('settings.time_sync_triggered'), 'success');
+                this.ntpSynced = true;
+            } catch(e) { showToast(e.message, 'error'); }
+        },
+        async saveBasic() {
+            try {
+                await api('/settings', { method: 'PUT', body: { panel_title: this.panelTitle } });
+                showToast(t('settings.saved'), 'success');
+            } catch(e) { showToast(e.message, 'error'); }
+        },
+        async saveServerSetting(key, val) {
+            try {
+                const body = {};
+                body[key] = val;
+                await api('/settings', { method: 'PUT', body });
+                showToast(t('settings.updated'), 'success');
+            } catch(e) { showToast(e.message, 'error'); }
+        },
+        async saveAutoUpdate() {
+            try {
+                await api('/settings', { method: 'PUT', body: {
+                    panel_auto_update_enabled: this.autoUpdate.enabled ? 'true' : 'false',
+                    panel_auto_update_mode: this.autoUpdate.mode,
+                    panel_auto_update_window: this.autoUpdate.window,
+                    panel_auto_update_release_delay_minutes: String(this.autoUpdate.delay || 15),
+                    panel_auto_update_signature_timeout_minutes: String(this.autoUpdate.signatureTimeout || 120)
+                } });
+                showToast(t('settings.auto_update_saved'), 'success');
+            } catch(e) { showToast(e.message, 'error'); }
+        },
+        async testProxy() {
+            if (!this.githubProxy) {
+                showToast(t('settings.proxy_required'), 'error');
+                return;
+            }
+            this.proxyTesting = true;
+            this.proxyResult = '';
+            try {
+                const r = await api('/proxy/test?url=' + encodeURIComponent(this.githubProxy));
+                if (r.success) {
+                    const d = r.data;
+                    this.proxyOk = d.ok;
+                    this.proxyResult = d.ok
+                        ? t('settings.connection_ok_with_latency', { latency: d.latency })
+                        : t('settings.connection_failed_with_reason', { reason: d.error || t('settings.unknown_error') });
+                } else {
+                    this.proxyOk = false;
+                    this.proxyResult = r.message || t('settings.test_failed');
+                }
+            } catch(e) {
+                this.proxyOk = false;
+                this.proxyResult = e.message;
+            }
+            this.proxyTesting = false;
+        },
+    }
+}
+function versionCheck() {
+    return {
+        currentVersion: "{{.PanelVersion}}",
+        latestVersion: "",
+        releaseNotes: "",
+        hasUpdate: false,
+        checking: false,
+        updating: false,
+        updateError: "",
+        updateStatus: { running: false, completed: false, stage: "idle", message: "", percent: 0, download_percent: 0, downloaded_bytes: 0, total_bytes: 0, has_total: false, error: "" },
+        pollTimer: null,
+        updateStarting: false,
+        pollStartedAt: 0,
+        maxPollMs: 12 * 60 * 1000,
+        scheduleCheck() {
+            deferTask(() => this.fetchVersion(), 1000);
+        },
+        async fetchVersion() {
+            try {
+                const r = await api("/update/check", { timeout: 15000 });
+                if (r.success) {
+                    this.currentVersion = r.data.current_version;
+                    this.latestVersion = r.data.latest_version || "";
+                    this.releaseNotes = r.data.release_notes || "";
+                    this.hasUpdate = r.data.has_update;
+                    if (r.data.error) this.updateError = r.data.error;
+                }
+            } catch(e) {}
+        },
+        async checkUpdate() {
+            this.checking = true;
+            this.updateError = "";
+            await this.fetchVersion();
+            if (!this.hasUpdate && !this.updateError) showToast(t('settings.up_to_date_message'), "success");
+            this.checking = false;
+        },
+        progressPercent() {
+            const percent = Number(this.updateStatus.percent || 0);
+            return Math.max(0, Math.min(100, percent));
+        },
+        progressLabel() {
+            if (this.updateStatus.stage === "download_binary" && this.updateStatus.has_total) {
+                return (this.updateStatus.download_percent || 0) + "%";
+            }
+            return this.progressPercent() + "%";
+        },
+        updateStatusText() {
+            if (this.updateStatus.error) return this.updateStatus.error;
+            if (this.updateStatus.stage === "download_binary") {
+                if (this.updateStatus.has_total) {
+                    return (this.updateStatus.message || t('settings.downloading_update_package')) + " " + (this.updateStatus.download_percent || 0) + "%";
+                }
+                if (this.updateStatus.downloaded_bytes > 0) {
+                    return (this.updateStatus.message || t('settings.downloading_update_package')) + " " + t('settings.downloaded', { downloaded: formatBytes(this.updateStatus.downloaded_bytes) });
+                }
+            }
+            return this.updateStatus.message || t('settings.preparing_update');
+        },
+        async fetchUpdateStatus() {
+            const prefix = document.body.dataset.panelPrefix || "";
+            try {
+                const resp = await fetch(prefix + "/api/update/status", {
+                    headers: { "X-CSRF-Token": document.querySelector('meta[name="csrf-token"]')?.content || "" },
+                });
+                if (!resp.ok) throw new Error("status " + resp.status);
+                const r = await resp.json();
+                if (r.success) {
+                    const nextStatus = Object.assign({}, this.updateStatus, r.data || {});
+                    if (this.updateStarting && !nextStatus.running) {
+                        return;
+                    }
+                    if (nextStatus.running) this.updateStarting = false;
+                    this.updateStatus = nextStatus;
+                    if (!this.updateStatus.running && this.pollTimer && (!this.updating || this.updateStatus.completed || this.updateStatus.error)) {
+                        clearInterval(this.pollTimer);
+                        this.pollTimer = null;
+                    }
+                }
+            } catch(e) {
+                if (this.updating) {
+                    this.updateStatus = Object.assign({}, this.updateStatus, {
+                        running: true,
+                        message: t('settings.panel_restarting'),
+                        percent: Math.max(this.progressPercent(), 98),
+                    });
+                }
+            }
+            if (this.updating && this.pollStartedAt && Date.now() - this.pollStartedAt > this.maxPollMs) {
+                if (this.pollTimer) {
+                    clearInterval(this.pollTimer);
+                    this.pollTimer = null;
+                }
+                this.updateStarting = false;
+                this.updating = false;
+                this.updateStatus = Object.assign({}, this.updateStatus, {
+                    running: false,
+                    error: t('settings.update_status_timeout'),
+                });
+            }
+        },
+        startStatusPolling() {
+            if (this.pollTimer) clearInterval(this.pollTimer);
+            this.updateStarting = true;
+            this.pollStartedAt = Date.now();
+            this.fetchUpdateStatus();
+            this.pollTimer = setInterval(() => this.fetchUpdateStatus(), 1000);
+        },
+        async doUpdate() {
+            if (!await confirmModal(t('settings.confirm_update_version', { version: this.latestVersion }))) return;
+            this.updating = true;
+            this.updateError = "";
+            this.updateStatus = { running: true, completed: false, stage: "fetch_release", message: t('settings.preparing_update'), percent: 5, download_percent: 0, downloaded_bytes: 0, total_bytes: 0, has_total: false, error: "" };
+            this.startStatusPolling();
+            try {
+                const r = await api("/update/do", { method: "POST" });
+                this.updateStarting = false;
+                await this.fetchUpdateStatus();
+                if (!this.updateStatus.completed) {
+                    this.updateStatus = Object.assign({}, this.updateStatus, { running: false, completed: true, message: this.updateStatus.message || t('settings.update_completed_restart'), percent: 100, error: "" });
+                }
+                showToast(r.data?.message || t('settings.update_started'), "success");
+                this.updateError = t('settings.update_completed_refresh');
+                setTimeout(() => { location.reload(); }, 3000);
+            } catch(e) {
+                this.updateStarting = false;
+                await this.fetchUpdateStatus();
+                this.updateError = e.message;
+                this.updateStatus = Object.assign({}, this.updateStatus, { running: false, error: this.updateStatus.error || e.message });
+                showToast(e.message, "error");
+                this.updating = false;
+            }
+        }
+    }
+}
+
+
+function dbBackup() {
+    return {
+        backups: [],
+        backingUp: false,
+        restoring: false,
+        async init() {
+            await this.fetchBackups();
+            const restoreID = localStorage.getItem('yubWPanelDBRestoreID');
+            if (restoreID) await this.waitForRestore(restoreID);
+        },
+        async fetchBackups() {
+            try { const r = await api('/settings/db-backup'); if (r.success) this.backups = r.data || []; } catch(e) {}
+        },
+        async doBackup() {
+            this.backingUp = true;
+            try {
+                const r = await api('/settings/db-backup', { method: 'POST' });
+                showToast(r.data?.message || t('settings.backup_finished'), 'success');
+                await this.fetchBackups();
+            } catch(e) { showToast(e.message, 'error'); }
+            this.backingUp = false;
+        },
+        doDownload(filename) {
+            const prefix = document.body.dataset.panelPrefix || '';
+            window.open(prefix + '/api/settings/db-backup/' + encodeURIComponent(filename) + '/download');
+        },
+        async doRestore(filename) {
+            if (!await confirmModal(t('settings.confirm_restore_db_backup'))) return;
+            this.restoring = true;
+            try {
+                const r = await api('/settings/db-backup/restore', { method: 'POST', body: { filename } });
+                showToast(r.data?.message || t('settings.restoring'), 'success');
+                localStorage.setItem('yubWPanelDBRestoreID', r.data.restore_id);
+                await this.waitForRestore(r.data.restore_id);
+            } catch(e) {
+                this.restoring = false;
+                showToast(e.message, 'error');
+            }
+        },
+        async waitForRestore(restoreID) {
+            this.restoring = true;
+            for (let i = 0; i < 90; i++) {
+                try {
+                    const r = await api('/settings/db-backup/restore-status', { silent: true });
+                    const status = r.data || {};
+                    if (status.id === restoreID && status.status !== 'running' && status.status !== 'idle') {
+                        localStorage.removeItem('yubWPanelDBRestoreID');
+                        showToast(status.message || t('settings.restoring'), status.status === 'success' ? 'success' : 'error');
+                        setTimeout(() => location.reload(), 1500);
+                        return;
+                    }
+                } catch(e) {}
+                await new Promise(resolve => setTimeout(resolve, 2000));
+            }
+            this.restoring = false;
+            showToast(t('settings.panel_db_restore_status_unknown'), 'error');
+        },
+        async doDelete(filename) {
+            if (!await confirmModal(t('settings.confirm_delete_backup'))) return;
+            try {
+                const r = await api('/settings/db-backup?filename=' + encodeURIComponent(filename), { method: 'DELETE' });
+                showToast(r.data?.message || t('settings.deleted'), 'success');
+                await this.fetchBackups();
+            } catch(e) { showToast(e.message, 'error'); }
+        }
+    }
+}
+
+function operationLogs() {
+    return {
+        logs: [],
+        logPage: 1,
+        logTotalPages: 1,
+        logTotal: 0,
+        async fetchLogs() {
+            try {
+                const r = await api('/settings/logs?page=' + this.logPage);
+                if (r.success) {
+                    this.logs = r.data?.data || r.data || [];
+                    this.logTotal = r.data?.total || this.logs.length;
+                    this.logPage = r.data?.page || 1;
+                    this.logTotalPages = r.data?.total_pages || 1;
+                }
+            } catch(e) { console.error('fetchLogs error:', e); }
+        },
+        logGoPage(p) {
+            if (p < 1 || p > this.logTotalPages) return;
+            this.logPage = p;
+            this.fetchLogs();
+        },
+        statusText(status) {
+            const labels = {
+                success: t('settings.success'),
+                failed: t('settings.failed'),
+                running: t('settings.running'),
+                waiting: t('settings.waiting'),
+                skipped: t('settings.skipped'),
+                info: t('settings.info')
+            };
+            return labels[status] || t('settings.unknown_status');
+        },
+        statusClass(status) {
+            if (status === 'success') return 'badge-success';
+            if (status === 'failed') return 'badge-danger';
+            if (status === 'running' || status === 'waiting') return 'badge-warning';
+            return 'badge-info';
+        },
+        get logPageNumbers() {
+            const pages = [];
+            const total = this.logTotalPages;
+            const current = this.logPage;
+            let start = Math.max(1, current - 2);
+            let end = Math.min(total, start + 4);
+            if (end - start < 4) start = Math.max(1, end - 4);
+            for (let i = start; i <= end; i++) pages.push(i);
+            return pages;
+        }
+    }
+}
+function systemUpdate() {
+    return {
+        packages: [],
+        count: 0,
+        checked: false,
+        checking: false,
+        updating: false,
+        msg: '',
+        ok: false,
+        pollTimer: null,
+        init() {
+            this.resume();
+            this.scheduleCheck();
+        },
+        scheduleCheck() {
+            deferTask(() => this.check(), 1600);
+        },
+        async check(fresh = false) {
+            this.checking = true;
+            try {
+                const r = await api('/system/updates' + (fresh ? '?fresh=1' : ''));
+                if (r.success) {
+                    this.packages = r.data.packages || [];
+                    this.count = r.data.count || 0;
+                    this.checked = true;
+                }
+            } catch(e) { showToast(e.message, 'error'); }
+            this.checking = false;
+        },
+        async resume() {
+            this.pollTimer = null;
+            try {
+                const r = await api('/system/updates/status');
+                if (!r.success || !r.data) return;
+                this.applyStatus(r.data);
+            } catch(e) {
+                console.error('system update status error:', e);
+                if (this.updating && !this.pollTimer) {
+                    this.pollTimer = setTimeout(() => this.resume(), 3000);
+                }
+            }
+        },
+        applyStatus(status) {
+            this.updating = status.status === 'running';
+            if (status.status !== 'idle') {
+                this.msg = status.message || '';
+                this.ok = status.status === 'success';
+            }
+            if (this.updating) {
+                clearTimeout(this.pollTimer);
+                this.pollTimer = setTimeout(() => {
+                    this.pollTimer = null;
+                    this.resume();
+                }, 1500);
+            } else if (status.status === 'success') {
+                this.check(true);
+            }
+        },
+        async doUpdate() {
+            if (!await confirmModal(t('settings.confirm_system_update'))) return;
+            this.updating = true;
+            this.ok = false;
+            this.msg = t('settings.system_update_status_queued');
+            try {
+                const r = await api('/system/updates/do', { method: 'POST' });
+                if (r.success) this.applyStatus(r.data);
+            } catch(e) { this.ok = false; this.msg = e.message; }
+            if (!this.pollTimer) this.updating = false;
+        }
+    }
+}
+</script>
+{{end}}

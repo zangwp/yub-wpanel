@@ -1,0 +1,118 @@
+{{template "base" .}}
+{{define "extensions_content"}}
+<div x-data="extensionConfig()" x-init="load()">
+    <h2 class="text-xl font-bold text-white mb-6">{{t .Lang "nav.extensions"}}</h2>
+    <p class="text-gray-400 text-sm mb-6">{{t .Lang "extension.description"}}</p>
+
+    <div class="flex space-x-2 mb-6">
+        <button @click="reset()" class="btn-secondary text-sm">{{t .Lang "extension.reset_defaults"}}</button>
+    </div>
+
+    <div x-show="message" class="mb-4 p-3 rounded-lg text-sm" :class="msgClass" x-text="message"></div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div class="card">
+            <h3 class="text-lg font-semibold text-white mb-4">{{t .Lang "extension.themes"}}</h3>
+            <table class="table-fixed w-full text-sm">
+                <thead>
+                    <tr class="text-left text-gray-400 border-b border-gray-700">
+                        <th class="pb-2 w-1/3">Slug</th>
+                        <th class="pb-2 w-1/3">{{t .Lang "extension.name"}}</th>
+                        <th class="pb-2 w-8 text-center">{{t .Lang "extension.enabled"}}</th>
+                        <th class="pb-2 w-8"></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <template x-for="(e, i) in themes" :key="e.id || -i">
+                        <tr class="border-b border-gray-800 text-gray-300">
+                            <td class="py-2"><input type="text" x-model="e.slug" class="input-field text-xs py-1 w-full"></td>
+                            <td class="py-2 px-1"><input type="text" x-model="e.name" class="input-field text-xs py-1 w-full"></td>
+                            <td class="py-2 text-center"><input type="checkbox" x-model="e.enabled" class="w-4 h-4 rounded border-gray-600 bg-gray-700 text-blue-600"></td>
+                            <td class="py-2 text-center"><button @click="remove(themes, i)" class="text-red-400 hover:text-red-300 text-xs">{{t .Lang "extension.delete"}}</button></td>
+                        </tr>
+                    </template>
+                </tbody>
+            </table>
+            <button @click="themes.push({id:0, etype:'theme', slug:'', name:'', enabled:true})" class="btn-secondary text-xs mt-3">{{t .Lang "extension.add_theme"}}</button>
+        </div>
+
+        <div class="card">
+            <h3 class="text-lg font-semibold text-white mb-4">{{t .Lang "extension.plugins"}}</h3>
+            <table class="table-fixed w-full text-sm">
+                <thead>
+                    <tr class="text-left text-gray-400 border-b border-gray-700">
+                        <th class="pb-2 w-1/3">Slug</th>
+                        <th class="pb-2 w-1/3">{{t .Lang "extension.name"}}</th>
+                        <th class="pb-2 w-8 text-center">{{t .Lang "extension.enabled"}}</th>
+                        <th class="pb-2 w-8"></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <template x-for="(e, i) in plugins" :key="e.id || -i">
+                        <tr class="border-b border-gray-800 text-gray-300">
+                            <td class="py-2"><input type="text" x-model="e.slug" class="input-field text-xs py-1 w-full"></td>
+                            <td class="py-2 px-1"><input type="text" x-model="e.name" class="input-field text-xs py-1 w-full"></td>
+                            <td class="py-2 text-center"><input type="checkbox" x-model="e.enabled" class="w-4 h-4 rounded border-gray-600 bg-gray-700 text-blue-600"></td>
+                            <td class="py-2 text-center"><button @click="remove(plugins, i)" class="text-red-400 hover:text-red-300 text-xs">{{t .Lang "extension.delete"}}</button></td>
+                        </tr>
+                    </template>
+                </tbody>
+            </table>
+            <button @click="plugins.push({id:0, etype:'plugin', slug:'', name:'', enabled:true})" class="btn-secondary text-xs mt-3">{{t .Lang "extension.add_plugin"}}</button>
+        </div>
+    </div>
+
+    <button @click="save()" class="btn-primary mt-6">{{t .Lang "extension.save_config"}}</button>
+</div>
+
+<script>
+function extensionConfig() {
+    return {
+        themes: [],
+        plugins: [],
+        message: '',
+        msgClass: '',
+        async load() {
+            try {
+                const resp = await api('/extensions');
+                if (resp.success) {
+                    this.themes = resp.data.filter(e => e.etype === 'theme');
+                    this.plugins = resp.data.filter(e => e.etype === 'plugin');
+                }
+            } catch(e) { this.showMsg(e.message, true); }
+        },
+        async remove(arr, i) {
+            const item = arr[i];
+            if (item && item.id > 0) {
+                try {
+                    await api('/extensions/' + item.id, { method: 'DELETE' });
+                } catch(e) {
+                    this.showMsg(e.message, true);
+                    return;
+                }
+            }
+            arr.splice(i, 1);
+        },
+        async save() {
+            const all = [...this.themes, ...this.plugins];
+            try {
+                const resp = await api('/extensions', { method: 'PUT', body: all });
+                if (resp.success) { this.showMsg(t('extension.saved'), false); await this.load(); }
+            } catch(e) { this.showMsg(e.message, true); }
+        },
+        async reset() {
+            if (!confirm(t('extension.reset_confirm'))) return;
+            try {
+                const resp = await api('/extensions/reset', { method: 'POST' });
+                if (resp.success) { this.showMsg(t('extension.restored_default'), false); await this.load(); }
+            } catch(e) { this.showMsg(e.message, true); }
+        },
+        showMsg(msg, err) {
+            this.message = msg;
+            this.msgClass = err ? 'bg-red-900/50 border border-red-700 text-red-300' : 'bg-green-900/50 border border-green-700 text-green-300';
+            setTimeout(() => { this.message = ''; }, 3000);
+        }
+    }
+}
+</script>
+{{end}}

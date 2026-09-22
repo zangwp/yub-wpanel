@@ -1,0 +1,217 @@
+<?php
+/**
+ * YUB WPanel Optimizer — 面板 API 通信模块
+ *
+ * 配置加载（面板地址/API Key）、与面板 REST API 的全部 HTTP 通信、
+ * 文件锁状态同步、插件自身版本检查。
+ */
+
+if (!defined('ABSPATH')) exit;
+
+trait YUBW_Optimizer_Config_Trait {
+
+    private static function is_path_allowed_by_open_basedir($path) {
+        $openBasedir = ini_get('open_basedir');
+        if (!$openBasedir) {
+            return true;
+        }
+
+        $path = str_replace('\\', '/', $path);
+        foreach (explode(PATH_SEPARATOR, $openBasedir) as $allowed) {
+            $allowed = trim($allowed);
+            if ($allowed === '') {
+                continue;
+            }
+            if ($allowed === '.' && defined('ABSPATH')) {
+                $allowed = ABSPATH;
+            }
+            $allowed = str_replace('\\', '/', $allowed);
+            if ($allowed === '/') {
+                return true;
+            }
+            $allowed = rtrim($allowed, '/');
+            if ($allowed === '') {
+                continue;
+            }
+            if ($path === $allowed || strpos($path, $allowed . '/') === 0) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static function load_config() {
+        static $loaded = false;
+        static $cached = null;
+
+        if ($loaded) {
+            return $cached;
+        }
+        $loaded = true;
+
+        $base = '/var/yub-wpanel/site-secrets/';
+        $files = array();
+
+        // Current YUB WPanel PHP-FPM pools provide the exact identity path. This
+        // remains correct when the panel domain and WordPress home URL differ.
+        $runtimeFile = getenv('YUB_WPANEL_CONFIG_PATH');
+        if (is_string($runtimeFile)) {
+            $runtimeFile = str_replace('\\', '/', trim($runtimeFile));
+            if (preg_match('#^/var/yub-wpanel/site-secrets/[A-Za-z0-9.-]+/yub-wpanel-config\.json$#', $runtimeFile)) {
+                $files[] = $runtimeFile;
+            }
+        }
+
+        // Compatibility for pools generated before YUB_WPANEL_CONFIG_PATH was
+        // introduced. These candidates can be removed after the legacy support
+        // window ends; no new code should infer panel identity from home_url().
+        $domain = wp_parse_url(home_url(), PHP_URL_HOST);
+        if ($domain) {
+            $domain = strtolower(trim($domain));
+            $domains = array($domain);
+            if (strpos($domain, 'www.') === 0) {
+                $domains[] = substr($domain, 4);
+            } else {
+                $domains[] = 'www.' . $domain;
+            }
+            foreach ($domains as $candidateDomain) {
+                $files[] = $base . $candidateDomain . '/yub-wpanel-config.json';
+            }
+        }
+
+        foreach (array_unique($files) as $file) {
+            if (!self::is_path_allowed_by_open_basedir($file)) {
+                continue;
+            }
+            if (file_exists($file)) {
+                $json = file_get_contents($file);
+                if ($json === false) {
+                    continue;
+                }
+                $cached = json_decode($json, true);
+                return $cached;
+            }
+        }
+        return null;
+    }
+
+    private static function get_panel_url() {
+        $cfg = self::load_config();
+        return $cfg ? $cfg['panel_url'] : '';
+    }
+
+    private static function get_api_key() {
+        $cfg = self::load_config();
+        return $cfg ? $cfg['api_key'] : '';
+    }
+
+    private static function fetch_panel_state() {
+        $domain = wp_parse_url(home_url(), PHP_URL_HOST);
+        $resp = self::api_request('GET', '/api/sites/find?domain=' . urlencode($domain));
+        if (!$resp || is_wp_error($resp)) return null;
+        $data = json_decode($resp, true);
+        return !empty($data['success']) ? ($data['data'] ?? null) : null;
+    }
+
+    private static function sync_file_lock_state($force = false) {
+        if (!$force) {
+            $cached = get_transient(self::FILE_LOCK_STATE_TRANSIENT);
+            if ($cached !== false) {
+                return $cached === '1';
+            }
+        }
+        $panelState = self::fetch_panel_state();
+        if (is_array($panelState)) {
+            return self::update_file_lock_state_option($panelState) === '1';
+        }
+        $current = get_option(self::OPTION_FILE_LOCK_ENABLED, '0') === '1' ? '1' : '0';
+        set_transient(self::FILE_LOCK_STATE_TRANSIENT, $current, self::FILE_LOCK_STATE_TTL);
+        return $current === '1';
+    }
+
+    private static function update_file_lock_state_option($panelState) {
+        $value = !empty($panelState['file_lock_enabled']) ? '1' : '0';
+        update_option(self::OPTION_FILE_LOCK_ENABLED, $value);
+        set_transient(self::FILE_LOCK_STATE_TRANSIENT, $value, self::FILE_LOCK_STATE_TTL);
+        return $value;
+    }
+
+    private static function push_optimizer_settings($fcacheEnabled, $fcacheTTL, $noUpdates, $noFileEdit, $wpDebug = false, $postRevisions = -1, $memoryLimit = '', $fileLockSafeOnly = false) {
+        $domain = wp_parse_url(home_url(), PHP_URL_HOST);
+        $resp = self::api_request('PUT', '/api/sites/optimizer-settings', [
+            'domain'               => $domain,
+            'enabled'              => $fcacheEnabled,
+            'ttl'                  => $fcacheTTL,
+            'disable_wp_updates'   => $noUpdates,
+            'disable_file_editing' => $noFileEdit,
+            'wp_debug_enabled'     => $wpDebug,
+            'wp_post_revisions'    => $postRevisions,
+            'wp_memory_limit'      => $memoryLimit,
+            'file_lock_safe_only'  => $fileLockSafeOnly,
+        ]);
+        if (is_wp_error($resp)) return $resp;
+        $data = json_decode($resp, true);
+        if (empty($data['success'])) {
+            return new \WP_Error('api_error', $data['message'] ?? __('API returned an error', 'yub-wpanel-optimizer'));
+        }
+        return true;
+    }
+
+    private static function do_clear() {
+        $domain = wp_parse_url(home_url(), PHP_URL_HOST);
+        $resp = self::api_request('DELETE', '/api/sites/clear-cache', ['domain' => $domain]);
+        if (is_wp_error($resp)) {
+            return ['success' => false, 'message' => $resp->get_error_message()];
+        }
+        $data = json_decode($resp, true);
+        return ['success' => !empty($data['success']), 'message' => $data['message'] ?? ''];
+    }
+
+    public static function api_request_public($method, $path, $body = null) {
+        return self::api_request($method, $path, $body);
+    }
+
+    private static function api_request($method, $path, $body = null) {
+        $baseUrl = self::get_panel_url();
+        $apiKey  = self::get_api_key();
+        if (!$baseUrl || !$apiKey) {
+            return new \WP_Error('config_missing', __('Unable to read the YUB WPanel configuration. The site domain or runtime configuration may have changed; rebuild the companion plugin configuration from the site details page in YUB WPanel.', 'yub-wpanel-optimizer'));
+        }
+
+        $args = [
+            'method'    => $method,
+            'headers'   => [
+                'X-YUB-WPanel-Key' => $apiKey,
+                'Content-Type'   => 'application/json',
+            ],
+            'timeout'   => 10,
+            'sslverify' => false,
+        ];
+
+        if ($body) {
+            $args['body'] = json_encode($body);
+        }
+
+        $response = wp_remote_request($baseUrl . $path, $args);
+        if (is_wp_error($response)) {
+            return $response;
+        }
+
+        $code = wp_remote_retrieve_response_code($response);
+        if ($code >= 400) {
+            $body = wp_remote_retrieve_body($response);
+            // 面板错误响应是 {"success":false,"message":"..."} 这样的 JSON，取出 message
+            // 字段展示给用户；不是这个形状（例如反代/网关的错误页）才退回原始响应体。
+            $decoded = $body ? json_decode($body, true) : null;
+            if (is_array($decoded) && !empty($decoded['message'])) {
+                $msg = $decoded['message'];
+            } else {
+                $msg = $body ?: "HTTP $code";
+            }
+            return new \WP_Error('api_error', $msg);
+        }
+
+        return wp_remote_retrieve_body($response);
+    }
+}

@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Prepare static assets
+        run: |
+          mkdir -p static/css static/js bin
+
+          curl -sSL "https://cdn.jsdelivr.net/npm/alpinejs@3.13.7/dist/cdn.min.js" -o static/js/alpine.min.js
+          curl -sSL "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" -o static/js/chart.min.js
+
+          TAILWIND_VERSION="v3.4.4"
+          curl -sSL "https://github.com/tailwindlabs/tailwindcss/releases/download/${TAILWIND_VERSION}/tailwindcss-linux-x64" -o bin/tailwindcss
+          chmod +x bin/tailwindcss
+          bin/tailwindcss -i input.css -o static/css/main.css --minify
+
+      - name: Test
+        run: |
+          packages=$(go list ./... | grep -v '/scratch$')
+          go test $packages
+
+      - name: Static check
+        run: |
+          packages=$(go list ./... | grep -v '/scratch$')
+          go vet $packages
+
+      - name: Build binary
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          BUILD_TIME=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          CGO_ENABLED=0 go build -ldflags "-s -w -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME}" -o yub-wpanel .
+
+      - name: Generate SHA256
+        run: sha256sum yub-wpanel > yub-wpanel.sha256
+
+      - name: Sign SHA256
+        env:
+          RELEASE_SIGNING_KEY_B64: ${{ secrets.RELEASE_SIGNING_KEY_B64 }}
+        run: |
+          test -n "$RELEASE_SIGNING_KEY_B64"
+          trap 'rm -f release-signing-key.pem' EXIT
+          printf '%s' "$RELEASE_SIGNING_KEY_B64" | base64 --decode > release-signing-key.pem
+          chmod 600 release-signing-key.pem
+          openssl pkeyutl -sign -rawin \
+            -inkey release-signing-key.pem \
+            -in yub-wpanel.sha256 \
+            -out yub-wpanel.sha256.sig
+          test "$(wc -c < yub-wpanel.sha256.sig)" -eq 64
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          files: |
+            yub-wpanel
+            yub-wpanel.sha256
+            yub-wpanel.sha256.sig
+          generate_release_notes: true

@@ -1,0 +1,489 @@
+package executor
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"reflect"
+	"testing"
+	"time"
+)
+
+type fakeWPPluginUpdateOperations struct {
+	active bool
+	fail   map[string]error
+	calls  []string
+	hook   map[string]func()
+}
+
+func (f *fakeWPPluginUpdateOperations) call(name string) error {
+	f.calls = append(f.calls, name)
+	if hook := f.hook[name]; hook != nil {
+		hook()
+	}
+	return f.fail[name]
+}
+
+func (f *fakeWPPluginUpdateOperations) Prepare(context.Context, wpPluginUpdateExecution) (bool, error) {
+	return f.active, f.call("prepare")
+}
+func (f *fakeWPPluginUpdateOperations) Unlock(context.Context, wpPluginUpdateExecution) error {
+	return f.call("unlock")
+}
+func (f *fakeWPPluginUpdateOperations) ApplyPluginUpdate(context.Context, wpPluginUpdateExecution) error {
+	return f.call("update")
+}
+func (f *fakeWPPluginUpdateOperations) ReactivatePlugin(context.Context, wpPluginUpdateExecution) error {
+	return f.call("reactivate")
+}
+func (f *fakeWPPluginUpdateOperations) CheckTargetHealth(_ context.Context, _ wpPluginUpdateExecution, active bool) error {
+	if active != f.active {
+		return errors.New("active expectation changed")
+	}
+	return f.call("target_health")
+}
+func (f *fakeWPPluginUpdateOperations) SetMaintenance(_ context.Context, _ wpPluginUpdateExecution, enabled bool) error {
+	if enabled {
+		return f.call("maintenance_on")
+	}
+	return f.call("maintenance_off")
+}
+func (f *fakeWPPluginUpdateOperations) RestoreDatabase(context.Context, wpPluginUpdateExecution) error {
+	return f.call("restore_database")
+}
+func (f *fakeWPPluginUpdateOperations) RestorePluginFiles(context.Context, wpPluginUpdateExecution) error {
+	return f.call("restore_plugin")
+}
+func (f *fakeWPPluginUpdateOperations) CheckRollbackHealth(context.Context, wpPluginUpdateExecution) error {
+	return f.call("rollback_health")
+}
+func (f *fakeWPPluginUpdateOperations) RestoreFileLock(context.Context, wpPluginUpdateExecution) error {
+	return f.call("restore_lock")
+}
+
+func TestWPPluginUpdateExecutorActiveSuccess(t *testing.T) {
+	executor, store, task, ops := preparePluginExecutorTask(t, true)
+	if err := executor.Execute(context.Background(), task.ID, "worker-plugin"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"prepare", "unlock", "update", "reactivate", "target_health", "restore_lock"}
+	if !reflect.DeepEqual(ops.calls, want) {
+		t.Fatalf("calls=%v want=%v", ops.calls, want)
+	}
+	finished, err := store.getTask(context.Background(), task.ID)
+	if err != nil || finished.Status != wpUpdateSuccess || finished.RollbackStatus != "not_required" {
+		t.Fatalf("finished=%+v err=%v", finished, err)
+	}
+	var evidence int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM wp_update_task_events
+		WHERE task_id=? AND stage='prepare' AND error_code='plugin_observed_active'`, task.ID).Scan(&evidence); err != nil || evidence != 1 {
+		t.Fatalf("active evidence=%d err=%v", evidence, err)
+	}
+}
+
+func TestWPPluginUpdateExecutorInactiveNeverReactivates(t *testing.T) {
+	executor, store, task, ops := preparePluginExecutorTask(t, false)
+	if err := executor.Execute(context.Background(), task.ID, "worker-plugin"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"prepare", "unlock", "update", "target_health", "restore_lock"}
+	if !reflect.DeepEqual(ops.calls, want) {
+		t.Fatalf("calls=%v want=%v", ops.calls, want)
+	}
+	var evidence int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM wp_update_task_events
+		WHERE task_id=? AND stage='prepare' AND error_code='plugin_observed_inactive'`, task.ID).Scan(&evidence); err != nil || evidence != 1 {
+		t.Fatalf("inactive evidence=%d err=%v", evidence, err)
+	}
+}
+
+func TestWPThemeUpdateExecutorNeverRunsPluginReactivation(t *testing.T) {
+	store, siteID := newWPUpdateStoreTest(t)
+	seedThemeUpdateCandidate(t, store, siteID, "sample-theme", "1.0.0", "1.1.0", "collection-theme-executor")
+	webRoot := filepath.Join(t.TempDir(), "wordpress")
+	themeRoot := filepath.Join(webRoot, "wp-content", "themes", "sample-theme")
+	if err := os.MkdirAll(themeRoot, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(themeRoot, "style.css"), []byte("/*\nTheme Name: Sample\nVersion: 1.0.0\n*/\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`UPDATE websites SET web_root=?,db_name='wordpress_db' WHERE id=?`, webRoot, siteID); err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.createThemeManualPlan(context.Background(), WPUpdatePlan{
+		SiteID: siteID, ComponentKey: "sample-theme", CurrentVersion: "1.0.0", TargetVersion: "1.1.0",
+		PackageSource: "wordpress.org", DownloadURL: "https://downloads.wordpress.org/theme/sample-theme.1.1.0.zip",
+	}, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := newWPUpdateArtifactService(store, filepath.Join(t.TempDir(), "artifacts"), fakeUpdateDump)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := writeThemePackageFixture(t, "sample-theme", "1.1.0", "")
+	digest, _, _ := hashRegularFile(source)
+	task, _, err = service.snapshotValidateAndSealThemePackage(context.Background(), task.ID, source, digest, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err = service.validateAndClaimThemeUpdate(context.Background(), task.ID, "worker-theme", "1.0.0", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.prepareThemeBackups(context.Background(), task.ID, "worker-theme"); err != nil {
+		t.Fatal(err)
+	}
+	ops := &fakeWPPluginUpdateOperations{active: false, fail: map[string]error{}, hook: map[string]func(){}}
+	executor, err := newWPThemeUpdateExecutor(store, service.root, ops)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := executor.Execute(context.Background(), task.ID, "worker-theme"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"prepare", "unlock", "update", "target_health", "restore_lock"}
+	if !reflect.DeepEqual(ops.calls, want) {
+		t.Fatalf("calls=%v want=%v", ops.calls, want)
+	}
+	finished, err := store.getTask(context.Background(), task.ID)
+	if err != nil || finished.Status != wpUpdateSuccess || finished.ComponentType != "theme" {
+		t.Fatalf("finished=%+v err=%v", finished, err)
+	}
+}
+
+func TestWPPluginUpdateExecutorUpdateFailureRollsBack(t *testing.T) {
+	executor, store, task, ops := preparePluginExecutorTask(t, true)
+	ops.fail["update"] = errors.New("injected update failure")
+	if err := executor.Execute(context.Background(), task.ID, "worker-plugin"); err == nil {
+		t.Fatal("expected update failure")
+	}
+	want := []string{"prepare", "unlock", "update", "maintenance_on", "restore_database", "restore_plugin", "maintenance_off", "rollback_health", "restore_lock"}
+	if !reflect.DeepEqual(ops.calls, want) {
+		t.Fatalf("calls=%v want=%v", ops.calls, want)
+	}
+	finished, err := store.getTask(context.Background(), task.ID)
+	if err != nil || finished.Status != wpUpdateFailed || finished.RollbackStatus != "success" || finished.RequiresAttention {
+		t.Fatalf("finished=%+v err=%v", finished, err)
+	}
+}
+
+func TestWPPluginUpdateExecutorSupervisionUncertainStopsWithoutRollback(t *testing.T) {
+	executor, store, task, ops := preparePluginExecutorTask(t, true)
+	ops.fail["update"] = errWPPluginScopeSupervisionUncertain
+	if err := executor.Execute(context.Background(), task.ID, "worker-plugin"); !errors.Is(err, errWPPluginScopeSupervisionUncertain) {
+		t.Fatalf("execute error=%v", err)
+	}
+	if want := []string{"prepare", "unlock", "update"}; !reflect.DeepEqual(ops.calls, want) {
+		t.Fatalf("calls=%v want=%v", ops.calls, want)
+	}
+	current, err := store.getTask(context.Background(), task.ID)
+	if err != nil || current.Status != wpUpdateInterrupted || !current.RequiresAttention || current.LeaseOwner != "" || current.RollbackStatus != "not_required" {
+		t.Fatalf("current=%+v err=%v", current, err)
+	}
+	var evidence int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM wp_update_task_events
+		WHERE task_id=? AND error_code='runner_supervision_uncertain'`, task.ID).Scan(&evidence); err != nil || evidence != 1 {
+		t.Fatalf("evidence=%d err=%v", evidence, err)
+	}
+}
+
+func TestWPUpdateStoreRejectsForgedAndDeduplicatesPluginJournal(t *testing.T) {
+	_, store, task, _ := preparePluginExecutorTask(t, true)
+	bad := wpPluginUpdateJournalReport{Checkpoints: []string{"upgrader_returned"}}
+	if err := store.recordPluginRunnerJournal(context.Background(), task.ID, "worker-plugin", bad, time.Now()); err == nil {
+		t.Fatal("forged checkpoint order was accepted")
+	}
+	report := wpPluginUpdateJournalReport{Checkpoints: []string{"before_upgrade", "upgrader_entered"}, Truncated: true}
+	for i := 0; i < 2; i++ {
+		if err := store.recordPluginRunnerJournal(context.Background(), task.ID, "worker-plugin", report, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var count int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM wp_update_task_events
+		WHERE task_id=? AND stage='runner_journal'`, task.ID).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
+}
+
+func TestWPPluginUpdateExecutorRollbackFailureRequiresAttention(t *testing.T) {
+	executor, store, task, ops := preparePluginExecutorTask(t, true)
+	ops.fail["target_health"] = errors.New("injected health failure")
+	ops.fail["restore_plugin"] = errors.New("injected restore failure")
+	if err := executor.Execute(context.Background(), task.ID, "worker-plugin"); err == nil {
+		t.Fatal("expected rollback failure")
+	}
+	finished, err := store.getTask(context.Background(), task.ID)
+	if err != nil || finished.Status != wpUpdateFailed || finished.RollbackStatus != "failed" || !finished.RequiresAttention {
+		t.Fatalf("finished=%+v err=%v", finished, err)
+	}
+	var healthFailures, rollbackFailures int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM wp_update_task_events
+		WHERE task_id=? AND stage='health_check' AND result='failed' AND error_code='health_check_failed'`, task.ID).Scan(&healthFailures); err != nil {
+		t.Fatalf("query health_check failures: %v", err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM wp_update_task_events
+		WHERE task_id=? AND stage='rollback' AND result='failed' AND error_code='rollback_restore_plugin_failed'`, task.ID).Scan(&rollbackFailures); err != nil {
+		t.Fatalf("query rollback failures: %v", err)
+	}
+	if healthFailures != 1 {
+		t.Fatalf("health_check failure events=%d want 1", healthFailures)
+	}
+	if rollbackFailures != 1 {
+		t.Fatalf("rollback restore_plugin failure events=%d want 1", rollbackFailures)
+	}
+}
+
+func TestWPPluginUpdateExecutorAutoRollbackDisabledHaltsForManualDecision(t *testing.T) {
+	executor, store, task, ops := prepareAutoRollbackDisabledPluginTask(t, true)
+	ops.fail["target_health"] = errors.New("injected health failure")
+	if err := executor.Execute(context.Background(), task.ID, "worker-plugin"); err == nil {
+		t.Fatal("expected halt for manual decision")
+	}
+	want := []string{"prepare", "unlock", "update", "reactivate", "target_health"}
+	if !reflect.DeepEqual(ops.calls, want) {
+		t.Fatalf("calls=%v want=%v (no rollback steps should run when auto_rollback=0)", ops.calls, want)
+	}
+	finished, err := store.getTask(context.Background(), task.ID)
+	if err != nil || finished.Status != wpUpdateFailed || finished.RollbackStatus != "pending" ||
+		!finished.RequiresAttention || finished.AutoRollback || finished.LeaseOwner != "" {
+		t.Fatalf("finished=%+v err=%v", finished, err)
+	}
+	var evidence int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM wp_update_task_events
+		WHERE task_id=? AND stage='rollback' AND result='manual' AND error_code='auto_rollback_disabled_awaiting_decision'`,
+		task.ID).Scan(&evidence); err != nil || evidence != 1 {
+		t.Fatalf("halt evidence=%d err=%v", evidence, err)
+	}
+}
+
+func TestWPPluginUpdateExecutorManualRollbackRestoresAfterHalt(t *testing.T) {
+	executor, store, task, ops := prepareAutoRollbackDisabledPluginTask(t, true)
+	ops.fail["target_health"] = errors.New("injected health failure")
+	if err := executor.Execute(context.Background(), task.ID, "worker-plugin"); err == nil {
+		t.Fatal("expected halt for manual decision")
+	}
+	delete(ops.fail, "target_health")
+	ops.calls = nil
+	if err := executor.ManualRollback(context.Background(), task.ID); err != nil {
+		t.Fatalf("ManualRollback() error = %v", err)
+	}
+	want := []string{"prepare", "maintenance_on", "restore_database", "restore_plugin", "maintenance_off", "rollback_health", "restore_lock"}
+	if !reflect.DeepEqual(ops.calls, want) {
+		t.Fatalf("calls=%v want=%v", ops.calls, want)
+	}
+	finished, err := store.getTask(context.Background(), task.ID)
+	if err != nil || finished.Status != wpUpdateFailed || finished.RollbackStatus != "success" ||
+		finished.RequiresAttention || finished.ManualDisposition != "manually_rolled_back" || finished.LeaseOwner != "" {
+		t.Fatalf("finished=%+v err=%v", finished, err)
+	}
+}
+
+func TestWPPluginUpdateExecutorManualRollbackRequiresPendingDecision(t *testing.T) {
+	executor, _, task, _ := preparePluginExecutorTask(t, true)
+	if err := executor.ManualRollback(context.Background(), task.ID); err == nil {
+		t.Fatal("expected manual rollback to reject a task that is still running")
+	}
+}
+
+// TestWPPluginUpdateExecutorAbandonManualRollbackCleanupSurvivesCancelledContext 覆盖
+// 第三方审核发现的问题：loadExecution/Prepare 失败后的放弃认领清理，必须用不受调用方
+// ctx 取消影响的 controlContext，而不是直接复用可能已经被取消的原始 ctx——否则请求
+// 断开/超时导致 loadExecution 失败时，紧跟着的放弃认领会因为同一个已取消的 ctx 立刻
+// 再次失败，lease_owner 永远清不掉，用户既不能重试回滚也不能 Ignore。
+func TestWPPluginUpdateExecutorAbandonManualRollbackCleanupSurvivesCancelledContext(t *testing.T) {
+	executor, store, task, _ := prepareAutoRollbackDisabledPluginTask(t, true)
+	if err := store.haltForManualRollback(context.Background(), task.ID, "worker-plugin", "health_check", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := newWPPluginManualRollbackOwner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.beginManualRollback(context.Background(), task.ID, owner, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	// 即便传入的 ctx 已经取消（模拟 loadExecution/Prepare 正是因为请求断开而失败的场景），
+	// 放弃认领本身也必须成功，因为它内部用的是 controlContext（context.WithoutCancel）。
+	executor.abandonManualRollbackCleanup(cancelledCtx, task.ID, owner)
+	released, err := store.getTask(context.Background(), task.ID)
+	if err != nil || released.LeaseOwner != "" {
+		t.Fatalf("released=%+v err=%v, want lease_owner cleared even with a cancelled cleanup ctx", released, err)
+	}
+	if err := store.disposeFailedTaskIgnored(context.Background(), task.ID, time.Now().UTC()); err != nil {
+		t.Fatalf("expected ignore to succeed once the cleanup released the claim: %v", err)
+	}
+}
+
+func TestWPPluginUpdateExecutorOwnershipLossDoesNotStartNextSubstage(t *testing.T) {
+	executor, store, task, ops := preparePluginExecutorTask(t, true)
+	ops.hook["update"] = func() {
+		if _, err := store.db.Exec(`UPDATE wp_update_tasks SET lease_owner='replacement-owner' WHERE id=?`, task.ID); err != nil {
+			t.Errorf("replace owner: %v", err)
+		}
+	}
+	if err := executor.Execute(context.Background(), task.ID, "worker-plugin"); err == nil {
+		t.Fatal("expected ownership loss")
+	}
+	want := []string{"prepare", "unlock", "update"}
+	if !reflect.DeepEqual(ops.calls, want) {
+		t.Fatalf("calls=%v want=%v", ops.calls, want)
+	}
+	current, err := store.getTask(context.Background(), task.ID)
+	if err != nil || current.Status != wpUpdateRunning || current.LeaseOwner != "replacement-owner" || current.RollbackStatus != "not_required" {
+		t.Fatalf("current=%+v err=%v", current, err)
+	}
+}
+
+func TestWPPluginUpdateExecutorRollbackOwnershipLossStopsAtBoundary(t *testing.T) {
+	executor, store, task, ops := preparePluginExecutorTask(t, true)
+	ops.fail["update"] = errors.New("injected update failure")
+	ops.hook["maintenance_on"] = func() {
+		if _, err := store.db.Exec(`UPDATE wp_update_tasks SET lease_owner='replacement-owner' WHERE id=?`, task.ID); err != nil {
+			t.Errorf("replace owner: %v", err)
+		}
+	}
+	if err := executor.Execute(context.Background(), task.ID, "worker-plugin"); err == nil {
+		t.Fatal("expected rollback ownership loss")
+	}
+	want := []string{"prepare", "unlock", "update", "maintenance_on"}
+	if !reflect.DeepEqual(ops.calls, want) {
+		t.Fatalf("calls=%v want=%v", ops.calls, want)
+	}
+	current, err := store.getTask(context.Background(), task.ID)
+	if err != nil || current.Status != wpUpdateRunning || current.LeaseOwner != "replacement-owner" || current.RollbackStatus != "pending" {
+		t.Fatalf("current=%+v err=%v", current, err)
+	}
+}
+
+func TestWPPluginUpdateExecutorCancellationAfterWriteBecomesInterrupted(t *testing.T) {
+	executor, store, task, ops := preparePluginExecutorTask(t, true)
+	ctx, cancel := context.WithCancel(context.Background())
+	ops.hook["reactivate"] = cancel
+	if err := executor.Execute(ctx, task.ID, "worker-plugin"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("execute error=%v", err)
+	}
+	want := []string{"prepare", "unlock", "update", "reactivate"}
+	if !reflect.DeepEqual(ops.calls, want) {
+		t.Fatalf("calls=%v want=%v", ops.calls, want)
+	}
+	current, err := store.getTask(context.Background(), task.ID)
+	if err != nil || current.Status != wpUpdateInterrupted || !current.RequiresAttention || current.LeaseOwner != "" {
+		t.Fatalf("current=%+v err=%v", current, err)
+	}
+}
+
+func TestWPPluginUpdateExecutorCancellationDuringRollbackStillFinishes(t *testing.T) {
+	executor, store, task, ops := preparePluginExecutorTask(t, true)
+	ctx, cancel := context.WithCancel(context.Background())
+	ops.fail["update"] = errors.New("injected update failure")
+	ops.hook["restore_database"] = cancel
+	if err := executor.Execute(ctx, task.ID, "worker-plugin"); err == nil {
+		t.Fatal("expected rolled back update failure")
+	}
+	want := []string{"prepare", "unlock", "update", "maintenance_on", "restore_database", "restore_plugin", "maintenance_off", "rollback_health", "restore_lock"}
+	if !reflect.DeepEqual(ops.calls, want) {
+		t.Fatalf("calls=%v want=%v", ops.calls, want)
+	}
+	current, err := store.getTask(context.Background(), task.ID)
+	if err != nil || current.Status != wpUpdateFailed || current.RollbackStatus != "success" {
+		t.Fatalf("current=%+v err=%v", current, err)
+	}
+}
+
+func preparePluginExecutorTask(t *testing.T, active bool) (*wpPluginUpdateExecutor, *wpUpdateStore, WPUpdateTask, *fakeWPPluginUpdateOperations) {
+	t.Helper()
+	service, store, task, webRoot := prepareRunningPluginArtifactTask(t, fakeUpdateDump)
+	pluginRoot := filepath.Join(webRoot, "wp-content", "plugins", "sample")
+	if err := writePluginDirectoryFixture(pluginRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.preparePluginBackups(context.Background(), task.ID, "worker-plugin"); err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.getTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ops := &fakeWPPluginUpdateOperations{active: active, fail: map[string]error{}, hook: map[string]func(){}}
+	executor, err := newWPPluginUpdateExecutor(store, service.root, ops)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return executor, store, task, ops
+}
+
+// prepareAutoRollbackDisabledPluginTask 与 preparePluginExecutorTask 相同，但任务的
+// auto_rollback 在计划创建（封存前）就置为 0，模拟批量更新场景。auto_rollback 一旦封存
+// 就不可再改（trg_wp_update_tasks_sealed_auto_rollback_immutable），所以必须在 WPUpdatePlan
+// 里从一开始就带上 SkipAutoRollback，不能像其它字段那样事后用 SQL 直接改。
+func prepareAutoRollbackDisabledPluginTask(t *testing.T, active bool) (*wpPluginUpdateExecutor, *wpUpdateStore, WPUpdateTask, *fakeWPPluginUpdateOperations) {
+	t.Helper()
+	store, siteID := newWPUpdateStoreTest(t)
+	seedPluginUpdateCandidate(t, store, siteID, "sample/sample.php", "1.0.0", "1.1.0", "collection-plugin")
+	webRoot := filepath.Join(t.TempDir(), "wordpress")
+	if err := os.MkdirAll(filepath.Join(webRoot, "wp-content", "plugins"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`UPDATE websites SET web_root=?,db_name='wordpress_db' WHERE id=?`, webRoot, siteID); err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.createPluginManualPlan(context.Background(), WPUpdatePlan{
+		SiteID: siteID, ComponentKey: "sample/sample.php", CurrentVersion: "1.0.0", TargetVersion: "1.1.0",
+		PackageSource: "wordpress.org", DownloadURL: "https://downloads.wordpress.org/plugin/sample.1.1.0.zip",
+		SkipAutoRollback: true, BatchID: "wpub_test",
+	}, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := writePluginPackageFixture(t, "sample", "sample.php", "1.1.0")
+	service, err := newWPUpdateArtifactService(store, filepath.Join(t.TempDir(), "artifacts"), fakeUpdateDump)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, _, err := hashRegularFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, _, err = service.snapshotValidateAndSealPluginPackage(context.Background(), task.ID, source, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stamp := wpUpdateDBTime(time.Now().UTC())
+	if _, err := store.db.Exec(`UPDATE wp_update_tasks SET status='running',stage='claimed',lease_owner='worker-plugin',
+		lease_expires_at=?,started_at=?,updated_at=? WHERE id=? AND status='queued'`, stamp, stamp, stamp, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	pluginRoot := filepath.Join(webRoot, "wp-content", "plugins", "sample")
+	if err := writePluginDirectoryFixture(pluginRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.preparePluginBackups(context.Background(), task.ID, "worker-plugin"); err != nil {
+		t.Fatal(err)
+	}
+	task, err = store.getTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.AutoRollback || task.BatchID != "wpub_test" {
+		t.Fatalf("task=%+v did not persist SkipAutoRollback/BatchID", task)
+	}
+	ops := &fakeWPPluginUpdateOperations{active: active, fail: map[string]error{}, hook: map[string]func(){}}
+	executor, err := newWPPluginUpdateExecutor(store, service.root, ops)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return executor, store, task, ops
+}
+
+func writePluginDirectoryFixture(root string) error {
+	if err := os.MkdirAll(root, 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(root, "sample.php"), []byte("<?php /* Plugin Name: Sample */"), 0644)
+}

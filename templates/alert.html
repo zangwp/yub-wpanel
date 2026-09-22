@@ -1,0 +1,426 @@
+{{template "base" .}}
+{{define "alert_content"}}
+<div x-data="alertManager()" x-init="fetchAll()">
+    <h2 class="text-xl font-bold text-white mb-6">{{t .Lang "nav.alert"}}</h2>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-8 mb-6">
+        <div class="space-y-8">
+            <div class="card" x-data="smtpConfig()" x-init="fetch()">
+                <h3 class="text-lg font-semibold text-white mb-4">{{t .Lang "alert.smtp_config"}}</h3>
+                <div class="mb-3">
+                    <label class="text-sm text-gray-300 mb-1 block">{{t .Lang "alert.smtp_server"}}</label>
+                    <input type="text" x-model="cfg.smtp_host" class="input-field text-sm">
+                </div>
+                <div class="mb-3">
+                    <label class="text-sm text-gray-300 mb-1 block">{{t .Lang "alert.port"}}</label>
+                    <input type="text" x-model="cfg.smtp_port" class="input-field text-sm">
+                </div>
+                <div class="mb-3">
+                    <label class="text-sm text-gray-300 mb-1 block">{{t .Lang "alert.encryption"}}</label>
+                    <select x-model="cfg.smtp_encryption" class="input-field text-sm">
+                        <option value="starttls">STARTTLS</option>
+                        <option value="ssl">SSL</option>
+                        <option value="none">{{t .Lang "alert.none"}}</option>
+                    </select>
+                </div>
+                <div class="mb-3">
+                    <label class="text-sm text-gray-300 mb-1 block">{{t .Lang "alert.sender_email"}}</label>
+                    <input type="text" x-model="cfg.smtp_user" class="input-field text-sm">
+                </div>
+                <div class="mb-3">
+                    <label class="text-sm text-gray-300 mb-1 block">{{t .Lang "alert.password_or_token"}}</label>
+                    <input type="password" x-model="cfg.smtp_pass" class="input-field text-sm">
+                </div>
+                <div class="mb-3">
+                    <label class="text-sm text-gray-300 mb-1 block">{{t .Lang "alert.admin_email"}}</label>
+                    <input type="text" x-model="cfg.admin_email" class="input-field text-sm" placeholder="admin@example.com">
+                </div>
+                <p class="text-xs text-amber-400 mb-3">{{t .Lang "alert.smtp_transfer_warning"}}</p>
+                <div class="flex flex-wrap gap-3">
+                    <button @click="save" :disabled="saving" class="btn-primary text-sm" x-text="saving ? t('alert.saving') : t('common.save')"></button>
+                    <button @click="test" :disabled="testing" class="btn-secondary text-sm" x-text="testing ? t('alert.sending') : t('alert.test_send')"></button>
+                    <button @click="copyConfig" :disabled="transferring" class="btn-secondary text-sm" x-text="t('alert.smtp_copy')"></button>
+                    <button @click="openImportModal" :disabled="transferring" class="btn-secondary text-sm" x-text="t('alert.smtp_import')"></button>
+                </div>
+
+                <div x-cloak x-show="importOpen" class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" @click.self="closeImportModal()" @keydown.escape.window="closeImportModal()">
+                    <div class="card w-full max-w-xl" role="dialog" aria-modal="true" aria-labelledby="smtp-import-title">
+                        <h3 id="smtp-import-title" class="text-lg font-semibold text-white mb-2">{{t .Lang "alert.smtp_import"}}</h3>
+                        <p class="text-sm text-gray-400 mb-4">{{t .Lang "alert.smtp_import_prompt"}}</p>
+                        <label class="text-sm text-gray-300 mb-1 block" for="smtp-import-code">{{t .Lang "alert.smtp_config_code"}}</label>
+                        <textarea id="smtp-import-code" x-ref="importCode" x-model="importCode" rows="7" class="input-field font-mono text-xs resize-y" placeholder="YUBWPANEL-SMTP-V1:"></textarea>
+                        <div class="flex justify-end gap-3 mt-5">
+                            <button @click="closeImportModal()" :disabled="transferring" class="btn-secondary text-sm">{{t .Lang "common.cancel"}}</button>
+                            <button @click="importConfig" :disabled="transferring || !importCode.trim()" class="btn-primary text-sm" x-text="t('alert.smtp_import')"></button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card" x-data="webhookConfig()" x-init="fetch()">
+                <h3 class="text-lg font-semibold text-white mb-4">{{t .Lang "alert.webhook_push"}}</h3>
+                <div class="mb-3">
+                    <label class="text-sm text-gray-300 mb-1 block">{{t .Lang "alert.push_channel"}}</label>
+                    <select x-model="cfg.webhook_channel" class="input-field text-sm">
+                        <option value="wecom">{{t .Lang "alert.wecom"}}</option>
+                        <option value="dingtalk">{{t .Lang "alert.dingtalk"}}</option>
+                        <option value="feishu">{{t .Lang "alert.feishu"}}</option>
+                        <option value="serverchan">Server酱</option>
+                        <option value="bark">Bark</option>
+                        <option value="custom">{{t .Lang "alert.custom"}}</option>
+                    </select>
+                </div>
+                <div class="mb-3">
+                    <label class="text-sm text-gray-300 mb-1 block">Webhook URL</label>
+                    <input type="text" x-model="cfg.webhook_url" class="input-field text-sm" placeholder="https://...">
+                    <p class="text-xs text-gray-500 mt-1">{{t .Lang "alert.webhook_url_help"}}</p>
+                </div>
+                <div class="flex space-x-3">
+                    <button @click="save" :disabled="saving" class="btn-primary text-sm" x-text="saving ? t('alert.saving') : t('common.save')"></button>
+                    <button @click="test" :disabled="testing" class="btn-secondary text-sm" x-text="testing ? t('alert.sending') : t('alert.test_send')"></button>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3 class="text-lg font-semibold text-white mb-4">{{t .Lang "alert.rules"}}</h3>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+                <label class="flex items-center space-x-2 text-sm text-gray-300 cursor-pointer mb-3">
+                    <input type="checkbox" x-model="rules.alert_cpu" @change="save">
+                    <span>{{t .Lang "alert.rule_cpu"}}</span>
+                </label>
+                <label class="flex items-center space-x-2 text-sm text-gray-300 cursor-pointer mb-3">
+                    <input type="checkbox" x-model="rules.alert_memory" @change="save">
+                    <span>{{t .Lang "alert.rule_memory"}}</span>
+                </label>
+                <label class="flex items-center space-x-2 text-sm text-gray-300 cursor-pointer mb-3">
+                    <input type="checkbox" x-model="rules.alert_oom" @change="save">
+                    <span>{{t .Lang "alert.rule_oom"}}</span>
+                </label>
+                <label class="flex items-center space-x-2 text-sm text-gray-300 cursor-pointer mb-3">
+                    <input type="checkbox" x-model="rules.alert_disk" @change="save">
+                    <span>{{t .Lang "alert.rule_disk"}}</span>
+                </label>
+            </div>
+            <div>
+                <label class="flex items-center space-x-2 text-sm text-gray-300 cursor-pointer mb-3">
+                    <input type="checkbox" x-model="rules.alert_service" @change="save">
+                    <span>{{t .Lang "alert.rule_service"}}</span>
+                </label>
+                <label class="flex items-center space-x-2 text-sm text-gray-300 cursor-pointer mb-3">
+                    <input type="checkbox" x-model="rules.alert_ssl" @change="save">
+                    <span>{{t .Lang "alert.rule_ssl"}}</span>
+                </label>
+                <label class="flex items-center space-x-2 text-sm text-gray-300 cursor-pointer mb-3">
+                    <input type="checkbox" x-model="rules.alert_backup" @change="save">
+                    <span>{{t .Lang "alert.rule_backup"}}</span>
+                </label>
+                <label class="flex items-center space-x-2 text-sm text-gray-300 cursor-pointer mb-3">
+                    <input type="checkbox" x-model="rules.alert_remote_backup" @change="save">
+                    <span>{{t .Lang "alert.rule_remote_backup"}}</span>
+                </label>
+                <label class="flex items-center space-x-2 text-sm text-gray-300 cursor-pointer mb-3">
+                    <input type="checkbox" x-model="rules.alert_cron_fail" @change="save">
+                    <span>{{t .Lang "alert.rule_cron_fail"}}</span>
+                </label>
+                <label class="flex items-center space-x-2 text-sm text-gray-300 cursor-pointer mb-3">
+                    <input type="checkbox" x-model="rules.alert_website_expiry" @change="save">
+                    <span>{{t .Lang "alert.rule_website_expiry"}}</span>
+                </label>
+                <label class="flex items-center space-x-2 text-sm text-gray-300 cursor-pointer mb-3">
+                    <input type="checkbox" x-model="rules.alert_system_update" @change="save">
+                    <span>{{t .Lang "alert.rule_system_update"}}</span>
+                </label>
+                <label class="flex items-center space-x-2 text-sm text-gray-300 cursor-pointer mb-3">
+                    <input type="checkbox" x-model="rules.alert_panel_update" @change="save">
+                    <span>{{t .Lang "alert.rule_panel_update"}}</span>
+                </label>
+                <label class="flex items-center space-x-2 text-sm text-gray-300 cursor-pointer mb-3">
+                    <input type="checkbox" x-model="rules.alert_wp_fake_search_bot" @change="save">
+                    <span>{{t .Lang "alert.rule_wp_fake_search_bot"}}</span>
+                </label>
+                <div class="flex flex-wrap items-center gap-4 mt-2 mb-3 text-sm text-gray-300">
+                    <label class="flex items-center gap-2">
+                        <span>{{t .Lang "alert.wp_security_threshold_label"}}</span>
+                        <input type="number" min="1" max="10000" x-model.number="wpSecCfg.threshold" @change="saveWPSecCfg" :disabled="wpSecSaving" class="input-field w-20 py-1 text-sm">
+                    </label>
+                    <label class="flex items-center gap-2">
+                        <span>{{t .Lang "alert.wp_security_window_label"}}</span>
+                        <input type="number" min="1" max="168" x-model.number="wpSecCfg.windowHours" @change="saveWPSecCfg" :disabled="wpSecSaving" class="input-field w-20 py-1 text-sm">
+                    </label>
+                </div>
+            </div>
+        </div>
+        <p class="text-xs text-gray-500 mt-2">{{t .Lang "alert.rate_limit_help"}}</p>
+        <p class="text-xs text-gray-500 mt-1">{{t .Lang "alert.wp_security_alert_help"}}</p>
+    </div>
+    </div>
+
+    <div class="card">
+        <h3 class="text-lg font-semibold text-white mb-4">{{t .Lang "alert.recent_logs"}}</h3>
+        <div class="overflow-x-auto">
+            <table class="table-fixed w-full min-w-[860px] text-sm">
+                <thead class="border-b border-gray-700 text-gray-400">
+                    <tr>
+                        <th class="w-40 py-2 text-left whitespace-nowrap">{{t .Lang "alert.time"}}</th>
+                        <th class="w-44 py-2 pr-3 text-left whitespace-nowrap">{{t .Lang "alert.type"}}</th>
+                        <th class="w-20 py-2 text-left whitespace-nowrap">{{t .Lang "alert.level"}}</th>
+                        <th class="py-2 text-left">{{t .Lang "alert.content"}}</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-gray-800">
+                    <template x-for="l in logs" :key="l.id">
+                        <tr>
+                            <td class="py-2 text-xs text-gray-400 whitespace-nowrap" x-text="fmtTime(l.created_at)"></td>
+                            <td class="py-2 pr-3 align-top text-sm text-gray-300" style="white-space: normal; overflow-wrap: anywhere;" x-text="typeLabel(l.alert_type)"></td>
+                            <td class="py-2 whitespace-nowrap">
+                                <span x-show="l.level === 'critical'" class="text-red-400 text-xs">{{t .Lang "alert.level_critical"}}</span>
+                                <span x-show="l.level === 'info'" class="text-green-400 text-xs">{{t .Lang "alert.level_info"}}</span>
+                            </td>
+                            <td class="py-2 text-sm text-gray-400" style="white-space: normal; overflow-wrap: anywhere;" x-text="l.message"></td>
+                        </tr>
+                    </template>
+                    <tr x-show="logs.length === 0">
+                        <td colspan="4" class="py-6 text-center text-gray-500">{{t .Lang "alert.no_logs"}}</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<script>
+function alertSettings() {
+    return cachedAPI('/alert/settings', { silent: true }, 2000);
+}
+
+function smtpConfig() {
+    return {
+        cfg: { smtp_host: '', smtp_port: '587', smtp_encryption: 'starttls', smtp_user: '', smtp_pass: '', admin_email: '' },
+        saving: false,
+        testing: false,
+        transferring: false,
+        importOpen: false,
+        importCode: '',
+        async fetch() {
+            try {
+                const r = await alertSettings();
+                if (r.success) {
+                    const d = r.data || {};
+                    this.cfg = {
+                        smtp_host: d.smtp_host || '',
+                        smtp_port: d.smtp_port || '587',
+                        smtp_encryption: d.smtp_encryption || 'starttls',
+                        smtp_user: d.smtp_user || '',
+                        smtp_pass: d.smtp_pass || '',
+                        admin_email: d.admin_email || ''
+                    };
+                }
+            } catch(e) {}
+        },
+        async save() {
+            this.saving = true;
+            try {
+                const body = {
+                    smtp_host: this.cfg.smtp_host || '',
+                    smtp_port: this.cfg.smtp_port || '587',
+                    smtp_encryption: this.cfg.smtp_encryption || 'starttls',
+                    smtp_user: this.cfg.smtp_user || '',
+                    smtp_pass: this.cfg.smtp_pass || '',
+                    admin_email: this.cfg.admin_email || ''
+                };
+                await api('/alert/settings', { method: 'PUT', body });
+                showToast(t('alert.smtp_config_saved'), 'success');
+            } catch(e) { showToast(e.message, 'error'); }
+            this.saving = false;
+        },
+        async test() {
+            this.testing = true;
+            try {
+                const r = await api('/alert/test-smtp', { method: 'POST', body: { email: this.cfg.admin_email || '' } });
+                showToast(r.data?.message || t('common.operation_success'), 'success');
+            } catch(e) { showToast(e.message || t('alert.send_failed'), 'error'); }
+            this.testing = false;
+        },
+        async copyConfig() {
+            this.transferring = true;
+            try {
+                const r = await api('/alert/smtp-config/export', { method: 'POST', body: {} });
+                let copied = false;
+                if (navigator.clipboard?.writeText) {
+                    try {
+                        await navigator.clipboard.writeText(r.data.code);
+                        copied = true;
+                    } catch (_) {}
+                }
+                if (!copied) {
+                    const input = document.createElement('textarea');
+                    input.value = r.data.code;
+                    input.style.position = 'fixed';
+                    input.style.opacity = '0';
+                    document.body.appendChild(input);
+                    input.select();
+                    copied = document.execCommand('copy');
+                    input.remove();
+                }
+                if (!copied) throw new Error(t('alert.smtp_copy_failed'));
+                showToast(t('alert.smtp_copy_success'), 'success');
+            } catch(e) { showToast(e.message || t('alert.smtp_copy_failed'), 'error'); }
+            this.transferring = false;
+        },
+        openImportModal() {
+            this.importCode = '';
+            this.importOpen = true;
+            this.$nextTick(() => this.$refs.importCode.focus());
+        },
+        closeImportModal() {
+            if (this.transferring) return;
+            this.importOpen = false;
+            this.importCode = '';
+        },
+        async importConfig() {
+            const code = this.importCode.trim();
+            if (!code) return;
+            this.transferring = true;
+            try {
+                const r = await api('/alert/smtp-config/import', { method: 'POST', body: { code } });
+                const d = r.data || {};
+                const hasExisting = ['smtp_host', 'smtp_user', 'smtp_pass', 'admin_email'].some(k => String(this.cfg[k] || '').trim() !== '');
+                if (hasExisting && !await confirmModal(t('alert.smtp_overwrite_confirm'))) {
+                    showToast(t('alert.smtp_import_cancelled'), 'info');
+                    this.importOpen = false;
+                    this.importCode = '';
+                    return;
+                }
+                this.cfg = {
+                    smtp_host: d.smtp_host || '',
+                    smtp_port: d.smtp_port || '587',
+                    smtp_encryption: d.smtp_encryption || 'starttls',
+                    smtp_user: d.smtp_user || '',
+                    smtp_pass: d.smtp_pass || '',
+                    admin_email: d.admin_email || ''
+                };
+                this.importOpen = false;
+                this.importCode = '';
+                showToast(t('alert.smtp_import_success'), 'success');
+            } catch(e) { showToast(e.message, 'error'); }
+            finally { this.transferring = false; }
+        }
+    }
+}
+
+function webhookConfig() {
+    return {
+        cfg: { webhook_channel: 'wecom', webhook_url: '' },
+        saving: false,
+        testing: false,
+        async fetch() {
+            try { const r = await alertSettings(); if (r.success) { const d = r.data || {}; if (d.webhook_channel) this.cfg.webhook_channel = d.webhook_channel; if (d.webhook_url) this.cfg.webhook_url = d.webhook_url; } } catch(e) {}
+        },
+        async save() {
+            this.saving = true;
+            try {
+                await api('/alert/settings', { method: 'PUT', body: { ...this.cfg } });
+                showToast(t('alert.webhook_config_saved'), 'success');
+            } catch(e) { showToast(e.message, 'error'); }
+            this.saving = false;
+        },
+        async test() {
+            if (!this.cfg.webhook_url) { showToast(t('alert.webhook_url_required'), 'error'); return; }
+            this.testing = true;
+            try {
+                const r = await api('/alert/test-webhook', { method: 'POST', body: { channel: this.cfg.webhook_channel, url: this.cfg.webhook_url } });
+                showToast(r.data?.message || t('common.operation_success'), 'success');
+            } catch(e) { showToast(e.message || t('alert.send_failed'), 'error'); }
+            this.testing = false;
+        }
+    }
+}
+
+function alertManager() {
+    return {
+        rules: {},
+        wpSecCfg: { threshold: 10, windowHours: 24 },
+        wpSecSaving: false,
+        logs: [],
+        async fetchAll() {
+            try {
+                const r = await alertSettings();
+                if (r.success) {
+                    const d = r.data || {};
+                    for (const k of Object.keys(d)) {
+                        // alert_wp_security_threshold / alert_wp_security_window_hours
+                        // 是数值键，不能走布尔 rules 通道，否则 "10" 会被 !== 'false'
+                        // 判成 true，下次 save() 又把 true 写回去覆盖数值。
+                        if (k.startsWith('alert_') && k !== 'alert_wp_sqli_probe' && k !== 'alert_wp_security_threshold' && k !== 'alert_wp_security_window_hours') {
+                            this.rules[k] = d[k] !== 'false';
+                        }
+                    }
+                    this.wpSecCfg.threshold = parseInt(d.alert_wp_security_threshold) || 10;
+                    this.wpSecCfg.windowHours = parseInt(d.alert_wp_security_window_hours) || 24;
+                }
+            } catch(e) {}
+            this.fetchLog();
+        },
+        async save() {
+            try {
+                const body = {};
+                for (const k of Object.keys(this.rules)) {
+                    body[k] = this.rules[k] ? 'true' : 'false';
+                }
+                await api('/alert/settings', { method: 'PUT', body });
+            } catch(e) {
+                showToast(e.message || t('common.operation_failed'), 'error');
+                await this.fetchAll();
+            }
+        },
+        async saveWPSecCfg() {
+            this.wpSecSaving = true;
+            try {
+                await api('/alert/settings', { method: 'PUT', body: {
+                    alert_wp_security_threshold: String(this.wpSecCfg.threshold),
+                    alert_wp_security_window_hours: String(this.wpSecCfg.windowHours)
+                }});
+                showToast(t('alert.wp_security_config_saved'), 'success');
+            } catch(e) { showToast(e.message || t('common.operation_failed'), 'error'); }
+            this.wpSecSaving = false;
+        },
+        async fetchLog() {
+            try {
+                const r = await api('/alert/log');
+                if (r.success) this.logs = r.data || [];
+            } catch(e) {}
+        },
+        typeLabel(alertType) {
+            const m = {
+                alert_cpu: t('alert.type_cpu_high_load'),
+                alert_memory: t('alert.type_memory_low'),
+                alert_oom: t('alert.type_oom'),
+                alert_disk: t('alert.type_disk_pressure'),
+                alert_service: t('alert.type_service_abnormal'),
+                alert_ssl: t('alert.type_ssl_expire'),
+                alert_backup: t('alert.type_backup_failed'),
+                alert_remote_backup: t('alert.type_remote_backup_failed'),
+                alert_cron_fail: t('alert.type_cron_failed'),
+                alert_website_expiry: t('alert.type_website_expiry'),
+                alert_site: t('alert.type_site_unavailable'),
+                alert_system_update: t('alert.type_system_update'),
+                alert_panel_update: t('alert.type_panel_update'),
+                alert_wp_sqli_probe: t('alert.type_wp_sqli_probe'),
+                alert_wp_fake_search_bot: t('alert.type_wp_fake_search_bot'),
+                alert_wp_admin_change: t('alert.type_wp_admin_change'),
+                alert_wp_post_volume: t('alert.type_wp_post_volume'),
+                alert_wp_content_change: t('alert.type_wp_content_change'),
+                alert_wp_content_volume: t('alert.type_wp_content_volume'),
+                alert_wp_setting_change: t('alert.type_wp_setting_change'),
+                alert_wp_application_password: t('alert.type_wp_application_password'),
+                alert_wp_database_object: t('alert.type_wp_database_object'),
+                alert_wp_code_integrity: t('alert.type_wp_code_integrity')
+            };
+            return m[alertType] || alertType;
+        }
+    }
+}
+</script>
+{{end}}

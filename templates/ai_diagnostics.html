@@ -1,0 +1,570 @@
+{{template "base" .}}
+{{define "ai_diagnostics_content"}}
+<div x-data="aiDiagnosticsPage()" x-init="init()">
+    <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-3 mb-6">
+        <div>
+            <h2 class="text-xl font-bold text-white">{{t .Lang "nav.ai_diagnostics"}}</h2>
+            <p class="text-xs text-gray-500 mt-1">{{t .Lang "ai_diagnostics.description"}}</p>
+        </div>
+        <button type="button" @click="openAISettings()" class="btn-secondary text-sm">{{t .Lang "ai_diagnostics.ai_settings"}}</button>
+    </div>
+
+    <div x-show="showAISettings" x-cloak @keydown.escape.window="closeAISettings()" class="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-60 p-4" @click.self="closeAISettings()">
+        <div class="w-full max-w-2xl max-h-[90vh] overflow-y-auto rounded-lg p-6 shadow-xl" style="background-color: #1e293b; border: 1px solid #334155;">
+            <div class="flex items-start justify-between gap-4 mb-5">
+                <div>
+                    <h3 class="text-lg font-semibold text-white">{{t .Lang "settings.ai_settings"}}</h3>
+                    <p class="text-xs text-gray-500 mt-1">{{t .Lang "settings.ai_settings_help"}}</p>
+                </div>
+                <button type="button" @click="closeAISettings()" class="text-gray-400 hover:text-white text-xl" aria-label="{{t .Lang "common.close"}}">&times;</button>
+            </div>
+
+            <div x-show="aiSettingsLoading" class="py-12 text-center text-sm text-gray-400">{{t .Lang "common.loading"}}</div>
+            <div x-show="!aiSettingsLoading" class="space-y-4">
+                <label class="flex items-center space-x-2 text-sm text-gray-300 cursor-pointer">
+                    <input type="checkbox" x-model="ai.enabled">
+                    <span x-text="ai.enabled ? t('settings.enabled') : t('settings.disabled')"></span>
+                </label>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div><label class="label">{{t .Lang "settings.provider"}}</label><select x-model="ai.provider" @change="applyAIProviderDefaults()" class="input-field text-sm"><option value="deepseek">DeepSeek</option><option value="openai">OpenAI</option><option value="openai_compatible">OpenAI Compatible</option></select></div>
+                    <div><label class="label">{{t .Lang "settings.model"}}</label><input type="text" x-model="ai.model" class="input-field text-sm" placeholder="deepseek-v4-pro"></div>
+                    <div><label class="label">Base URL</label><input type="text" x-model="ai.base_url" class="input-field text-sm" placeholder="https://api.deepseek.com"></div>
+                    <div><label class="label">API Key</label><input type="password" x-model="ai.api_key" class="input-field text-sm" :placeholder="ai.api_key_masked || t('settings.api_key_placeholder')"></div>
+                    <div><label class="label">{{t .Lang "settings.timeout_seconds"}}</label><input type="number" x-model.number="ai.timeout_seconds" min="15" max="180" class="input-field text-sm"><p class="text-xs text-gray-500 mt-1">{{t .Lang "settings.ai_timeout_help"}}</p></div>
+                </div>
+                <div class="p-3 rounded text-xs text-yellow-200" style="background-color: #422006; border: 1px solid #854d0e;">{{t .Lang "settings.ai_privacy_notice"}}</div>
+                <div class="flex flex-wrap items-center gap-3">
+                    <button type="button" @click="testAI()" :disabled="aiTesting || aiSaving" class="btn-secondary text-sm" x-text="aiTesting ? t('settings.testing') : t('settings.test_connection')"></button>
+                    <button type="button" @click="saveAI()" :disabled="aiSaving || aiTesting" class="btn-primary text-sm" x-text="aiSaving ? t('settings.saving') : t('settings.save_ai_settings')"></button>
+                </div>
+                <p x-show="aiTestResult" class="text-xs" :class="aiTestOK ? 'text-green-400' : 'text-red-400'" x-text="aiTestResult"></p>
+            </div>
+        </div>
+    </div>
+
+    <div class="p-3 rounded text-xs text-yellow-200 mb-6" style="background-color: #422006; border: 1px solid #854d0e;">
+        {{t .Lang "ai_diagnostics.privacy_notice"}}
+    </div>
+
+    <div class="grid grid-cols-1 xl:grid-cols-12 gap-6">
+        <div class="xl:col-span-4 space-y-6">
+            <div class="card">
+                <h3 class="text-lg font-semibold text-white mb-4">{{t .Lang "ai_diagnostics.start_diagnosis"}}</h3>
+                <div class="space-y-4">
+                    <div>
+                        <label class="label">{{t .Lang "ai_diagnostics.website"}}</label>
+                        <select x-model="selectedSiteID" @change="onSiteChange()" class="input-field text-sm">
+                            <option value="">{{t .Lang "ai_diagnostics.select_website"}}</option>
+                            <template x-for="site in websites" :key="site.id">
+                                <option :value="String(site.id)" x-text="site.domain"></option>
+                            </template>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="label">{{t .Lang "ai_diagnostics.issue_type"}}</label>
+                        <select x-model="symptom" class="input-field text-sm">
+                            <template x-for="item in symptoms" :key="item.value">
+                                <option :value="item.value" x-text="item.label"></option>
+                            </template>
+                        </select>
+                    </div>
+                    <button @click="runDiagnosis()" :disabled="diagnosing || !selectedSiteID" class="btn-primary w-full text-sm" x-text="diagnosing ? t('ai_diagnostics.diagnosing', { seconds: elapsedSeconds }) : t('ai_diagnostics.start_diagnosis_button')"></button>
+                    <div x-show="diagnosing" class="p-3 rounded text-xs text-gray-300" style="background-color: #0f172a; border: 1px solid #1e293b;">
+                        <p x-text="waitMessage()"></p>
+                        <p class="text-gray-500 mt-1">{{t .Lang "ai_diagnostics.timeout_help"}}</p>
+                    </div>
+                    <p x-show="error" class="text-sm text-red-400" x-text="error"></p>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="flex items-start gap-3">
+                    <div class="w-2 h-2 rounded-full mt-2 shrink-0" style="background-color: #facc15;"></div>
+                    <div>
+                        <h3 class="text-sm font-semibold text-white">{{t .Lang "ai_diagnostics.testing_title"}}</h3>
+                        <p class="text-xs text-gray-400 mt-2 leading-relaxed">{{t .Lang "ai_diagnostics.feedback_help"}}</p>
+                        <div class="mt-3 text-xs">
+                            <a href="https://github.com/zangwp/yub-wpanel/issues/new" target="_blank" rel="noopener" class="text-blue-400 hover:text-blue-300">GitHub Issues</a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <details class="card">
+                <summary class="cursor-pointer list-none">
+                    <div class="flex items-center justify-between gap-3">
+                        <div>
+                            <h3 class="text-lg font-semibold text-white">{{t .Lang "ai_diagnostics.history"}}</h3>
+                            <p class="text-xs text-gray-500 mt-1" x-text="selectedSiteID ? t('ai_diagnostics.history_summary', { count: sessions.length }) : t('ai_diagnostics.select_site_for_history')"></p>
+                        </div>
+                        <span class="text-xs text-blue-400">{{t .Lang "ai_diagnostics.expand"}}</span>
+                    </div>
+                </summary>
+                <div class="mt-4">
+                    <div class="flex justify-end mb-3">
+                        <button @click="fetchSessions()" :disabled="!selectedSiteID" class="btn-secondary text-xs">{{t .Lang "ai_diagnostics.refresh"}}</button>
+                    </div>
+                    <div x-show="!selectedSiteID" class="text-sm text-gray-500 py-8 text-center">{{t .Lang "ai_diagnostics.select_site_for_history"}}</div>
+                    <div x-show="selectedSiteID" class="space-y-2">
+                        <template x-for="session in sessions" :key="session.id">
+                            <button @click="loadSession(session.id)" class="w-full text-left p-3 rounded border border-gray-800 hover:border-blue-800" style="background-color: #0f172a;">
+                                <div class="flex items-center justify-between gap-2">
+                                    <span class="text-sm text-white" x-text="symptomLabel(session.symptom)"></span>
+                                    <span class="text-xs text-gray-500" x-text="statusText(session.status)"></span>
+                                </div>
+                                <p class="text-xs text-gray-500 mt-1" x-text="formatTime(session.created_at)"></p>
+                                <p class="text-xs text-gray-400 mt-2 line-clamp-2" x-text="session.error_message || session.summary_excerpt || '--'"></p>
+                            </button>
+                        </template>
+                        <div x-show="sessions.length === 0" class="text-sm text-gray-500 py-8 text-center">{{t .Lang "ai_diagnostics.no_history"}}</div>
+                    </div>
+                </div>
+            </details>
+        </div>
+
+        <div class="xl:col-span-8">
+            <div class="card min-h-[520px]">
+                <div class="flex flex-col md:flex-row md:items-start md:justify-between gap-3 mb-5">
+                    <div>
+                        <h3 class="text-lg font-semibold text-white">{{t .Lang "ai_diagnostics.results"}}</h3>
+                        <p class="text-xs text-gray-500 mt-1" x-text="selectedSite() ? selectedSite().domain : t('ai_diagnostics.select_site_to_start')"></p>
+                    </div>
+                    <span x-show="report?.risk_level" class="text-xs px-2 py-1 rounded" :class="riskClass(report?.risk_level)" x-text="riskText(report?.risk_level)"></span>
+                </div>
+
+                <div x-show="!report && !rawText && !error && !diagnosing" class="py-24 text-center text-gray-500">
+                    <p class="text-sm">{{t .Lang "ai_diagnostics.results_placeholder"}}</p>
+                </div>
+
+                <div x-show="diagnosing" class="py-24 text-center">
+                    <div class="animate-spin w-8 h-8 border-4 border-blue-500 border-t-transparent rounded-full mx-auto"></div>
+                    <p class="text-sm text-gray-400 mt-4" x-text="waitMessage()"></p>
+                    <p class="text-xs text-gray-500 mt-2" x-text="t('ai_diagnostics.waiting', { seconds: elapsedSeconds })"></p>
+                </div>
+
+                <div x-show="report || rawText" class="space-y-5">
+                    <div x-show="sessionDetail?.context_type" class="p-4 rounded border border-blue-900/60 bg-blue-950/20">
+                        <div class="flex flex-wrap items-center justify-between gap-3">
+                            <div><p class="text-sm text-blue-200">{{t .Lang "ai_diagnostics.linked_context"}}</p><p class="text-xs text-gray-400 mt-1" x-text="contextDescription()"></p></div>
+                            <a x-show="sessionDetail?.context_type === 'log_analysis'" :href="(document.body.dataset.panelPrefix || '') + '/log-analysis?site_id=' + selectedSiteID" class="btn-secondary text-xs">{{t .Lang "ai_diagnostics.back_to_log_analysis"}}</a>
+                        </div>
+                        <details x-show="toolEvents.length" class="mt-3"><summary class="text-xs text-blue-300 cursor-pointer" x-text="t('ai_diagnostics.data_read_count', { count: toolEvents.length })"></summary><div class="mt-2 space-y-2"><template x-for="event in toolEvents" :key="event.id"><div class="text-xs text-gray-400 border-l-2 border-blue-900 pl-2"><span class="text-gray-300" x-text="toolLabel(event.tool_name)"></span><span class="block mt-1" x-text="event.result_summary"></span></div></template></div></details>
+                    </div>
+                    <div class="p-4 rounded" style="background-color: #0f172a; border: 1px solid #334155;">
+                        <p class="text-base font-semibold text-white" x-text="report?.summary || t('ai_diagnostics.report_title')"></p>
+                        <p class="text-sm text-gray-400 mt-2" x-show="report?.user_friendly_explanation" x-text="report?.user_friendly_explanation"></p>
+                    </div>
+
+                    <div x-show="report || rawText" class="space-y-4">
+                        <div class="flex items-center justify-between gap-3">
+                            <p class="text-sm text-gray-300">{{t .Lang "ai_diagnostics.raw_details"}}</p>
+                            <button @click="diagnosisCollapsed = !diagnosisCollapsed" class="btn-secondary text-xs" x-text="diagnosisCollapsed ? t('ai_diagnostics.expand_details') : t('ai_diagnostics.collapse_details')"></button>
+                        </div>
+
+                        <div x-show="!diagnosisCollapsed" class="space-y-5">
+                            <div x-show="report?.likely_causes?.length">
+                                <p class="text-sm text-gray-300 mb-3">{{t .Lang "ai_diagnostics.likely_causes"}}</p>
+                                <template x-for="cause in report.likely_causes" :key="cause.title">
+                                    <div class="mb-3 p-4 rounded" style="background-color: #0f172a; border: 1px solid #1e293b;">
+                                        <div class="flex items-center justify-between gap-3 mb-2">
+                                            <span class="text-sm text-white" x-text="cause.title"></span>
+                                            <span class="text-xs text-gray-500" x-text="t('ai_diagnostics.confidence_prefix') + confidenceText(cause.confidence)"></span>
+                                        </div>
+                                        <ul class="text-xs text-gray-400 space-y-1 list-disc list-inside">
+                                            <template x-for="ev in (cause.evidence || [])" :key="ev">
+                                                <li x-text="ev"></li>
+                                            </template>
+                                        </ul>
+                                    </div>
+                                </template>
+                            </div>
+
+                            <div x-show="report?.recommended_actions?.length">
+                                <p class="text-sm text-gray-300 mb-3">{{t .Lang "ai_diagnostics.recommended_actions"}}</p>
+                                <template x-for="action in report.recommended_actions" :key="action.label">
+                                    <div class="mb-3 p-4 rounded" style="background-color: #0f172a; border: 1px solid #1e293b;">
+                                        <div class="flex items-center justify-between gap-3 mb-2">
+                                            <span class="text-sm text-white" x-text="action.label"></span>
+                                            <span class="text-xs px-2 py-0.5 rounded" :class="riskClass(action.risk)" x-text="riskText(action.risk)"></span>
+                                        </div>
+                                        <p class="text-xs text-gray-400 mb-3" x-text="action.description"></p>
+                                        <ul class="text-xs text-gray-500 space-y-1 list-disc list-inside" x-show="action.manual_steps?.length">
+                                            <template x-for="step in action.manual_steps" :key="step">
+                                                <li x-text="step"></li>
+                                            </template>
+                                        </ul>
+                                        <p x-show="action.panel_action_hint" class="text-xs text-blue-300 mt-3" x-text="action.panel_action_hint"></p>
+                                    </div>
+                                </template>
+                            </div>
+
+                            <p x-show="report?.needs_more_info" class="text-xs text-yellow-400">{{t .Lang "ai_diagnostics.needs_more_info"}}</p>
+                            <pre x-show="!report && rawText" x-text="rawText" class="text-xs text-gray-300 whitespace-pre-wrap overflow-auto max-h-[560px] p-4 rounded" style="background-color: #0f172a; border: 1px solid #334155;"></pre>
+                        </div>
+                    </div>
+
+                    <div x-show="currentSessionID" class="pt-2">
+                        <div class="rounded border border-gray-800 flex flex-col h-[560px] max-h-[72vh]" style="background-color: #0f172a;">
+                            <div class="flex items-center justify-between gap-3 px-4 py-3 border-b border-gray-800">
+                                <div>
+                                    <p class="text-sm text-gray-300">{{t .Lang "ai_diagnostics.continue_troubleshooting"}}</p>
+                                    <p class="text-xs text-gray-600 mt-1">{{t .Lang "ai_diagnostics.followup_help"}}</p>
+                                </div>
+                                <button @click="fetchMessages()" class="btn-secondary text-xs shrink-0" :disabled="!currentSessionID || sendingFollowup">{{t .Lang "ai_diagnostics.refresh_chat"}}</button>
+                            </div>
+                            <div x-ref="messageList" class="flex-1 overflow-y-auto p-4 space-y-3">
+                                <template x-for="msg in messages" :key="msg.id">
+                                    <div class="p-3 rounded border" :class="msg.role === 'user' ? 'border-blue-900 bg-blue-950/30' : 'border-gray-800'" style="background-color: #0f172a;">
+                                        <div class="flex items-center justify-between gap-3 mb-2">
+                                            <span class="text-xs" :class="msg.role === 'user' ? 'text-blue-300' : 'text-green-300'" x-text="msg.role === 'user' ? t('ai_diagnostics.chat_role_user') : t('ai_diagnostics.chat_role_ai')"></span>
+                                            <span class="text-xs text-gray-600" x-text="formatTime(msg.created_at)"></span>
+                                        </div>
+                                        <div x-show="msg.content" class="text-sm text-gray-300 space-y-2" x-html="renderSafeMarkdown(msg.content)"></div>
+                                        <p x-show="msg.error_message" class="text-sm text-red-300" x-text="msg.error_message"></p>
+                                    </div>
+                                </template>
+                                <div x-show="messages.length === 0" class="text-xs text-gray-500 py-2">{{t .Lang "ai_diagnostics.empty_chat_help"}}</div>
+                            </div>
+                            <div class="border-t border-gray-800 p-4 space-y-2">
+                                <textarea x-model="followupText" rows="3" class="input-field w-full text-sm resize-none" placeholder="{{t .Lang "ai_diagnostics.followup_placeholder"}}"></textarea>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                                    <span class="text-xs text-gray-600">{{t .Lang "ai_diagnostics.followup_context_help"}}</span>
+                                <button @click="sendFollowup()" class="btn-primary text-sm shrink-0" :disabled="sendingFollowup || !followupText.trim()" x-text="sendingFollowup ? t('ai_diagnostics.analyzing') : t('ai_diagnostics.send_to_ai')"></button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+function aiDiagnosticsPage() {
+    return {
+        websites: [],
+        selectedSiteID: '',
+        symptom: 'site_500',
+        symptoms: [
+            { value: 'site_500', label: t('ai_diagnostics.symptom_site_500') },
+            { value: 'wp_admin_down', label: t('ai_diagnostics.symptom_wp_admin_down') },
+            { value: 'ssl_failure', label: t('ai_diagnostics.symptom_ssl_failure') },
+            { value: 'db_connection', label: t('ai_diagnostics.symptom_db_connection') },
+            { value: 'cache_issue', label: t('ai_diagnostics.symptom_cache_issue') },
+            { value: 'performance', label: t('ai_diagnostics.symptom_performance') }
+        ],
+        sessions: [],
+        report: null,
+        rawText: '',
+        sessionDetail: null,
+        toolEvents: [],
+        currentSessionID: null,
+        messages: [],
+        followupText: '',
+        sendingFollowup: false,
+        diagnosisCollapsed: false,
+        error: '',
+        diagnosing: false,
+        elapsedSeconds: 0,
+        waitTimer: null,
+        showAISettings: false,
+        aiSettingsLoading: false,
+        ai: { enabled: false, provider: 'deepseek', base_url: 'https://api.deepseek.com', model: 'deepseek-v4-pro', api_key: '', api_key_masked: '', timeout_seconds: 180 },
+        aiSaving: false,
+        aiTesting: false,
+        aiTestResult: '',
+        aiTestOK: false,
+        async openAISettings() {
+            this.showAISettings = true;
+            this.aiSettingsLoading = true;
+            this.aiTestResult = '';
+            try {
+                const r = await api('/ai/settings', { silent: true });
+                if (r.success && r.data) {
+                    this.ai = { enabled: !!r.data.enabled, provider: r.data.provider || 'deepseek', base_url: r.data.base_url || 'https://api.deepseek.com', model: r.data.model || 'deepseek-v4-pro', api_key: '', api_key_masked: r.data.api_key_masked || '', timeout_seconds: r.data.timeout_seconds || 180 };
+                }
+            } catch (e) { showToast(e.message, 'error'); }
+            this.aiSettingsLoading = false;
+        },
+        closeAISettings() {
+            if (this.aiSettingsLoading || this.aiSaving || this.aiTesting) return;
+            this.showAISettings = false;
+        },
+        applyAIProviderDefaults() {
+            if (this.ai.provider === 'deepseek') {
+                this.ai.base_url = 'https://api.deepseek.com';
+                if (!this.ai.model || this.ai.model === 'gpt-4.1-mini') this.ai.model = 'deepseek-v4-pro';
+            } else if (this.ai.provider === 'openai') {
+                this.ai.base_url = 'https://api.openai.com/v1';
+                if (!this.ai.model || this.ai.model.startsWith('deepseek-')) this.ai.model = 'gpt-4.1-mini';
+            }
+        },
+        aiPayload() { return { enabled: this.ai.enabled, provider: this.ai.provider, base_url: this.ai.base_url, model: this.ai.model, api_key: this.ai.api_key, timeout_seconds: parseInt(this.ai.timeout_seconds) || 180 }; },
+        async saveAI() {
+            this.aiSaving = true;
+            try {
+                const r = await api('/ai/settings', { method: 'PUT', body: this.aiPayload() });
+                if (r.success && r.data) { this.ai.api_key = ''; this.ai.api_key_masked = r.data.api_key_masked || this.ai.api_key_masked; }
+                showToast(t('settings.ai_settings_saved'), 'success');
+            } catch (e) { showToast(e.message, 'error'); }
+            this.aiSaving = false;
+        },
+        async testAI() {
+            this.aiTesting = true;
+            this.aiTestResult = '';
+            try {
+                const r = await api('/ai/test', { method: 'POST', body: this.aiPayload(), timeout: 60000 });
+                const d = r.data || {};
+                this.aiTestOK = !!d.ok;
+                this.aiTestResult = d.ok ? t('settings.connection_ok_with_latency', { latency: d.latency_ms }) : (d.message || t('settings.connection_failed'));
+            } catch (e) { this.aiTestOK = false; this.aiTestResult = e.message; }
+            this.aiTesting = false;
+        },
+        async init() {
+            const params = new URLSearchParams(window.location.search);
+            this.selectedSiteID = params.get('site_id') || '';
+            const requestedSessionID = params.get('session_id') || '';
+            this.symptom = params.get('symptom') || 'site_500';
+            await this.fetchWebsites();
+            if (this.selectedSiteID && !this.selectedSite()) {
+                this.selectedSiteID = '';
+            }
+            if (!this.selectedSiteID && this.websites.length > 0) {
+                this.selectedSiteID = String(this.websites[0].id);
+            }
+            await this.fetchSessions();
+            if (requestedSessionID && this.selectedSiteID) await this.loadSession(Number(requestedSessionID));
+        },
+        async fetchWebsites() {
+            try {
+                const r = await api('/websites');
+                if (r.success) this.websites = r.data || [];
+            } catch(e) {
+                this.error = e.message;
+            }
+        },
+        selectedSite() {
+            return this.websites.find(site => String(site.id) === String(this.selectedSiteID));
+        },
+        async onSiteChange() {
+            this.report = null;
+            this.rawText = '';
+            this.currentSessionID = null;
+            this.sessionDetail = null;
+            this.toolEvents = [];
+            this.messages = [];
+            this.followupText = '';
+            this.diagnosisCollapsed = false;
+            this.error = '';
+            await this.fetchSessions();
+        },
+        symptomLabel(value) {
+            if (value === 'log_analysis') return t('ai_diagnostics.symptom_log_analysis');
+            const found = this.symptoms.find(item => item.value === value);
+            return found ? found.label : value;
+        },
+        statusText(status) {
+            const map = {
+                pending: t('ai_diagnostics.status_waiting'),
+                running: t('ai_diagnostics.status_running'),
+                completed: t('ai_diagnostics.status_completed'),
+                failed: t('ai_diagnostics.status_failed')
+            };
+            return map[status] || status;
+        },
+        riskText(risk) {
+            const map = {
+                low: t('ai_diagnostics.risk_text_low'),
+                medium: t('ai_diagnostics.risk_text_medium'),
+                high: t('ai_diagnostics.risk_text_high')
+            };
+            return map[risk] || (risk || '');
+        },
+        riskClass(risk) {
+            if (risk === 'high') return 'bg-red-900/60 text-red-200';
+            if (risk === 'medium') return 'bg-yellow-900/60 text-yellow-200';
+            return 'bg-green-900/60 text-green-200';
+        },
+        confidenceText(confidence) {
+            const map = {
+                low: t('ai_diagnostics.risk_low'),
+                medium: t('ai_diagnostics.risk_medium'),
+                high: t('ai_diagnostics.risk_high')
+            };
+            return map[confidence] || t('ai_diagnostics.risk_unknown');
+        },
+        formatTime(value) {
+            if (!value) return '--';
+            try { return new Date(value).toLocaleString('zh-CN'); } catch(e) { return value; }
+        },
+        async fetchSessions() {
+            if (!this.selectedSiteID) {
+                this.sessions = [];
+                return;
+            }
+            try {
+                const r = await api('/websites/' + this.selectedSiteID + '/ai/sessions', { silent: true });
+                if (r.success) this.sessions = r.data || [];
+            } catch(e) {}
+        },
+        async runDiagnosis() {
+            if (!this.selectedSiteID) return;
+            this.diagnosing = true;
+            this.startWaitTimer();
+            this.error = '';
+            this.report = null;
+            this.rawText = '';
+            this.currentSessionID = null;
+            this.sessionDetail = null;
+            this.toolEvents = [];
+            this.messages = [];
+            this.followupText = '';
+            this.diagnosisCollapsed = false;
+            try {
+                const r = await api('/websites/' + this.selectedSiteID + '/ai/diagnose', {
+                    method: 'POST',
+                    body: { symptom: this.symptom },
+                    timeout: 210000
+                });
+                const d = r.data || {};
+                if (d.status === 'failed') {
+                    this.error = d.error_message || t('ai_diagnostics.diagnosis_failed');
+                    showToast(this.error, 'error');
+                } else if (d.status === 'running') {
+                    this.error = d.message || t('ai_diagnostics.diagnosis_running');
+                    showToast(this.error, 'info');
+                } else {
+                    this.currentSessionID = d.session_id || null;
+                    this.report = d.report || null;
+                    this.rawText = d.raw_text || '';
+                    this.diagnosisCollapsed = false;
+                    await this.loadSession(this.currentSessionID);
+                    showToast(t('ai_diagnostics.diagnosis_completed'), 'success');
+                }
+                await this.fetchSessions();
+            } catch(e) {
+                this.error = e.message;
+                showToast(e.message, 'error');
+            }
+            this.stopWaitTimer();
+            this.diagnosing = false;
+        },
+        startWaitTimer() {
+            this.stopWaitTimer();
+            this.elapsedSeconds = 0;
+            this.waitTimer = setInterval(() => {
+                this.elapsedSeconds += 1;
+            }, 1000);
+        },
+        stopWaitTimer() {
+            if (this.waitTimer) clearInterval(this.waitTimer);
+            this.waitTimer = null;
+        },
+        waitMessage() {
+            if (this.elapsedSeconds < 8) return t('ai_diagnostics.waiting_collect');
+            if (this.elapsedSeconds < 25) return t('ai_diagnostics.waiting_ai_request');
+            if (this.elapsedSeconds < 70) return t('ai_diagnostics.waiting_analysis');
+            return t('ai_diagnostics.waiting_long');
+        },
+        async loadSession(sessionID) {
+            if (!this.selectedSiteID || !sessionID) return;
+            try {
+                const r = await api('/websites/' + this.selectedSiteID + '/ai/sessions/' + sessionID);
+                if (r.success) {
+                    this.currentSessionID = sessionID;
+                    this.sessionDetail = r.data;
+                    this.toolEvents = r.data.tool_events || [];
+                    this.report = r.data.report || null;
+                    this.rawText = r.data.raw_text || '';
+                    this.error = r.data.error_message || '';
+                    this.diagnosisCollapsed = false;
+                    await this.fetchMessages();
+                    if (this.error) showToast(this.error, 'error');
+                }
+            } catch(e) {
+                this.error = e.message;
+                showToast(e.message, 'error');
+            }
+        },
+        async fetchMessages() {
+            if (!this.selectedSiteID || !this.currentSessionID) {
+                this.messages = [];
+                return;
+            }
+            try {
+                const r = await api('/websites/' + this.selectedSiteID + '/ai/sessions/' + this.currentSessionID + '/messages', { silent: true });
+                if (r.success) {
+                    this.messages = r.data || [];
+                    if (this.messages.length > 0) this.diagnosisCollapsed = true;
+                    this.scrollMessagesToBottom();
+                }
+            } catch(e) {}
+        },
+        contextDescription() {
+            if (!this.sessionDetail?.context_type) return '';
+            if (this.sessionDetail.context_type === 'log_analysis') {
+                let text = t('ai_diagnostics.log_context_description', { id: this.sessionDetail.context_id });
+                if (this.sessionDetail.focus_kind && this.sessionDetail.focus_value) text += ' · ' + this.sessionDetail.focus_kind + ': ' + this.sessionDetail.focus_value;
+                return text;
+            }
+            return this.sessionDetail.context_type;
+        },
+        toolLabel(name) {
+            const labels = {
+                read_site_runtime_configuration: t('ai_diagnostics.tool_runtime_config'),
+                read_security_configuration: t('ai_diagnostics.tool_security_config'),
+                read_log_analysis_overview: t('ai_diagnostics.tool_log_overview'),
+                read_log_detail_status: t('ai_diagnostics.tool_log_status'),
+                read_log_detail_path: t('ai_diagnostics.tool_log_path'),
+                read_log_detail_bot: t('ai_diagnostics.tool_log_bot'),
+                read_log_detail_ip: t('ai_diagnostics.tool_log_ip'),
+                read_log_detail_category: t('ai_diagnostics.tool_log_category')
+            };
+            return labels[name] || name;
+        },
+        scrollMessagesToBottom() {
+            this.$nextTick(() => {
+                const el = this.$refs.messageList;
+                if (el) el.scrollTop = el.scrollHeight;
+            });
+        },
+        async sendFollowup() {
+            if (!this.selectedSiteID || !this.currentSessionID || !this.followupText.trim()) return;
+            this.sendingFollowup = true;
+            this.error = '';
+            const content = this.followupText.trim();
+            this.followupText = '';
+            try {
+                const r = await api('/websites/' + this.selectedSiteID + '/ai/sessions/' + this.currentSessionID + '/messages', {
+                    method: 'POST',
+                    body: { content },
+                    timeout: 210000
+                });
+                const d = r.data || {};
+                if (d.status === 'failed') {
+                    this.error = d.error_message || t('ai_diagnostics.followup_failed');
+                    showToast(this.error, 'error');
+                    await this.fetchMessages();
+                } else if (d.status === 'running') {
+                    this.error = d.message || t('ai_diagnostics.followup_running');
+                    showToast(this.error, 'info');
+                    this.followupText = content;
+                } else {
+                    this.messages = d.messages || [];
+                    if (this.messages.length > 0) this.diagnosisCollapsed = true;
+                    await this.loadSession(this.currentSessionID);
+                    this.scrollMessagesToBottom();
+                    showToast(t('ai_diagnostics.reply_ready'), 'success');
+                }
+            } catch(e) {
+                this.error = e.message;
+                this.followupText = content;
+                showToast(e.message, 'error');
+            }
+            this.sendingFollowup = false;
+        }
+    }
+}
+</script>
+{{end}}

@@ -1,0 +1,624 @@
+package handlers
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/zangwp/yub-wpanel/database"
+	"github.com/zangwp/yub-wpanel/models"
+)
+
+func TestUpdateCDNRealIPGroupFail2banFailureRollsBackDB(t *testing.T) {
+	setupSecurityTestDB(t)
+	insertTestCDNRealIPGroup(t)
+	restoreSecurityExecutorHooks(t)
+
+	applyFail2banSettings = func() error { return errors.New("fail2ban failed") }
+	regenerateAllSitesNginx = func() error {
+		t.Fatal("nginx regenerate should not run after fail2ban failure")
+		return nil
+	}
+
+	rec := performSecurityRequest(
+		http.MethodPut,
+		"/groups/99",
+		`{"name":"New","header_name":"X-Real-IP","ip_ranges":"198.51.100.0/24","enabled":true,"description":"new desc"}`,
+		func(router *gin.Engine, h *SecurityHandler) {
+			router.PUT("/groups/:id", h.UpdateCDNRealIPGroup)
+		},
+	)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	resp := decodeAPIResponse(t, rec)
+	if !strings.Contains(resp.Message, "未生效") || !strings.Contains(resp.Message, "已回滚") {
+		t.Fatalf("unexpected message: %s", resp.Message)
+	}
+
+	var name, header, ranges string
+	var enabled int
+	if err := database.GetDB().QueryRow(`SELECT name, header_name, ip_ranges, enabled FROM cdn_realip_groups WHERE id = 99`).
+		Scan(&name, &header, &ranges, &enabled); err != nil {
+		t.Fatalf("query group: %v", err)
+	}
+	if name != "Old" || header != "X-Forwarded-For" || ranges != "203.0.113.0/24" || enabled != 1 {
+		t.Fatalf("group was not rolled back: name=%q header=%q ranges=%q enabled=%d", name, header, ranges, enabled)
+	}
+}
+
+func TestCreateCDNRealIPGroupFail2banFailureDeletesGroup(t *testing.T) {
+	setupSecurityTestDB(t)
+	restoreSecurityExecutorHooks(t)
+
+	applyFail2banSettings = func() error { return errors.New("fail2ban failed") }
+
+	rec := performSecurityRequest(
+		http.MethodPost,
+		"/groups",
+		`{"name":"New","header_name":"X-Forwarded-For","ip_ranges":"198.51.100.0/24","enabled":true,"description":"new desc"}`,
+		func(router *gin.Engine, h *SecurityHandler) {
+			router.POST("/groups", h.CreateCDNRealIPGroup)
+		},
+	)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	resp := decodeAPIResponse(t, rec)
+	if !strings.Contains(resp.Message, "未创建") || !strings.Contains(resp.Message, "已回滚") {
+		t.Fatalf("unexpected message: %s", resp.Message)
+	}
+
+	var count int
+	if err := database.GetDB().QueryRow(`SELECT COUNT(*) FROM cdn_realip_groups WHERE name = 'New'`).Scan(&count); err != nil {
+		t.Fatalf("query group count: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("created group was not rolled back, count=%d", count)
+	}
+}
+
+func TestUpdateCDNRealIPGroupNginxFailureRollsBackRuntime(t *testing.T) {
+	setupSecurityTestDB(t)
+	insertTestCDNRealIPGroup(t)
+	restoreSecurityExecutorHooks(t)
+
+	applyCalls := 0
+	applyFail2banSettings = func() error {
+		applyCalls++
+		return nil
+	}
+	nginxCalls := 0
+	regenerateAllSitesNginx = func() error {
+		nginxCalls++
+		if nginxCalls == 1 {
+			return errors.New("nginx failed")
+		}
+		return nil
+	}
+
+	rec := performSecurityRequest(
+		http.MethodPut,
+		"/groups/99",
+		`{"name":"New","header_name":"X-Real-IP","ip_ranges":"198.51.100.0/24","enabled":true,"description":"new desc"}`,
+		func(router *gin.Engine, h *SecurityHandler) {
+			router.PUT("/groups/:id", h.UpdateCDNRealIPGroup)
+		},
+	)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	resp := decodeAPIResponse(t, rec)
+	if !strings.Contains(resp.Message, "nginx failed") {
+		t.Fatalf("unexpected message: %s", resp.Message)
+	}
+	if applyCalls != 2 || nginxCalls != 2 {
+		t.Fatalf("apply/nginx calls = %d/%d, want 2/2", applyCalls, nginxCalls)
+	}
+	assertTestCDNRealIPGroupRolledBack(t)
+}
+
+func TestUpdateCDNRealIPGroupNginxFailureReportsRollbackFailure(t *testing.T) {
+	setupSecurityTestDB(t)
+	insertTestCDNRealIPGroup(t)
+	restoreSecurityExecutorHooks(t)
+
+	applyFail2banSettings = func() error { return nil }
+	nginxCalls := 0
+	regenerateAllSitesNginx = func() error {
+		nginxCalls++
+		if nginxCalls == 1 {
+			return errors.New("nginx failed")
+		}
+		return errors.New("rollback nginx failed")
+	}
+
+	rec := performSecurityRequest(
+		http.MethodPut,
+		"/groups/99",
+		`{"name":"New","header_name":"X-Real-IP","ip_ranges":"198.51.100.0/24","enabled":true,"description":"new desc"}`,
+		func(router *gin.Engine, h *SecurityHandler) {
+			router.PUT("/groups/:id", h.UpdateCDNRealIPGroup)
+		},
+	)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	resp := decodeAPIResponse(t, rec)
+	if !strings.Contains(resp.Message, "rollback nginx failed") || !strings.Contains(resp.Message, "nginx failed") {
+		t.Fatalf("unexpected message: %s", resp.Message)
+	}
+	if nginxCalls != 2 {
+		t.Fatalf("nginx calls = %d, want 2", nginxCalls)
+	}
+	assertTestCDNRealIPGroupRolledBack(t)
+}
+
+func TestDeleteCDNRealIPGroupNginxFailureRollsBackRuntime(t *testing.T) {
+	setupSecurityTestDB(t)
+	insertTestCDNRealIPGroup(t)
+	restoreSecurityExecutorHooks(t)
+
+	applyCalls := 0
+	applyFail2banSettings = func() error {
+		applyCalls++
+		return nil
+	}
+	nginxCalls := 0
+	regenerateAllSitesNginx = func() error {
+		nginxCalls++
+		if nginxCalls == 1 {
+			return errors.New("nginx failed")
+		}
+		return nil
+	}
+
+	rec := performSecurityRequest(
+		http.MethodDelete,
+		"/groups/99",
+		"",
+		func(router *gin.Engine, h *SecurityHandler) {
+			router.DELETE("/groups/:id", h.DeleteCDNRealIPGroup)
+		},
+	)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	resp := decodeAPIResponse(t, rec)
+	if !strings.Contains(resp.Message, "nginx failed") {
+		t.Fatalf("unexpected message: %s", resp.Message)
+	}
+	if applyCalls != 2 || nginxCalls != 2 {
+		t.Fatalf("apply/nginx calls = %d/%d, want 2/2", applyCalls, nginxCalls)
+	}
+	assertTestCDNRealIPGroupRolledBack(t)
+}
+
+func TestDeleteCDNRealIPGroupNginxFailureReportsRollbackFailure(t *testing.T) {
+	setupSecurityTestDB(t)
+	insertTestCDNRealIPGroup(t)
+	restoreSecurityExecutorHooks(t)
+
+	applyFail2banSettings = func() error { return nil }
+	nginxCalls := 0
+	regenerateAllSitesNginx = func() error {
+		nginxCalls++
+		if nginxCalls == 1 {
+			return errors.New("nginx failed")
+		}
+		return errors.New("rollback nginx failed")
+	}
+
+	rec := performSecurityRequest(
+		http.MethodDelete,
+		"/groups/99",
+		"",
+		func(router *gin.Engine, h *SecurityHandler) {
+			router.DELETE("/groups/:id", h.DeleteCDNRealIPGroup)
+		},
+	)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	resp := decodeAPIResponse(t, rec)
+	if !strings.Contains(resp.Message, "rollback nginx failed") || !strings.Contains(resp.Message, "nginx failed") {
+		t.Fatalf("unexpected message: %s", resp.Message)
+	}
+	if nginxCalls != 2 {
+		t.Fatalf("nginx calls = %d, want 2", nginxCalls)
+	}
+	assertTestCDNRealIPGroupRolledBack(t)
+}
+
+func TestDeleteCDNRealIPGroupReportsRestoreFailure(t *testing.T) {
+	setupSecurityTestDB(t)
+	insertTestCDNRealIPGroup(t)
+	restoreSecurityExecutorHooks(t)
+
+	applyFail2banSettings = func() error { return errors.New("fail2ban failed") }
+	websiteIDsForCDNRealIPGroup = func(int) ([]int, error) { return []int{101}, nil }
+	restoreCDNRealIPGroupWithBindings = func(models.CDNRealIPGroup, []int) error {
+		return errors.New("restore failed")
+	}
+	regenerateAllSitesNginx = func() error {
+		t.Fatal("nginx regenerate should not run after fail2ban failure")
+		return nil
+	}
+
+	rec := performSecurityRequest(
+		http.MethodDelete,
+		"/groups/99",
+		"",
+		func(router *gin.Engine, h *SecurityHandler) {
+			router.DELETE("/groups/:id", h.DeleteCDNRealIPGroup)
+		},
+	)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	resp := decodeAPIResponse(t, rec)
+	if !strings.Contains(resp.Message, "数据库回滚失败") || !strings.Contains(resp.Message, "原始错误") {
+		t.Fatalf("unexpected message: %s", resp.Message)
+	}
+}
+
+func TestUpdateSQLiSettingsAppliesAndPersists(t *testing.T) {
+	setupSecurityTestDB(t)
+	restoreSecurityExecutorHooks(t)
+	nginxCalls, fail2banCalls := 0, 0
+	regenerateAllSitesNginx = func() error { nginxCalls++; return nil }
+	applyFail2banSettings = func() error { fail2banCalls++; return nil }
+
+	rec := performSecurityRequest(http.MethodPut, "/settings", `{"wp_sqli_block_enabled":"false","wp_sqli_autoban_enabled":"false","wp_sqli_ban_threshold":"7","wp_sqli_ban_window_seconds":"900"}`, func(router *gin.Engine, h *SecurityHandler) {
+		router.PUT("/settings", h.UpdateSettings)
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if nginxCalls != 1 || fail2banCalls != 1 {
+		t.Fatalf("nginx/fail2ban calls = %d/%d, want 1/1", nginxCalls, fail2banCalls)
+	}
+	for key, want := range map[string]string{
+		"wp_sqli_block_enabled": "false", "wp_sqli_autoban_enabled": "false",
+		"wp_sqli_ban_threshold": "7", "wp_sqli_ban_window_seconds": "900",
+	} {
+		var got string
+		if err := database.GetDB().QueryRow(`SELECT svalue FROM security_settings WHERE skey=?`, key).Scan(&got); err != nil || got != want {
+			t.Fatalf("%s = %q, err=%v, want %q", key, got, err, want)
+		}
+	}
+}
+
+func TestUpdateSQLiSettingsRollsBackDatabaseAndRuntime(t *testing.T) {
+	setupSecurityTestDB(t)
+	restoreSecurityExecutorHooks(t)
+	nginxCalls, fail2banCalls := 0, 0
+	regenerateAllSitesNginx = func() error { nginxCalls++; return nil }
+	applyFail2banSettings = func() error {
+		fail2banCalls++
+		if fail2banCalls == 1 {
+			return errors.New("injected fail2ban failure")
+		}
+		return nil
+	}
+
+	rec := performSecurityRequest(http.MethodPut, "/settings", `{"wp_sqli_ban_threshold":"9"}`, func(router *gin.Engine, h *SecurityHandler) {
+		router.PUT("/settings", h.UpdateSettings)
+	})
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if nginxCalls != 2 || fail2banCalls != 2 {
+		t.Fatalf("nginx/fail2ban calls = %d/%d, want 2/2", nginxCalls, fail2banCalls)
+	}
+	var got string
+	if err := database.GetDB().QueryRow(`SELECT svalue FROM security_settings WHERE skey='wp_sqli_ban_threshold'`).Scan(&got); err != nil || got != "5" {
+		t.Fatalf("threshold after rollback = %q, err=%v, want 5", got, err)
+	}
+}
+
+func TestUpdateSQLiSettingsDatabaseWriteIsAtomic(t *testing.T) {
+	setupSecurityTestDB(t)
+	restoreSecurityExecutorHooks(t)
+	if _, err := database.GetDB().Exec(`CREATE TRIGGER reject_sqli_threshold
+		BEFORE UPDATE ON security_settings
+		WHEN NEW.skey='wp_sqli_ban_threshold' AND NEW.svalue='9'
+		BEGIN SELECT RAISE(ABORT, 'injected write failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	regenerateAllSitesNginx = func() error { t.Fatal("nginx must not run after database failure"); return nil }
+	applyFail2banSettings = func() error { t.Fatal("fail2ban must not run after database failure"); return nil }
+
+	rec := performSecurityRequest(http.MethodPut, "/settings", `{"wp_sqli_block_enabled":"false","wp_sqli_ban_threshold":"9"}`, func(router *gin.Engine, h *SecurityHandler) {
+		router.PUT("/settings", h.UpdateSettings)
+	})
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	for key, want := range map[string]string{
+		"wp_sqli_block_enabled": "true",
+		"wp_sqli_ban_threshold": "5",
+	} {
+		var got string
+		if err := database.GetDB().QueryRow(`SELECT svalue FROM security_settings WHERE skey=?`, key).Scan(&got); err != nil || got != want {
+			t.Fatalf("%s after failed transaction = %q, err=%v, want %q", key, got, err, want)
+		}
+	}
+}
+
+func TestUpdateSecuritySettingsDatabaseWriteIsAtomicAcrossSubsystems(t *testing.T) {
+	setupSecurityTestDB(t)
+	restoreSecurityExecutorHooks(t)
+	if _, err := database.GetDB().Exec(`CREATE TRIGGER reject_rate_limit_burst
+		BEFORE UPDATE ON security_settings
+		WHEN NEW.skey='rate_limit_burst' AND NEW.svalue='20'
+		BEGIN SELECT RAISE(ABORT, 'injected write failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	regenerateAllSitesNginx = func() error { t.Fatal("nginx must not run after database failure"); return nil }
+	applyFail2banSettings = func() error { t.Fatal("fail2ban must not run after database failure"); return nil }
+	applyRateLimitSettings = func() error { t.Fatal("rate limit must not run after database failure"); return nil }
+
+	beforeSQLi := securitySettingValue(t, "wp_sqli_block_enabled")
+	beforeBurst := securitySettingValue(t, "rate_limit_burst")
+	rec := performSecurityRequest(http.MethodPut, "/settings", `{"wp_sqli_block_enabled":"false","rate_limit_burst":"20"}`, func(router *gin.Engine, h *SecurityHandler) {
+		router.PUT("/settings", h.UpdateSettings)
+	})
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := securitySettingValue(t, "wp_sqli_block_enabled"); got != beforeSQLi {
+		t.Fatalf("SQLi setting after failed transaction = %q, want %q", got, beforeSQLi)
+	}
+	if got := securitySettingValue(t, "rate_limit_burst"); got != beforeBurst {
+		t.Fatalf("rate limit setting after failed transaction = %q, want %q", got, beforeBurst)
+	}
+}
+
+func TestUpdateGenericSecuritySettingRollsBackDatabaseAndRuntime(t *testing.T) {
+	setupSecurityTestDB(t)
+	restoreSecurityExecutorHooks(t)
+	before := securitySettingValue(t, "fail2ban_maxretry")
+	calls := 0
+	applyFail2banSettings = func() error {
+		calls++
+		if calls == 1 {
+			return errors.New("injected fail2ban failure")
+		}
+		return nil
+	}
+
+	rec := performSecurityRequest(http.MethodPut, "/settings", `{"fail2ban_maxretry":"12"}`, func(router *gin.Engine, h *SecurityHandler) {
+		router.PUT("/settings", h.UpdateSettings)
+	})
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if calls != 2 {
+		t.Fatalf("fail2ban calls = %d, want 2", calls)
+	}
+	if got := securitySettingValue(t, "fail2ban_maxretry"); got != before {
+		t.Fatalf("maxretry after rollback = %q, want %q", got, before)
+	}
+}
+
+func TestUpdateSecuritySettingsRollbackAttemptsEveryRuntimeSubsystem(t *testing.T) {
+	setupSecurityTestDB(t)
+	restoreSecurityExecutorHooks(t)
+
+	nginxCalls, fail2banCalls, rateLimitCalls := 0, 0, 0
+	regenerateAllSitesNginx = func() error {
+		nginxCalls++
+		if nginxCalls == 2 {
+			return errors.New("injected rollback nginx failure")
+		}
+		return nil
+	}
+	applyFail2banSettings = func() error { fail2banCalls++; return nil }
+	applyRateLimitSettings = func() error {
+		rateLimitCalls++
+		if rateLimitCalls == 1 {
+			return errors.New("injected rate limit failure")
+		}
+		return nil
+	}
+
+	rec := performSecurityRequest(http.MethodPut, "/settings", `{"wp_sqli_block_enabled":"false","rate_limit_burst":"20"}`, func(router *gin.Engine, h *SecurityHandler) {
+		router.PUT("/settings", h.UpdateSettings)
+	})
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if nginxCalls != 2 || fail2banCalls != 2 || rateLimitCalls != 2 {
+		t.Fatalf("nginx/fail2ban/rate limit calls = %d/%d/%d, want 2/2/2", nginxCalls, fail2banCalls, rateLimitCalls)
+	}
+	if !strings.Contains(decodeAPIResponse(t, rec).Message, "服务器配置恢复不完整") {
+		t.Fatalf("unexpected message: %s", rec.Body.String())
+	}
+	if got := securitySettingValue(t, "wp_sqli_block_enabled"); got != "true" {
+		t.Fatalf("SQLi setting after rollback = %q, want true", got)
+	}
+}
+
+func TestUpdateSecuritySettingsSerializesSnapshotThroughRuntimeApply(t *testing.T) {
+	setupSecurityTestDB(t)
+	restoreSecurityExecutorHooks(t)
+
+	firstApplyStarted := make(chan struct{})
+	releaseFirstApply := make(chan struct{})
+	var calls atomic.Int32
+	applyFail2banSettings = func() error {
+		if calls.Add(1) == 1 {
+			close(firstApplyStarted)
+			<-releaseFirstApply
+			return errors.New("injected first request failure")
+		}
+		return nil
+	}
+
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		firstDone <- performSecurityRequest(http.MethodPut, "/settings", `{"fail2ban_maxretry":"12"}`, func(router *gin.Engine, h *SecurityHandler) {
+			router.PUT("/settings", h.UpdateSettings)
+		})
+	}()
+	select {
+	case <-firstApplyStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first request did not reach runtime apply")
+	}
+
+	secondDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		secondDone <- performSecurityRequest(http.MethodPut, "/settings", `{"fail2ban_maxretry":"13"}`, func(router *gin.Engine, h *SecurityHandler) {
+			router.PUT("/settings", h.UpdateSettings)
+		})
+	}()
+	select {
+	case rec := <-secondDone:
+		t.Fatalf("second request completed before first request released: %s", rec.Body.String())
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseFirstApply)
+
+	if rec := <-firstDone; rec.Code != http.StatusInternalServerError {
+		t.Fatalf("first status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if rec := <-secondDone; rec.Code != http.StatusOK {
+		t.Fatalf("second status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := securitySettingValue(t, "fail2ban_maxretry"); got != "13" {
+		t.Fatalf("final maxretry = %q, want 13", got)
+	}
+}
+
+func TestNormalizeSecuritySettingAcceptsBotLimitSettings(t *testing.T) {
+	for _, tc := range []struct {
+		key  string
+		val  interface{}
+		want string
+	}{
+		{"bot_limit_enabled", true, "true"},
+		{"bot_limit_rpm", "30", "30"},
+		{"bot_limit_burst", float64(20), "20"},
+	} {
+		got, ok, err := normalizeSecuritySetting(tc.key, tc.val)
+		if err != nil {
+			t.Fatalf("%s returned error: %v", tc.key, err)
+		}
+		if !ok || got != tc.want {
+			t.Fatalf("%s = %q, %v; want %q, true", tc.key, got, ok, tc.want)
+		}
+	}
+}
+
+func TestNormalizeSecuritySettingRejectsBotLimitOutOfRange(t *testing.T) {
+	for _, tc := range []struct {
+		key string
+		val interface{}
+	}{
+		{"bot_limit_rpm", "4"},
+		{"bot_limit_rpm", "301"},
+		{"bot_limit_burst", "4"},
+		{"bot_limit_burst", "301"},
+	} {
+		if _, _, err := normalizeSecuritySetting(tc.key, tc.val); err == nil {
+			t.Fatalf("expected %s=%v to be rejected", tc.key, tc.val)
+		}
+	}
+}
+
+func setupSecurityTestDB(t *testing.T) {
+	t.Helper()
+	oldDB := database.DB
+	if err := database.Open(filepath.Join(t.TempDir(), "panel.db")); err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	if err := database.RunMigrations(); err != nil {
+		t.Fatalf("migrate db: %v", err)
+	}
+	t.Cleanup(func() {
+		database.Close()
+		database.DB = oldDB
+	})
+}
+
+func insertTestCDNRealIPGroup(t *testing.T) {
+	t.Helper()
+	if _, err := database.GetDB().Exec(`INSERT INTO cdn_realip_groups
+		(id, name, provider, header_name, ip_ranges, builtin, enabled, description)
+		VALUES (99, 'Old', 'custom', 'X-Forwarded-For', '203.0.113.0/24', 0, 1, 'old desc')`); err != nil {
+		t.Fatalf("insert cdn group: %v", err)
+	}
+}
+
+func assertTestCDNRealIPGroupRolledBack(t *testing.T) {
+	t.Helper()
+	var name, header, ranges string
+	var enabled int
+	if err := database.GetDB().QueryRow(`SELECT name, header_name, ip_ranges, enabled FROM cdn_realip_groups WHERE id = 99`).
+		Scan(&name, &header, &ranges, &enabled); err != nil {
+		t.Fatalf("query group: %v", err)
+	}
+	if name != "Old" || header != "X-Forwarded-For" || ranges != "203.0.113.0/24" || enabled != 1 {
+		t.Fatalf("group was not rolled back: name=%q header=%q ranges=%q enabled=%d", name, header, ranges, enabled)
+	}
+}
+
+func restoreSecurityExecutorHooks(t *testing.T) {
+	t.Helper()
+	oldApplyFail2ban := applyFail2banSettings
+	oldApplyRateLimit := applyRateLimitSettings
+	oldEnsureLogMap := ensureLogMap
+	oldRegenerateAllSitesNginx := regenerateAllSitesNginx
+	oldWebsiteIDsForCDNRealIPGroup := websiteIDsForCDNRealIPGroup
+	oldRestoreCDNRealIPGroupWithBindings := restoreCDNRealIPGroupWithBindings
+	t.Cleanup(func() {
+		applyFail2banSettings = oldApplyFail2ban
+		applyRateLimitSettings = oldApplyRateLimit
+		ensureLogMap = oldEnsureLogMap
+		regenerateAllSitesNginx = oldRegenerateAllSitesNginx
+		websiteIDsForCDNRealIPGroup = oldWebsiteIDsForCDNRealIPGroup
+		restoreCDNRealIPGroupWithBindings = oldRestoreCDNRealIPGroupWithBindings
+	})
+}
+
+func securitySettingValue(t *testing.T, key string) string {
+	t.Helper()
+	var value string
+	if err := database.GetDB().QueryRow(`SELECT svalue FROM security_settings WHERE skey=?`, key).Scan(&value); err != nil {
+		t.Fatalf("read security setting %s: %v", key, err)
+	}
+	return value
+}
+
+func performSecurityRequest(method, path, body string, register func(*gin.Engine, *SecurityHandler)) *httptest.ResponseRecorder {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	register(router, &SecurityHandler{})
+
+	req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec
+}
+
+func decodeAPIResponse(t *testing.T, rec *httptest.ResponseRecorder) models.ApiResponse {
+	t.Helper()
+	var resp models.ApiResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v; body=%s", err, rec.Body.String())
+	}
+	return resp
+}

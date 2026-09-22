@@ -1,0 +1,743 @@
+package executor
+
+import (
+	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/zangwp/yub-wpanel/config"
+	"github.com/zangwp/yub-wpanel/database"
+	"github.com/zangwp/yub-wpanel/models"
+
+	"github.com/go-acme/lego/v4/certificate"
+	"github.com/go-acme/lego/v4/lego"
+	"github.com/go-acme/lego/v4/registration"
+)
+
+type acmeUser struct {
+	Email        string
+	Registration *registration.Resource
+	key          crypto.PrivateKey
+}
+
+var (
+	applySSLNginxConfig  = applySSLNginxToSite
+	applyHTTPNginxConfig = applyHTTPNginxToSite
+	persistSSLState      = persistSSLDatabaseState
+	persistSSLDisabled   = persistSSLDisabledDatabaseState
+	restoreSSLState      = restoreSSLDatabaseState
+	restoreSSLCertDir    = restorePublishedSSLCertDir
+	removeSSLCertDir     = os.RemoveAll
+)
+
+func (u *acmeUser) GetEmail() string                        { return u.Email }
+func (u *acmeUser) GetRegistration() *registration.Resource { return u.Registration }
+func (u *acmeUser) GetPrivateKey() crypto.PrivateKey        { return u.key }
+
+func executeEnableSSL(task *Task) TaskResult {
+	payload, ok := task.Payload.(*EnableSSLPayload)
+	if !ok {
+		return TaskResult{Success: false, Message: "任务参数类型错误"}
+	}
+
+	site := payload.Site
+	if site == nil {
+		return TaskResult{Success: false, Message: "网站不存在"}
+	}
+	if blocked := rejectPausedSiteConfiguration(site.ID); blocked != nil {
+		return *blocked
+	}
+	cfg := config.AppConfig
+	certDir := filepath.Join(cfg.Paths.Certificates, site.Domain)
+	certPath := filepath.Join(certDir, "fullchain.pem")
+	keyPath := filepath.Join(certDir, "privkey.pem")
+	stageDir := fmt.Sprintf("%s.pending-%d", certDir, time.Now().UnixNano())
+	stageCertPath := filepath.Join(stageDir, "fullchain.pem")
+	stageKeyPath := filepath.Join(stageDir, "privkey.pem")
+	defer os.RemoveAll(stageDir)
+
+	if err := os.MkdirAll(stageDir, 0700); err != nil {
+		log.Printf("创建证书目录失败: %v", err)
+		return TaskResult{Success: false, Message: "创建证书目录失败"}
+	}
+
+	var expiry time.Time
+	var applyErr error
+
+	if payload.Mode == "manual" {
+		if payload.Certificate == "" || payload.PrivateKey == "" {
+			return TaskResult{Success: false, Message: "证书内容和私钥不能为空"}
+		}
+		if err := os.WriteFile(stageCertPath, []byte(payload.Certificate), 0644); err != nil {
+			log.Printf("写入证书文件失败: %v", err)
+			return TaskResult{Success: false, Message: "写入证书文件失败"}
+		}
+		if err := os.WriteFile(stageKeyPath, []byte(payload.PrivateKey), 0600); err != nil {
+			os.Remove(stageCertPath)
+			log.Printf("写入私钥文件失败: %v", err)
+			return TaskResult{Success: false, Message: "写入私钥文件失败"}
+		}
+		expiry, applyErr = validateCertificate(stageCertPath, site.Domain)
+		if applyErr != nil {
+			log.Printf("证书验证失败: %v", applyErr)
+			return TaskResult{Success: false, Message: "证书验证失败"}
+		}
+	} else {
+		documentRoot, err := EnsureEffectiveDocumentRoot(site.WebRoot, site.SiteType, site.DocumentRootSubdir, site.SystemUser)
+		if err != nil {
+			return taskFailure("准备SSL验证目录失败", err)
+		}
+		expiry, applyErr = obtainLegoCert(site.Domain, site.Aliases,
+			documentRoot, stageDir)
+		if applyErr != nil {
+			log.Printf("申请 Let's Encrypt 证书失败: %v", applyErr)
+			msg := FriendlySSLError(applyErr)
+			database.GetDB().Exec("UPDATE websites SET ssl_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", msg, site.ID)
+			return TaskResult{Success: false, Message: msg}
+		}
+	}
+
+	if applyErr = publishSSLCertificate(site, certDir, stageDir, certPath, keyPath, expiry, payload.Mode); applyErr != nil {
+		log.Printf("应用SSL配置失败: %v", applyErr)
+		return taskFailure("应用SSL配置失败", applyErr)
+	}
+
+	return TaskResult{
+		Success: true,
+		Message: fmt.Sprintf("网站 %s SSL 已启用（到期: %s）", site.Domain, expiry.Format("2006-01-02")),
+	}
+}
+
+func publishSSLCertificate(site *models.Website, certDir, stageDir, certPath, keyPath string, expiry time.Time, source string) error {
+	backupDir := fmt.Sprintf("%s.previous-%d", certDir, time.Now().UnixNano())
+	hadOldCertDir := false
+	if _, err := os.Stat(certDir); err == nil {
+		if err := os.Rename(certDir, backupDir); err != nil {
+			return fmt.Errorf("备份现有证书失败: %w", err)
+		}
+		hadOldCertDir = true
+	}
+	if err := os.Rename(stageDir, certDir); err != nil {
+		if hadOldCertDir {
+			logRecoveryFailure("安装新证书失败后恢复旧证书", os.Rename(backupDir, certDir))
+		}
+		return fmt.Errorf("安装新证书失败: %w", err)
+	}
+
+	if err := persistSSLState(site.ID, certPath, keyPath, expiry, source); err != nil {
+		if restoreErr := restoreSSLCertDir(certDir, backupDir, hadOldCertDir); restoreErr != nil {
+			return fmt.Errorf("保存SSL状态失败: %v；恢复旧证书也失败: %w", err, restoreErr)
+		}
+		return fmt.Errorf("保存SSL状态失败: %w", err)
+	}
+
+	if err := applySSLNginxConfig(site, certPath, keyPath); err != nil {
+		dbRestoreErr := restoreSSLState(site)
+		certRestoreErr := restoreSSLCertDir(certDir, backupDir, hadOldCertDir)
+		if dbRestoreErr != nil || certRestoreErr != nil {
+			return fmt.Errorf("应用Nginx配置失败: %v；恢复数据库失败: %v；恢复旧证书失败: %v", err, dbRestoreErr, certRestoreErr)
+		}
+		return fmt.Errorf("应用Nginx配置失败，已恢复原状态: %w", err)
+	}
+	if hadOldCertDir {
+		logRecoveryFailure("清理旧证书备份", os.RemoveAll(backupDir))
+	}
+	return nil
+}
+
+func FriendlySSLError(err error) string {
+	if err == nil {
+		return ""
+	}
+	raw := strings.TrimSpace(err.Error())
+	lower := strings.ToLower(raw)
+	switch {
+	case strings.Contains(lower, "invalid response from http://") && strings.Contains(lower, ": 404"):
+		return "Let's Encrypt HTTP-01 验证返回 404。请确认域名指向本服务器；如使用 CDN，请放行 ACME 验证路径。"
+	case strings.Contains(lower, "no valid a records found") || strings.Contains(lower, "no valid aaaa records found") || strings.Contains(lower, "nxdomain"):
+		return "域名解析记录无效或尚未生效。请检查主域名和附加域名的 A/AAAA 记录后重试。"
+	case strings.Contains(lower, "connection refused"):
+		return "Let's Encrypt 无法连接 80 端口。请检查域名解析、防火墙和 CDN 回源。"
+	case strings.Contains(lower, "timeout") || strings.Contains(lower, "i/o timeout") || strings.Contains(lower, "context deadline exceeded"):
+		return "Let's Encrypt 验证超时。请检查域名解析、80 端口和 CDN 回源。"
+	case strings.Contains(lower, "unauthorized"):
+		return "Let's Encrypt 验证未通过。请确认域名指向本服务器；如使用 CDN，请放行 ACME 验证路径。"
+	default:
+		return "申请 Let's Encrypt 证书失败：" + raw
+	}
+}
+
+func executeRemoveSSL(task *Task) TaskResult {
+	payload, ok := task.Payload.(*RemoveSSLPayload)
+	if !ok {
+		return TaskResult{Success: false, Message: "任务参数类型错误"}
+	}
+
+	site := payload.Site
+	if site == nil {
+		return TaskResult{Success: false, Message: "网站不存在"}
+	}
+	if blocked := rejectPausedSiteConfiguration(site.ID); blocked != nil {
+		return *blocked
+	}
+	if locked, err := SiteMigrationLocked(context.Background(), site.ID, site.Domain); err != nil {
+		return taskFailure("检查网站搬家状态失败", err)
+	} else if locked {
+		return TaskResult{Success: false, Message: "网站正在搬家，不能删除 SSL 证书"}
+	}
+
+	return removeSSLCertificate(site, filepath.Join(config.AppConfig.Paths.Certificates, site.Domain))
+}
+
+func removeSSLCertificate(site *models.Website, certDir string) TaskResult {
+	if err := persistSSLDisabled(site.ID); err != nil {
+		log.Printf("保存 SSL 关闭状态失败: %v", err)
+		return taskFailure("保存 SSL 关闭状态失败", err)
+	}
+
+	if err := applyHTTPNginxConfig(site); err != nil {
+		if restoreErr := restoreSSLState(site); restoreErr != nil {
+			log.Printf("应用 HTTP 配置失败，且恢复 SSL 数据库状态失败: apply_error=%v restore_error=%v", err, restoreErr)
+			return TaskResult{Success: false, Message: "切换 HTTP 失败，且原 SSL 状态恢复失败，请立即检查网站配置"}
+		}
+		log.Printf("应用 HTTP 配置失败，数据库 SSL 状态已恢复且证书未删除: %v", err)
+		return TaskResult{Success: false, Message: "切换 HTTP 失败，数据库 SSL 状态已恢复且证书未删除，请检查 Nginx 当前配置"}
+	}
+
+	if err := removeSSLCertDir(certDir); err != nil {
+		log.Printf("SSL 已关闭，但旧证书文件清理失败: %v", err)
+		return TaskResult{Success: false, Message: "SSL 已关闭并恢复为 HTTP，但旧证书文件清理失败，请人工检查"}
+	}
+
+	return TaskResult{Success: true, Message: "网站 " + site.Domain + " SSL 证书已删除，已恢复为 HTTP"}
+}
+
+const acmeAccountDir = "/www/server/panel/acme"
+
+type acmeAccountMetadata struct {
+	Registration *registration.Resource `json:"registration,omitempty"`
+}
+
+func newACMEClient(user *acmeUser, caDirURL string) (*lego.Client, error) {
+	legoCfg := lego.NewConfig(user)
+	legoCfg.CADirURL = caDirURL
+
+	client, err := lego.NewClient(legoCfg)
+	if err != nil {
+		return nil, fmt.Errorf("创建lego客户端失败: %w", err)
+	}
+	return client, nil
+}
+
+func loadACMERegistration(path string) (*registration.Resource, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if strings.TrimSpace(string(data)) == "" {
+		return nil, nil
+	}
+
+	var meta acmeAccountMetadata
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return nil, err
+	}
+	if meta.Registration == nil || strings.TrimSpace(meta.Registration.URI) == "" {
+		return nil, nil
+	}
+	return meta.Registration, nil
+}
+
+func saveACMERegistration(path string, reg *registration.Resource) error {
+	if reg == nil || strings.TrimSpace(reg.URI) == "" {
+		return fmt.Errorf("ACME账户注册信息为空")
+	}
+	data, err := json.MarshalIndent(acmeAccountMetadata{Registration: reg}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0600)
+}
+
+func getOrCreateACMEClient(email string, caDirURL string) (*lego.Client, error) {
+	if err := os.MkdirAll(acmeAccountDir, 0700); err != nil {
+		return nil, fmt.Errorf("创建ACME目录失败: %w", err)
+	}
+
+	accountKeyPath := filepath.Join(acmeAccountDir, "account.key")
+	accountMetaPath := filepath.Join(acmeAccountDir, "account.json")
+
+	var privateKey crypto.PrivateKey
+	var err error
+
+	if keyData, readErr := os.ReadFile(accountKeyPath); readErr == nil {
+		block, _ := pem.Decode(keyData)
+		if block != nil {
+			privateKey, err = x509.ParseECPrivateKey(block.Bytes)
+			if err != nil {
+				return nil, fmt.Errorf("解析ACME账户私钥失败: %w", err)
+			}
+		}
+	}
+
+	if privateKey == nil {
+		privateKey, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			return nil, fmt.Errorf("生成ACME账户私钥失败: %w", err)
+		}
+		keyBytes, _ := x509.MarshalECPrivateKey(privateKey.(*ecdsa.PrivateKey))
+		pemData := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
+		if err := os.WriteFile(accountKeyPath, pemData, 0600); err != nil {
+			return nil, fmt.Errorf("保存ACME账户私钥失败: %w", err)
+		}
+	}
+
+	user := &acmeUser{Email: email, key: privateKey}
+	if reg, loadErr := loadACMERegistration(accountMetaPath); loadErr != nil {
+		return nil, fmt.Errorf("读取ACME账户信息失败: %w", loadErr)
+	} else if reg != nil {
+		user.Registration = reg
+	}
+
+	client, err := newACMEClient(user, caDirURL)
+	if err != nil {
+		return nil, err
+	}
+
+	if user.Registration == nil {
+		reg, resolveErr := client.Registration.ResolveAccountByKey()
+		if resolveErr != nil {
+			reg, err = client.Registration.Register(registration.RegisterOptions{TermsOfServiceAgreed: true})
+			if err != nil {
+				return nil, fmt.Errorf("注册ACME账户失败: %w", err)
+			}
+		}
+		user.Registration = reg
+		if err := saveACMERegistration(accountMetaPath, reg); err != nil {
+			return nil, fmt.Errorf("保存ACME账户信息失败: %w", err)
+		}
+		client, err = newACMEClient(user, caDirURL)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return client, nil
+}
+
+func isTransientACMEOrderError(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "certificate not found") ||
+		strings.Contains(lower, "authorizations for these identifiers not found")
+}
+
+func obtainLegoCert(domain string, aliases string, webRoot string, certDir string) (time.Time, error) {
+	client, err := getOrCreateACMEClient("admin@"+domain, lego.LEDirectoryProduction)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	provider := &webrootProvider{webroot: webRoot}
+	if err := client.Challenge.SetHTTP01Provider(provider); err != nil {
+		return time.Time{}, fmt.Errorf("设置HTTP-01验证提供者失败: %w", err)
+	}
+
+	domains := []string{domain}
+	if aliases != "" {
+		for _, a := range strings.Split(aliases, "\n") {
+			a = strings.TrimSpace(a)
+			if a != "" && a != domain {
+				domains = append(domains, a)
+			}
+		}
+	}
+
+	req := certificate.ObtainRequest{
+		Domains: domains,
+		Bundle:  true,
+	}
+
+	certRes, err := client.Certificate.Obtain(req)
+	if err != nil && isTransientACMEOrderError(err) {
+		log.Printf("ACME订单临时错误，准备重试 domain=%s: %v", domain, err)
+		time.Sleep(3 * time.Second)
+		certRes, err = client.Certificate.Obtain(req)
+	}
+	if err != nil {
+		return time.Time{}, fmt.Errorf("获取证书失败: %w", err)
+	}
+
+	certPath := filepath.Join(certDir, "fullchain.pem")
+	keyPath := filepath.Join(certDir, "privkey.pem")
+
+	if err := os.WriteFile(certPath, certRes.Certificate, 0644); err != nil {
+		return time.Time{}, fmt.Errorf("保存证书失败: %w", err)
+	}
+	if err := os.WriteFile(keyPath, certRes.PrivateKey, 0600); err != nil {
+		return time.Time{}, fmt.Errorf("保存私钥失败: %w", err)
+	}
+
+	expiry, err := validateCertificate(certPath, domain)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("验证签发证书失败: %w", err)
+	}
+
+	return expiry, nil
+}
+
+type webrootProvider struct {
+	webroot string
+}
+
+func (w *webrootProvider) Present(domain, token, keyAuth string) error {
+	challengePath := filepath.Join(w.webroot, ".well-known", "acme-challenge")
+	if err := os.MkdirAll(challengePath, 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(challengePath, token), []byte(keyAuth), 0644)
+}
+
+func (w *webrootProvider) CleanUp(domain, token, keyAuth string) error {
+	challengeFile := filepath.Join(w.webroot, ".well-known", "acme-challenge", token)
+	os.Remove(challengeFile)
+	return nil
+}
+
+func applySSLNginxToSite(site *models.Website, certPath, keyPath string) error {
+	cfg := config.AppConfig
+
+	engine := NewTemplateEngine(cfg.Panel.BackupDir)
+	nginxData, err := nginxDataFromSiteChecked(site)
+	if err != nil {
+		return fmt.Errorf("CDN 真实 IP 配置无效: %w", err)
+	}
+	nginxData.UseSSL = true
+	nginxData.SSLCertPath = certPath
+	nginxData.SSLKeyPath = keyPath
+
+	nginxConfig, err := engine.RenderNginxConfig(nginxData)
+	if err != nil {
+		return fmt.Errorf("渲染 Nginx 配置失败: %w", err)
+	}
+
+	if err := engine.ApplyNginxConfig(nginxConfig, site.NginxConfPath,
+		nginxEnabledPath(cfg, site.NginxConfPath, site.Domain)); err != nil {
+		return fmt.Errorf("应用 Nginx 配置失败: %w", err)
+	}
+
+	return nil
+}
+
+func applyHTTPNginxToSite(site *models.Website) error {
+	cfg := config.AppConfig
+	engine := NewTemplateEngine(cfg.Panel.BackupDir)
+	nginxData, err := nginxDataFromSiteChecked(site)
+	if err != nil {
+		return fmt.Errorf("CDN 真实 IP 配置无效: %w", err)
+	}
+	nginxData.UseSSL = false
+	nginxData.SSLCertPath = ""
+	nginxData.SSLKeyPath = ""
+
+	nginxConfig, err := engine.RenderNginxConfig(nginxData)
+	if err != nil {
+		return fmt.Errorf("渲染 HTTP 配置失败: %w", err)
+	}
+	if err := engine.ApplyNginxConfig(nginxConfig, site.NginxConfPath,
+		nginxEnabledPath(cfg, site.NginxConfPath, site.Domain)); err != nil {
+		return fmt.Errorf("应用 HTTP 配置失败: %w", err)
+	}
+	return nil
+}
+
+func persistSSLDatabaseState(siteID int, certPath, keyPath string, expiry time.Time, source string) error {
+	result, err := database.GetDB().Exec(
+		`UPDATE websites SET ssl_enabled = 1, ssl_cert_path = ?, ssl_key_path = ?, ssl_expires_at = ?, ssl_last_error = '', ssl_cert_source = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+		certPath, keyPath, expiry, source, siteID,
+	)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil || rows != 1 {
+		return fmt.Errorf("网站SSL状态未更新")
+	}
+	return nil
+}
+
+func persistSSLDisabledDatabaseState(siteID int) error {
+	result, err := database.GetDB().Exec(
+		`UPDATE websites SET ssl_enabled = 0, ssl_cert_path = '', ssl_key_path = '', ssl_expires_at = NULL, ssl_last_error = '', ssl_cert_source = '', updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+		siteID,
+	)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil || rows != 1 {
+		return fmt.Errorf("网站SSL关闭状态未更新")
+	}
+	return nil
+}
+
+func restoreSSLDatabaseState(site *models.Website) error {
+	result, err := database.GetDB().Exec(
+		`UPDATE websites SET ssl_enabled = ?, ssl_cert_path = ?, ssl_key_path = ?, ssl_expires_at = ?, ssl_last_error = ?, ssl_cert_source = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+		boolInt(site.SSLEnabled), site.SSLCertPath, site.SSLKeyPath, site.SSLExpiresAt, site.SSLLastError, site.SSLCertSource, site.ID,
+	)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil || rows != 1 {
+		return fmt.Errorf("网站原SSL状态未恢复")
+	}
+	return nil
+}
+
+func restorePublishedSSLCertDir(certDir, backupDir string, hadOld bool) error {
+	if err := os.RemoveAll(certDir); err != nil {
+		return err
+	}
+	if hadOld {
+		return os.Rename(backupDir, certDir)
+	}
+	return nil
+}
+
+func validateCertificate(certPath string, domain string) (time.Time, error) {
+	data, err := os.ReadFile(certPath)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("读取证书文件失败: %w", err)
+	}
+
+	var expiry time.Time
+	found := false
+
+	for rest := data; len(rest) > 0; {
+		block, remaining := pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		rest = remaining
+
+		if block.Type == "CERTIFICATE" {
+			cert, err := x509.ParseCertificate(block.Bytes)
+			if err != nil {
+				continue
+			}
+			if !cert.IsCA {
+				now := time.Now()
+				if now.After(cert.NotAfter) {
+					return time.Time{}, fmt.Errorf("证书已过期（到期: %s）", cert.NotAfter.Format("2006-01-02"))
+				}
+				if now.Before(cert.NotBefore) {
+					return time.Time{}, fmt.Errorf("证书尚未生效（生效: %s）", cert.NotBefore.Format("2006-01-02"))
+				}
+				if err := cert.VerifyHostname(domain); err != nil {
+					matched := false
+					certDomains := cert.DNSNames
+					if len(certDomains) == 0 && cert.Subject.CommonName != "" {
+						certDomains = []string{cert.Subject.CommonName}
+					}
+					for _, san := range certDomains {
+						if san == domain {
+							matched = true
+							break
+						}
+					}
+					if !matched {
+						hint := strings.Join(certDomains, ", ")
+						if hint == "" {
+							hint = "(证书未包含任何域名)"
+						}
+						return time.Time{}, fmt.Errorf("证书与域名 %s 不匹配，证书包含的域名: %s", domain, hint)
+					}
+				}
+				expiry = cert.NotAfter
+				found = true
+			}
+		}
+	}
+
+	if !found {
+		return time.Time{}, fmt.Errorf("未找到有效的证书内容")
+	}
+
+	return expiry, nil
+}
+
+func executeRenewSSL(task *Task) TaskResult {
+	cfg := config.AppConfig
+	db := database.GetDB()
+
+	rows, err := db.Query(
+		`SELECT id, name, domain, aliases, status, system_user, web_root, document_root_subdir, log_dir,
+		        db_name, db_user, php_pool_path, nginx_conf_path, site_type, ssl_enabled,
+		        ssl_cert_path, ssl_key_path, ssl_cert_source, template_version, ssl_expires_at
+		 FROM websites WHERE ssl_enabled = 1 AND ssl_cert_path != ''`,
+	)
+	if err != nil {
+		log.Printf("查询SSL站点失败: %v", err)
+		return TaskResult{Success: false, Message: "查询SSL站点失败"}
+	}
+	defer rows.Close()
+
+	var renewed []string
+	var failed []string
+	now := time.Now()
+	renewThreshold := now.AddDate(0, 0, 30)
+
+	for rows.Next() {
+		var w models.Website
+		var aliases string
+		var status string
+		var sslEnabled int
+		var sslExpiresAt *time.Time
+		if scanErr := rows.Scan(
+			&w.ID, &w.Name, &w.Domain, &aliases, &status, &w.SystemUser,
+			&w.WebRoot, &w.DocumentRootSubdir, &w.LogDir, &w.DBName, &w.DBUser, &w.PHPPoolPath,
+			&w.NginxConfPath, &w.SiteType, &sslEnabled, &w.SSLCertPath, &w.SSLKeyPath, &w.SSLCertSource,
+			&w.TemplateVersion, &sslExpiresAt,
+		); scanErr != nil {
+			failed = append(failed, w.Domain+"(读取失败)")
+			continue
+		}
+		w.Aliases = aliases
+		w.Status = models.WebsiteStatus(status)
+		w.SSLEnabled = sslEnabled == 1
+		w.SSLExpiresAt = sslExpiresAt
+		if !sslAutoRenewalEligible(&w) {
+			continue
+		}
+
+		expiry, certErr := validateCertificate(w.SSLCertPath, w.Domain)
+		if certErr != nil {
+			log.Printf("SSL证书异常 domain=%s: %v", w.Domain, certErr)
+			failed = append(failed, w.Domain+"(证书异常)")
+			continue
+		}
+
+		if expiry.After(renewThreshold) {
+			continue
+		}
+
+		if expiry.Before(now) {
+			failed = append(failed, w.Domain+"(证书已过期)")
+			continue
+		}
+		if !TryAcquireSiteOpLock(w.ID, "ssl_renewal") {
+			failed = append(failed, w.Domain+"(网站正在执行其它维护操作)")
+			continue
+		}
+		locked, lockErr := SiteMigrationLocked(context.Background(), w.ID, w.Domain)
+		if lockErr != nil || locked {
+			ReleaseSiteOpLock(w.ID)
+			if lockErr != nil {
+				failed = append(failed, w.Domain+"(检查搬家状态失败)")
+			} else {
+				failed = append(failed, w.Domain+"(网站正在搬家)")
+			}
+			continue
+		}
+
+		documentRoot, docRootErr := EnsureEffectiveDocumentRoot(w.WebRoot, w.SiteType, w.DocumentRootSubdir, w.SystemUser)
+		if docRootErr != nil {
+			ReleaseSiteOpLock(w.ID)
+			log.Printf("SSL续期准备验证目录失败 domain=%s: %v", w.Domain, docRootErr)
+			failed = append(failed, w.Domain+"(验证目录失败)")
+			continue
+		}
+
+		certDir := filepath.Join(cfg.Paths.Certificates, w.Domain)
+		stageDir := fmt.Sprintf("%s.pending-%d", certDir, time.Now().UnixNano())
+		if err := os.MkdirAll(stageDir, 0700); err != nil {
+			ReleaseSiteOpLock(w.ID)
+			failed = append(failed, w.Domain+"(准备续期目录失败)")
+			continue
+		}
+		newExpiry, renewErr := obtainLegoCert(w.Domain, w.Aliases, documentRoot, stageDir)
+		if renewErr != nil {
+			_ = os.RemoveAll(stageDir)
+			ReleaseSiteOpLock(w.ID)
+			log.Printf("SSL续期失败 domain=%s: %v", w.Domain, renewErr)
+			if stateErr := persistSSLRenewalError(w.ID, FriendlySSLError(renewErr)); stateErr != nil {
+				log.Printf("SSL续期错误状态保存失败 domain=%s: %v", w.Domain, stateErr)
+				failed = append(failed, w.Domain+"(续期失败且错误状态未保存)")
+			} else {
+				failed = append(failed, w.Domain+"(续期失败)")
+			}
+			continue
+		}
+		if renewErr = publishSSLCertificate(&w, certDir, stageDir, filepath.Join(certDir, "fullchain.pem"), filepath.Join(certDir, "privkey.pem"), newExpiry, "auto"); renewErr != nil {
+			_ = os.RemoveAll(stageDir)
+			ReleaseSiteOpLock(w.ID)
+			log.Printf("SSL续期发布失败 domain=%s: %v", w.Domain, renewErr)
+			_ = persistSSLRenewalError(w.ID, "SSL 续期发布失败")
+			failed = append(failed, w.Domain+"(续期发布失败)")
+			continue
+		}
+		ReleaseSiteOpLock(w.ID)
+
+		renewed = append(renewed, w.Domain)
+	}
+	if err := rows.Err(); err != nil {
+		failed = append(failed, "读取网站列表失败")
+		log.Printf("遍历SSL站点失败: %v", err)
+	}
+
+	msg := fmt.Sprintf("续期完成。成功: %d", len(renewed))
+	if len(failed) > 0 {
+		msg += "; 失败: " + strings.Join(failed, ", ")
+	}
+
+	if len(renewed) > 0 {
+		log.Printf("SSL 自动续期: %s", msg)
+	}
+
+	return TaskResult{Success: len(failed) == 0, Message: msg, Data: map[string]interface{}{"renewed": renewed, "failed": failed}}
+}
+
+func sslAutoRenewalEligible(site *models.Website) bool {
+	return site != nil && site.Status != models.StatusPaused && site.SSLCertSource == "auto"
+}
+
+func persistSSLRenewalError(siteID int, message string) error {
+	result, err := database.GetDB().Exec("UPDATE websites SET ssl_last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", message, siteID)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil || rows != 1 {
+		return fmt.Errorf("网站 SSL 续期错误状态未更新")
+	}
+	return nil
+}
+
+func StartSSLRenewalScheduler() {
+	go func() {
+		for {
+			now := time.Now()
+			next := time.Date(now.Year(), now.Month(), now.Day()+1, 3, 0, 0, 0, now.Location())
+			time.Sleep(next.Sub(now))
+			GlobalQueue.Enqueue(TaskRenewSSL, nil)
+		}
+	}()
+}

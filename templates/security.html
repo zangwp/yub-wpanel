@@ -1,0 +1,503 @@
+{{template "base" .}}
+{{define "security_content"}}
+<div x-data="securitySettings()" x-init="fetchSettings(); fetchCDNGroups()">
+    <div class="flex items-center justify-between mb-6">
+        <h2 class="text-xl font-bold text-white">{{t .Lang "nav.security"}}</h2>
+        <button @click="showHelp = true" class="btn-secondary text-sm">{{t .Lang "security.help"}}</button>
+    </div>
+
+    <div x-show="showHelp" x-cloak class="fixed inset-0 z-50 flex items-center justify-center bg-black/60" @click.self="showHelp = false">
+        <div class="bg-gray-800 rounded-lg p-6 max-w-4xl w-full mx-4 shadow-xl max-h-[80vh] overflow-y-auto">
+            <h3 class="text-lg font-bold text-white mb-4">{{t .Lang "security.help_title"}}</h3>
+            <div class="text-sm text-gray-300 space-y-4">
+                <div>
+                    <p class="text-white font-semibold mb-2">Fail2ban 配置项</p>
+                    <ul class="space-y-3 ml-2">
+                        <li>
+                            <p class="text-blue-400 font-medium">触发阈值（次）</p>
+                            <p>在统计窗口内，单个 IP 触发特征规则的次数达到此值即自动封禁。默认 <span class="text-blue-400">5</span> 次。调低更敏感（容易误封），调高更宽松。具体检测特征规则详见「安全防御」页面。</p>
+                        </li>
+                        <li>
+                            <p class="text-blue-400 font-medium">统计窗口（秒）</p>
+                            <p>用于累计违规次数的时间范围。默认 <span class="text-blue-400">60</span> 秒。与触发阈值配合使用：例如默认配置即"60 秒内违规 5 次则封禁"。窗口越大，累计越容易触发。</p>
+                        </li>
+                        <li>
+                            <p class="text-blue-400 font-medium">封禁时长（秒）</p>
+                            <p>首次触发后固定封禁 <span class="text-blue-400">600</span> 秒（10 分钟）。同一 IP 在同一规则中重复违规时，Fail2ban 会按 10 分钟、1 小时、6 小时、24 小时、7 天递增；不同规则分别计数，自动封禁不会升级为永久封禁。</p>
+                        </li>
+                    </ul>
+                </div>
+                <div>
+                    <p class="text-white font-semibold mb-2">白名单机制</p>
+                    <ul class="space-y-3 ml-2">
+                        <li>
+                            <p class="text-blue-400 font-medium">官方白名单</p>
+                            <p>面板自动从以下官方来源拉取最新 IP 段，加入 fail2ban 白名单，防止误封合法爬虫和 CDN 节点：</p>
+                            <ul class="list-disc list-inside ml-2 mt-1 space-y-0.5">
+                                <li><span class="text-white">Cloudflare</span> — 全球 CDN 和反向代理 IP 段（ipv4 + ipv6）</li>
+                                <li><span class="text-white">Googlebot</span> — Google 搜索爬虫官方 IP 段</li>
+                                <li><span class="text-white">Bingbot</span> — Bing 搜索爬虫官方 IP 段</li>
+                            </ul>
+                            <p class="text-gray-500 mt-1">勾选"每周自动更新"后，系统将在每周一凌晨 4:00 自动重新拉取最新 IP。</p>
+                        </li>
+                        <li>
+                            <p class="text-blue-400 font-medium">自定义白名单</p>
+                            <p>手动添加不会被封禁的 IP 或 IP 段，每行一个。支持 IPv4/IPv6 地址和 CIDR 格式（如 <code>10.0.0.0/8</code>）。自定义白名单不会被官方拉取覆盖。</p>
+                        </li>
+                        <li>
+                            <p class="text-blue-400 font-medium">WordPress 安全日志路径白名单</p>
+                            <p>用于排除搜索引擎、广告平台、站点所有权验证等正常文件。该配置只影响 WordPress 异常访问统计，不影响通用 PHP 网站，不会直接放行或封禁请求。</p>
+                        </li>
+                    </ul>
+                </div>
+                <div>
+                    <p class="text-white font-semibold mb-2">请求频率限制详解</p>
+                    <ul class="space-y-3 ml-2">
+                        <li>
+                            <p class="text-blue-400 font-medium">工作原理：令牌桶算法</p>
+                            <p>系统为每个 IP 维护一个容量等于「突发缓冲」的令牌桶，并按设置的「请求频率」持续补充令牌。请求到达时消耗令牌，耗尽后超出持续速率的请求返回 429。默认 60 次/分钟时，耗尽后的长期速率约为 1 次/秒。</p>
+                        </li>
+                        <li>
+                            <p class="text-blue-400 font-medium">请求频率（次/分钟）</p>
+                            <p>控制长期持续速率，即令牌补充速度。默认 <span class="text-blue-400">60</span> 次/分钟（= 1 次/秒）。机器人扫描通常远超此值，因此会在数秒内耗尽令牌桶，几乎所有请求都被返回 429。</p>
+                        </li>
+                        <li>
+                            <p class="text-blue-400 font-medium">突发缓冲（次）</p>
+                            <p>控制令牌桶容量，即页面打开瞬间允许的最大并发请求数。默认 <span class="text-blue-400">300</span> 次，可覆盖 Elementor + 多插件站点（单页 100+ 请求）同时打开 2-3 个标签页的场景。如需同时打开更多标签页，请设置更大值（如 500-600）。非 Elementor / 轻量站点可适当调低至 30-120。</p>
+                            <p class="text-green-400 mt-1">增大此值可减少正常页面并发请求误触发 429，但会增加初始可用令牌，使持续高频请求更晚进入限速；令牌耗尽后的长期速率不变。</p>
+                        </li>
+                        <li>
+                            <p class="text-red-400 font-semibold">⚠ 警告：多次返回 429 的 IP 将被 Fail2ban 自动封禁</p>
+                            <p class="text-red-400">429 响应会被 Fail2ban 规则捕获并计入违规次数（与 wp-login 暴力破解等同级处理）。累计触发阈值后将导致该 IP 被防火墙封锁。请确保突发缓冲足够日常使用，避免正常访客误触发 429 而被拉黑。</p>
+                        </li>
+                        <li>
+                            <p class="text-green-400 font-semibold">✓ 请求频率与突发缓冲的取舍</p>
+                            <p>「请求频率」决定令牌耗尽后的长期允许速率；「突发缓冲」决定进入限速前可承受的短时请求量。缓冲越大，正常复杂页面越不容易误触发，但持续高频请求开始收到 429 的时间也会相应延后。</p>
+                        </li>
+                        <li>
+                            <p class="text-blue-400 font-medium">如何测试配置是否合适</p>
+                            <p>用浏览器无痕窗口打开网站，随机浏览 5-10 个页面（含首页、分类页、文章页）。打开开发者工具（F12）→ Network 标签，观察是否有红色 429 状态码。全部 200/304 即表示配置合理。</p>
+                        </li>
+                    </ul>
+                </div>
+                <div>
+                    <p class="text-white font-semibold mb-2">爬虫限速说明</p>
+                    <ul class="space-y-3 ml-2">
+                        <li>
+                            <p class="text-blue-400 font-medium">限速范围</p>
+                            <p>爬虫限速默认关闭。开启后，每个站点拥有独立的爬虫限速桶；同一站点内命中的常见 Bot UA 共享该桶，普通浏览器不会进入此限速层。</p>
+                        </li>
+                        <li>
+                            <p class="text-blue-400 font-medium">搜索引擎豁免</p>
+                            <p>Googlebot/Bingbot 只有在来源 IP 命中官方 IP 段时才豁免爬虫限速。伪装成搜索引擎的请求会进入站点的爬虫限速桶。</p>
+                        </li>
+                        <li>
+                            <p class="text-blue-400 font-medium">默认识别的 Bot</p>
+                            <p>当前默认匹配 Googlebot、Bingbot、Facebook/Meta（facebookexternalhit、facebook、meta-externalagent）、Twitterbot、LinkedInBot、Slackbot、Discordbot、TelegramBot、SemrushBot、AhrefsBot、MJ12Bot、DotBot，以及 UA 中包含 bot、crawler、spider、scraper、scan 的请求。</p>
+                        </li>
+                        <li>
+                            <p class="text-blue-400 font-medium">建议默认值</p>
+                            <p>默认 30 次/分钟、突发 20 次，主要用于压制多 IP 假爬虫持续扫描，降低 WordPress 动态 404 压力。调整后可观察访问日志中 429 数量和正常抓取情况。</p>
+                        </li>
+                    </ul>
+                </div>
+            </div>
+            <div class="mt-5 text-right">
+                <button @click="showHelp = false" class="btn-primary text-sm">{{t .Lang "security.got_it"}}</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-8 mb-6">
+        <div class="card">
+            <h3 class="text-lg font-semibold text-white mb-4">{{t .Lang "security.fail2ban_config"}}</h3>
+            <form @submit.prevent="save">
+                <div class="mb-4">
+                    <label class="label">{{t .Lang "security.max_retry"}}</label>
+                    <input type="number" x-model="settings.fail2ban_maxretry" class="input-field" min="1" max="20">
+                </div>
+                <div class="mb-4">
+                    <label class="label">{{t .Lang "security.find_time"}}</label>
+                    <input type="number" x-model="settings.fail2ban_findtime" class="input-field" min="10" max="3600">
+                </div>
+                <div class="mb-4">
+                    <label class="label">{{t .Lang "security.ban_time"}}</label>
+                    <div class="input-field text-gray-300">600</div>
+                    <p class="text-xs text-gray-500 mt-1">{{t .Lang "security.increment_ban_help"}}</p>
+                </div>
+                <div class="mb-6">
+                    <label class="flex items-center space-x-2 cursor-pointer">
+                        <input type="checkbox" x-model="settings.auto_whitelist_enabled" class="w-4 h-4 rounded border-gray-600 bg-gray-700 text-blue-600">
+                        <span class="text-gray-300">{{t .Lang "security.auto_update_official_whitelist"}}</span>
+                    </label>
+                </div>
+                <button type="submit" class="btn-primary">{{t .Lang "security.save_settings"}}</button>
+            </form>
+        </div>
+
+        <div class="card">
+            <h3 class="text-lg font-semibold text-white mb-2">{{t .Lang "security.sqli_protection"}}</h3>
+            <p class="text-xs text-gray-400 mb-4">{{t .Lang "security.sqli_protection_help"}}</p>
+            <form @submit.prevent="saveSQLi" class="space-y-4">
+                <label class="flex items-center space-x-2 cursor-pointer">
+                    <input type="checkbox" x-model="settings.wp_sqli_block_enabled">
+                    <span class="text-gray-300">{{t .Lang "security.sqli_block_enabled"}}</span>
+                </label>
+                <label class="flex items-center space-x-2 cursor-pointer">
+                    <input type="checkbox" x-model="settings.wp_sqli_autoban_enabled" :disabled="!settings.wp_sqli_block_enabled">
+                    <span class="text-gray-300">{{t .Lang "security.sqli_autoban_enabled"}}</span>
+                </label>
+                <p class="text-xs text-yellow-400">{{t .Lang "security.sqli_proxy_boundary"}}</p>
+                <div>
+                    <label class="label">{{t .Lang "security.sqli_ban_threshold"}}</label>
+                    <input type="number" x-model.number="settings.wp_sqli_ban_threshold" min="1" max="50" class="input-field">
+                </div>
+                <div>
+                    <label class="label">{{t .Lang "security.sqli_ban_window"}}</label>
+                    <input type="number" x-model.number="settings.wp_sqli_ban_window_seconds" min="60" max="3600" class="input-field">
+                </div>
+                <button type="submit" class="btn-primary" :disabled="sqliSaving" x-text="sqliSaving ? t('settings.saving') : t('security.save_settings')"></button>
+            </form>
+        </div>
+
+        <div class="card">
+            <h3 class="text-lg font-semibold text-white mb-4">{{t .Lang "security.rate_limit"}}</h3>
+            <form @submit.prevent="saveRateLimit">
+                <div class="mb-4">
+                    <label class="flex items-center space-x-2 cursor-pointer">
+                        <input type="checkbox" x-model="settings.rate_limit_enabled" class="w-4 h-4 rounded border-gray-600 bg-gray-700 text-blue-600">
+                        <span class="text-gray-300">{{t .Lang "security.enable_global_rate_limit"}}</span>
+                    </label>
+                    <p class="text-xs text-gray-500 mt-1">{{t .Lang "security.rate_limit_help"}}</p>
+                </div>
+                <div class="mb-4">
+                    <label class="label">{{t .Lang "security.requests_per_minute"}}</label>
+                    <input type="number" x-model="settings.rate_limit_rpm" class="input-field" min="10" max="600">
+                    <p class="text-xs text-gray-500 mt-1">{{t .Lang "security.requests_per_minute_help"}}</p>
+                </div>
+                <div class="mb-4">
+                    <label class="label">{{t .Lang "security.burst"}}</label>
+                    <input type="number" x-model="settings.rate_limit_burst" class="input-field" min="5" max="600">
+                    <p class="text-xs text-gray-500 mt-1">{{t .Lang "security.burst_help"}}</p>
+                    <p class="text-xs text-red-400 mt-1">{{t .Lang "security.burst_warning"}}</p>
+                </div>
+                <button type="submit" class="btn-primary">{{t .Lang "security.save_rate_limit"}}</button>
+            </form>
+        </div>
+
+        <div class="card">
+            <h3 class="text-lg font-semibold text-white mb-4">{{t .Lang "security.bot_limit"}}</h3>
+            <form @submit.prevent="saveBotLimit">
+                <div class="mb-4">
+                    <label class="flex items-center space-x-2 cursor-pointer">
+                        <input type="checkbox" x-model="settings.bot_limit_enabled" class="w-4 h-4 rounded border-gray-600 bg-gray-700 text-blue-600">
+                        <span class="text-gray-300">{{t .Lang "security.enable_bot_limit"}}</span>
+                    </label>
+                    <p class="text-xs text-gray-500 mt-1">{{t .Lang "security.bot_limit_help"}}</p>
+                </div>
+                <div class="mb-4">
+                    <label class="label">{{t .Lang "security.bot_requests_per_minute"}}</label>
+                    <input type="number" x-model="settings.bot_limit_rpm" class="input-field" min="5" max="300">
+                    <p class="text-xs text-gray-500 mt-1">{{t .Lang "security.bot_requests_help"}}</p>
+                </div>
+                <div class="mb-4">
+                    <label class="label">{{t .Lang "security.bot_burst"}}</label>
+                    <input type="number" x-model="settings.bot_limit_burst" class="input-field" min="5" max="300">
+                    <p class="text-xs text-gray-500 mt-1">{{t .Lang "security.bot_burst_help"}}</p>
+                </div>
+                <button type="submit" class="btn-primary">{{t .Lang "security.save_bot_limit"}}</button>
+            </form>
+        </div>
+        <div class="card">
+            <h3 class="text-lg font-semibold text-white mb-4">{{t .Lang "security.whitelist_management"}}</h3>
+        <div class="mb-4">
+            <div class="flex items-center justify-between mb-2">
+                <label class="label">{{t .Lang "security.official_whitelist"}}</label>
+                <button @click="refreshWhitelist" class="text-sm py-1 px-3 rounded" style="background-color: #166534; color: #bbf7d0;">{{t .Lang "security.fetch_now"}}</button>
+            </div>
+            <textarea x-model="settings.official_whitelist_ips" class="input-field font-mono text-sm" rows="5" readonly disabled style="opacity: 0.6;"></textarea>
+            <p class="text-gray-500 text-xs mt-1" x-text="t('security.last_update_label') + (settings.last_whitelist_update || t('settings.no_data'))"></p>
+        </div>
+        <div class="mb-4 rounded border border-gray-700 p-3">
+            <div class="flex items-center justify-between gap-3 mb-2">
+                <label class="label mb-0">{{t .Lang "security.googlebot_ranges"}}</label>
+                <span class="text-xs text-blue-300" x-text="googlebotSourceLabel()"></span>
+            </div>
+            <p class="text-xs text-gray-400 mb-2">{{t .Lang "security.googlebot_ranges_help"}}</p>
+            <textarea x-model="settings.googlebot_ips" class="input-field font-mono text-sm" rows="5" placeholder="66.249.64.0/19"></textarea>
+            <div class="text-xs text-gray-500 mt-2">
+                <span x-text="t('security.googlebot_last_success') + (settings.googlebot_ips_last_success_at || t('settings.no_data'))"></span>
+                <p x-show="settings.googlebot_ips_last_error" class="text-yellow-400 mt-1" x-text="t('security.googlebot_last_error') + settings.googlebot_ips_last_error"></p>
+            </div>
+            <button @click="saveGooglebotRanges" class="btn-secondary mt-3 text-sm">{{t .Lang "security.import_googlebot_ranges"}}</button>
+        </div>
+        <div class="mb-4">
+            <label class="label">{{t .Lang "security.custom_whitelist"}}</label>
+            <textarea x-model="settings.whitelist_ips" class="input-field font-mono text-sm" rows="4" placeholder="1.2.3.4&#10;10.0.0.0/8"></textarea>
+        </div>
+        <button @click="saveWhitelist" class="btn-primary">{{t .Lang "security.save_custom_whitelist"}}</button>
+        <div class="mt-6 pt-4 border-t border-gray-700/50">
+            <label class="label">{{t .Lang "security.wp_security_path_whitelist"}}</label>
+            <textarea x-model="settings.wp_security_log_whitelist" class="input-field font-mono text-sm" rows="5" placeholder="/google*.html&#10;/BingSiteAuth.xml&#10;/custom-verify-*.txt"></textarea>
+            <p class="text-xs text-gray-500 mt-1">{{t .Lang "security.wp_security_path_help"}}</p>
+            <button @click="saveWPSecurityLogWhitelist" class="btn-primary mt-3">{{t .Lang "security.save_path_whitelist"}}</button>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="flex items-center justify-between mb-4">
+            <h3 class="text-lg font-semibold text-white">{{t .Lang "security.cdn_realip_groups"}}</h3>
+            <span class="text-xs text-gray-500">{{t .Lang "security.cdn_realip_subtitle"}}</span>
+        </div>
+        <div class="rounded border border-blue-900/60 bg-blue-950/30 p-3 mb-4 text-sm text-blue-100">
+            <p class="font-medium text-blue-200">{{t .Lang "security.cdn_realip_conclusion"}}</p>
+            <p class="text-xs text-blue-200/80 mt-1">{{t .Lang "security.cdn_realip_compatible_help"}}</p>
+            <p class="text-xs text-blue-200/80 mt-1">{{t .Lang "security.cdn_realip_strict_help"}}</p>
+        </div>
+        <div class="space-y-2 mb-4">
+            <template x-for="g in cdnGroups" :key="g.id">
+                <div class="rounded border border-gray-700 p-3 text-sm">
+                    <div class="flex items-start justify-between gap-3">
+                        <div>
+                            <div class="text-white font-medium">
+                                <span x-text="g.name"></span>
+                                <span x-show="g.builtin" class="badge-info ml-2">{{t .Lang "security.builtin"}}</span>
+                                <span x-show="!g.enabled" class="badge-warning ml-2">{{t .Lang "security.disabled"}}</span>
+                            </div>
+                            <div class="text-xs text-gray-400 mt-1">
+                                <span x-text="'Header: ' + g.header_name"></span>
+                                <span class="mx-2">|</span>
+                                <span x-text="cdnGroupModeLabel(g)"></span>
+                            </div>
+                            <p x-show="g.provider === 'compatible'" class="text-xs text-gray-500 mt-1">{{t .Lang "security.compatible_group_help"}}</p>
+                            <p x-show="g.provider === 'cloudflare'" class="text-xs text-gray-500 mt-1">{{t .Lang "security.cloudflare_group_help"}}</p>
+                        </div>
+                        <div x-show="!g.builtin" class="flex items-center space-x-2">
+                            <button @click="editCDNGroup(g)" class="btn-secondary text-xs py-1 px-2">{{t .Lang "security.edit"}}</button>
+                            <button @click="deleteCDNGroup(g)" class="btn-danger text-xs py-1 px-2">{{t .Lang "security.delete"}}</button>
+                        </div>
+                    </div>
+                </div>
+            </template>
+        </div>
+        <div class="rounded border border-gray-700 p-3">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div>
+                    <label class="label text-xs">{{t .Lang "security.name"}}</label>
+                    <input x-model="cdnGroupForm.name" class="input-field text-sm" placeholder="{{t .Lang "security.name_placeholder"}}">
+                </div>
+                <div>
+                    <label class="label text-xs">{{t .Lang "security.real_ip_header"}}</label>
+                    <input x-model="cdnGroupForm.header_name" class="input-field text-sm font-mono" placeholder="X-Forwarded-For">
+                </div>
+            </div>
+            <div class="mt-3">
+                <label class="label text-xs">{{t .Lang "security.trusted_cdn_origin_ips"}}</label>
+                <textarea x-model="cdnGroupForm.ip_ranges" class="input-field font-mono text-sm" rows="4" placeholder="{{t .Lang "security.trusted_cdn_origin_ips_placeholder"}}"></textarea>
+                <p class="text-xs text-gray-500 mt-1">{{t .Lang "security.trusted_cdn_origin_ips_help"}}</p>
+            </div>
+            <div class="mt-3">
+                <label class="label text-xs">{{t .Lang "security.description"}}</label>
+                <input x-model="cdnGroupForm.description" class="input-field text-sm" placeholder="{{t .Lang "security.description_placeholder"}}">
+            </div>
+            <label class="flex items-center space-x-2 text-sm text-gray-300 mt-3">
+                <input type="checkbox" x-model="cdnGroupForm.enabled">
+                <span>{{t .Lang "security.enable_group"}}</span>
+            </label>
+            <div class="mt-3 flex items-center space-x-2">
+                <button @click="saveCDNGroup()" :disabled="cdnGroupSaving" class="btn-primary text-sm">
+                    <span x-show="cdnGroupForm.id">{{t .Lang "security.save_group"}}</span>
+                    <span x-show="!cdnGroupForm.id">{{t .Lang "security.add_group"}}</span>
+                </button>
+                <button x-show="cdnGroupForm.id" @click="resetCDNGroupForm()" class="btn-secondary text-sm">{{t .Lang "security.cancel_edit"}}</button>
+            </div>
+            <p class="text-xs text-gray-500 mt-2">{{t .Lang "security.header_name_help"}}</p>
+        </div>
+    </div>
+
+    <div class="card">
+        <h3 class="text-lg font-semibold text-white mb-4">{{t .Lang "security.telemetry"}}</h3>
+        <div class="mb-4">
+            <label class="flex items-center space-x-2 cursor-pointer">
+                <input type="checkbox" x-model="settings.telemetry_enabled" @change="saveTelemetry" class="w-4 h-4 rounded border-gray-600 bg-gray-700 text-blue-600">
+                <span class="text-gray-300">{{t .Lang "security.enable_telemetry"}}</span>
+            </label>
+            <p class="text-xs text-gray-500 mt-2">{{t .Lang "security.telemetry_help"}}</p>
+        </div>
+    </div>
+</div>
+
+<script>
+function securitySettings() {
+    return {
+        settings: {},
+        showHelp: false,
+        cdnGroups: [],
+        cdnGroupSaving: false,
+        sqliSaving: false,
+        cdnGroupForm: { id: null, name: '', header_name: 'X-Forwarded-For', ip_ranges: '', enabled: true, description: '' },
+        async fetchSettings() {
+            try {
+                const r = await api('/security/settings');
+                if (r.success) {
+                    const map = {};
+                    r.data.forEach(s => {
+                        let v = s.svalue;
+                        if (['auto_whitelist_enabled','rate_limit_enabled','bot_limit_enabled','telemetry_enabled','wp_sqli_block_enabled','wp_sqli_autoban_enabled'].includes(s.skey)) v = v === 'true';
+                        else if (['fail2ban_maxretry','fail2ban_findtime','fail2ban_bantime','rate_limit_rpm','rate_limit_burst','bot_limit_rpm','bot_limit_burst','wp_sqli_ban_threshold','wp_sqli_ban_window_seconds'].includes(s.skey)) v = parseInt(v) || 0;
+                        map[s.skey] = v;
+                    });
+                    if (typeof map.bot_limit_enabled === 'undefined') map.bot_limit_enabled = false;
+                    if (typeof map.bot_limit_rpm === 'undefined') map.bot_limit_rpm = 30;
+                    if (typeof map.bot_limit_burst === 'undefined') map.bot_limit_burst = 20;
+                    this.settings = map;
+                }
+            } catch(e) {}
+        },
+        async fetchCDNGroups() {
+            try {
+                const r = await api('/security/cdn-realip-groups');
+                if (r.success) this.cdnGroups = r.data || [];
+            } catch(e) { showToast(t('security.fetch_cdn_groups_failed') + ': ' + e.message, 'error'); }
+        },
+        cdnGroupModeLabel(group) {
+            if ((group.ip_ranges || '').trim()) return t('security.cdn_mode_strict_trusted_ips');
+            if (group.provider === 'cloudflare') return t('security.cdn_mode_cloudflare_auto');
+            if (group.provider === 'compatible') return t('security.cdn_mode_compatible_no_origin_ips');
+            return t('security.cdn_mode_compatible_missing_origin_ips');
+        },
+        resetCDNGroupForm() {
+            this.cdnGroupForm = { id: null, name: '', header_name: 'X-Forwarded-For', ip_ranges: '', enabled: true, description: '' };
+        },
+        editCDNGroup(group) {
+            this.cdnGroupForm = {
+                id: group.id,
+                name: group.name || '',
+                header_name: group.header_name || 'X-Forwarded-For',
+                ip_ranges: group.ip_ranges || '',
+                enabled: !!group.enabled,
+                description: group.description || ''
+            };
+        },
+        async saveCDNGroup() {
+            this.cdnGroupSaving = true;
+            try {
+                const body = {
+                    name: this.cdnGroupForm.name || '',
+                    header_name: this.cdnGroupForm.header_name || '',
+                    ip_ranges: this.cdnGroupForm.ip_ranges || '',
+                    enabled: !!this.cdnGroupForm.enabled,
+                    description: this.cdnGroupForm.description || ''
+                };
+                const url = this.cdnGroupForm.id ? '/security/cdn-realip-groups/' + this.cdnGroupForm.id : '/security/cdn-realip-groups';
+                const method = this.cdnGroupForm.id ? 'PUT' : 'POST';
+                const r = await api(url, { method, body });
+                showToast(r.data?.message || t('settings.saved'), 'success');
+                this.resetCDNGroupForm();
+                await this.fetchCDNGroups();
+            } catch(e) { showToast(e.message, 'error'); }
+            finally { this.cdnGroupSaving = false; }
+        },
+        async deleteCDNGroup(group) {
+            if (!await confirmModal(t('security.confirm_delete_cdn_group', { name: group.name }))) return;
+            try {
+                const r = await api('/security/cdn-realip-groups/' + group.id, { method: 'DELETE' });
+                showToast(r.data?.message || t('settings.deleted'), 'success');
+                await this.fetchCDNGroups();
+            } catch(e) { showToast(e.message, 'error'); }
+        },
+        async save() {
+            try {
+                const { fail2ban_bantime, wp_sqli_block_enabled, wp_sqli_autoban_enabled, wp_sqli_ban_threshold, wp_sqli_ban_window_seconds, ...body } = this.settings;
+                await api('/security/settings', { method: 'PUT', body });
+                showToast(t('settings.saved'), 'success');
+            } catch(e) { showToast(e.message, 'error'); }
+        },
+        async saveSQLi() {
+            this.sqliSaving = true;
+            try {
+                await api('/security/settings', { method: 'PUT', body: {
+                    wp_sqli_block_enabled: this.settings.wp_sqli_block_enabled ? 'true' : 'false',
+                    wp_sqli_autoban_enabled: this.settings.wp_sqli_autoban_enabled ? 'true' : 'false',
+                    wp_sqli_ban_threshold: String(this.settings.wp_sqli_ban_threshold || 5),
+                    wp_sqli_ban_window_seconds: String(this.settings.wp_sqli_ban_window_seconds || 600),
+                } });
+                showToast(t('settings.saved'), 'success');
+                await this.fetchSettings();
+            } catch(e) { showToast(e.message, 'error'); }
+            finally { this.sqliSaving = false; }
+        },
+        async saveRateLimit() {
+            try {
+                await api('/security/settings', { method: 'PUT', body: {
+                    rate_limit_enabled: this.settings.rate_limit_enabled ? 'true' : 'false',
+                    rate_limit_rpm: String(this.settings.rate_limit_rpm || 60),
+                    rate_limit_burst: String(this.settings.rate_limit_burst || 300),
+                } });
+                showToast(t('settings.saved'), 'success');
+            } catch(e) { showToast(e.message, 'error'); }
+        },
+        async saveBotLimit() {
+            try {
+                await api('/security/settings', { method: 'PUT', body: {
+                    bot_limit_enabled: this.settings.bot_limit_enabled ? 'true' : 'false',
+                    bot_limit_rpm: String(this.settings.bot_limit_rpm || 30),
+                    bot_limit_burst: String(this.settings.bot_limit_burst || 20),
+                } });
+                showToast(t('settings.saved'), 'success');
+            } catch(e) { showToast(e.message, 'error'); }
+        },
+        async saveTelemetry() {
+            if (!this.settings.telemetry_enabled) {
+                const confirmed = await confirmModal(
+                    t('security.telemetry_disable_confirm')
+                );
+                if (!confirmed) {
+                    this.settings.telemetry_enabled = true;
+                    return;
+                }
+            }
+            try {
+                await api('/security/settings', { method: 'PUT', body: {
+                    telemetry_enabled: this.settings.telemetry_enabled ? 'true' : 'false',
+                } });
+                showToast(this.settings.telemetry_enabled ? t('security.telemetry_enabled') : t('security.telemetry_disabled'), 'success');
+            } catch(e) { showToast(e.message, 'error'); }
+        },
+        async saveWhitelist() {
+            try {
+                await api('/security/settings', { method: 'PUT', body: { whitelist_ips: this.settings.whitelist_ips || '' } });
+                showToast(t('settings.saved'), 'success');
+            } catch(e) { showToast(e.message, 'error'); }
+        },
+        googlebotSourceLabel() {
+            const source = this.settings.googlebot_ips_source || '';
+            if (source === 'official') return t('security.googlebot_source_official');
+            if (source === 'relay') return t('security.googlebot_source_relay');
+            if (source === 'manual') return t('security.googlebot_source_manual');
+            return t('security.googlebot_source_unknown');
+        },
+        async saveGooglebotRanges() {
+            try {
+                const r = await api('/security/whitelist/googlebot', { method: 'PUT', body: { ip_ranges: this.settings.googlebot_ips || '' } });
+                showToast(r.data?.message || t('settings.saved'), 'success');
+                await this.fetchSettings();
+            } catch(e) { showToast(e.message, 'error'); }
+        },
+        async saveWPSecurityLogWhitelist() {
+            try {
+                await api('/security/settings', { method: 'PUT', body: { wp_security_log_whitelist: this.settings.wp_security_log_whitelist || '' } });
+                showToast(t('settings.saved'), 'success');
+            } catch(e) { showToast(e.message, 'error'); }
+        },
+        async refreshWhitelist() {
+            try {
+                const r = await api('/security/whitelist/refresh', { method: 'POST' });
+                showToast(r.data?.message || t('security.refresh_triggered'), 'success');
+                await this.fetchSettings();
+            } catch(e) { showToast(e.message, 'error'); }
+        }
+    }
+}
+</script>
+{{end}}

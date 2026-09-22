@@ -1,0 +1,62 @@
+package middleware
+
+import (
+	"fmt"
+	"testing"
+	"time"
+)
+
+func insertTestBan(t *testing.T, tracker *LoginAttemptTracker, ip, jail string) {
+	t.Helper()
+	expires := time.Now().UTC().Add(time.Hour).Format("2006-01-02 15:04:05")
+	if _, err := tracker.DB.Exec(
+		`INSERT INTO firewall_bans (ip_address, ban_level, reason, source_jail, expires_at, ban_count)
+		 VALUES (?, 2, 'test', ?, ?, 1)`,
+		ip, jail, expires,
+	); err != nil {
+		t.Fatalf("insert test ban: %v", err)
+	}
+}
+
+func TestIsBannedIgnoresYubWPanelLoginSource(t *testing.T) {
+	db := newScanDefenseTestDB(t)
+	tracker := &LoginAttemptTracker{DB: db}
+	insertTestBan(t, tracker, "203.0.113.10", "yubwpanel-login")
+
+	banned, err := tracker.IsBanned("203.0.113.10")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if banned {
+		t.Fatal("a yubwpanel-login-only ban must not block panel access")
+	}
+}
+
+func TestIsBannedHonorsOtherSources(t *testing.T) {
+	db := newScanDefenseTestDB(t)
+	tracker := &LoginAttemptTracker{DB: db}
+
+	jails := []string{"yubwpanel", "yubwpanel-404", "yubwpanel-sshd", "panel", "panel_scan", "manual"}
+	for i, jail := range jails {
+		ip := fmt.Sprintf("203.0.113.%d", i+1)
+		insertTestBan(t, tracker, ip, jail)
+		banned, err := tracker.IsBanned(ip)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !banned {
+			t.Fatalf("a %s ban should still block panel access", jail)
+		}
+	}
+}
+
+func TestIsBannedReportsDatabaseFailure(t *testing.T) {
+	db := newScanDefenseTestDB(t)
+	tracker := &LoginAttemptTracker{DB: db}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if banned, err := tracker.IsBanned("203.0.113.10"); err == nil || banned {
+		t.Fatalf("banned=%t err=%v, want database error", banned, err)
+	}
+}

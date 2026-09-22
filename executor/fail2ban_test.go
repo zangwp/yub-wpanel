@@ -1,0 +1,1789 @@
+package executor
+
+import (
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/zangwp/yub-wpanel/database"
+	"github.com/zangwp/yub-wpanel/models"
+)
+
+func TestGooglebotFetchUsesOfficialSource(t *testing.T) {
+	oldClient := googlebotHTTPClient
+	t.Cleanup(func() { googlebotHTTPClient = oldClient })
+	googlebotHTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.String() != googlebotOfficialURL {
+			return nil, errors.New("unexpected URL")
+		}
+		body := `{"creationTime":"2026-08-14T00:00:00.000000Z","prefixes":[{"ipv4Prefix":"66.249.64.0/19"},{"ipv6Prefix":"2001:4860:4801::/48"}]}`
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}
+	ips, source, err := fetchGooglebotIPsWithFallback()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source != "official" || strings.Join(ips, ",") != "66.249.64.0/19,2001:4860:4801::/48" {
+		t.Fatalf("source=%q ips=%v", source, ips)
+	}
+}
+
+func TestFail2banWebFilterIncludesNewSensitiveFileNames(t *testing.T) {
+	for _, want := range []string{
+		`secrets\.(?:json|ya?ml)`,
+		`settings\.py`,
+		`application\.properties`,
+		`config\.toml`,
+	} {
+		if !strings.Contains(fail2banFilterConfig, want) {
+			t.Fatalf("fail2ban web filter missing %q", want)
+		}
+	}
+}
+
+func TestPersistFamilyFor(t *testing.T) {
+	tests := []struct {
+		ip, family, setType, saddr string
+	}{
+		{ip: "192.0.2.1", family: "ip", setType: "ipv4_addr", saddr: "ip"},
+		{ip: "2001:db8::1", family: "ip6", setType: "ipv6_addr", saddr: "ip6"},
+	}
+	for _, tt := range tests {
+		family, err := persistFamilyFor(net.ParseIP(tt.ip))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if family.family != tt.family || family.setType != tt.setType || family.saddr != tt.saddr {
+			t.Fatalf("persistFamilyFor(%s) = %+v", tt.ip, family)
+		}
+	}
+	if _, err := persistFamilyFor(nil); err == nil {
+		t.Fatal("persistFamilyFor(nil) succeeded")
+	}
+}
+
+func TestPersistBanUsesAddressFamilyAndIsIdempotent(t *testing.T) {
+	oldExec := persistNftExec
+	t.Cleanup(func() { persistNftExec = oldExec })
+	var commands []string
+	persistNftExec = func(args ...string) (string, error) {
+		command := strings.Join(args, " ")
+		commands = append(commands, command)
+		if strings.HasPrefix(command, "add table ") || strings.HasPrefix(command, "add chain ") || strings.HasPrefix(command, "add set ") {
+			return "Error: File exists", errors.New("exit status 1")
+		}
+		if strings.HasPrefix(command, "list chain ") {
+			return "ip saddr @banned_ips drop\nip6 saddr @banned_ips drop\ntcp dport 22 ct state new", nil
+		}
+		return "", nil
+	}
+	if err := AddPersistBan("2604:a880:cad:d0:0:1:a6db:2001"); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemovePersistBan("192.0.2.9"); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(commands, "\n")
+	if !strings.Contains(joined, "add element ip6 yubwpanel_persist banned_ips { 2604:a880:cad:d0:0:1:a6db:2001 }") {
+		t.Fatalf("IPv6 add did not use ip6 family or normalized address:\n%s", joined)
+	}
+	if !strings.Contains(joined, "delete element ip yubwpanel_persist banned_ips { 192.0.2.9 }") {
+		t.Fatalf("IPv4 delete did not use ip family:\n%s", joined)
+	}
+}
+
+func TestRemovePersistBanTreatsMissingElementAsSuccess(t *testing.T) {
+	oldExec := persistNftExec
+	t.Cleanup(func() { persistNftExec = oldExec })
+	persistNftExec = func(args ...string) (string, error) {
+		return "Error: No such file or directory", errors.New("exit status 1")
+	}
+	if err := RemovePersistBan("2001:db8::2"); err != nil {
+		t.Fatalf("missing element should be idempotent: %v", err)
+	}
+}
+
+func TestEnsurePersistNftablesAttemptsBothFamilies(t *testing.T) {
+	oldExec := persistNftExec
+	t.Cleanup(func() { persistNftExec = oldExec })
+	var commands []string
+	persistNftExec = func(args ...string) (string, error) {
+		command := strings.Join(args, " ")
+		commands = append(commands, command)
+		if command == "add table ip yubwpanel_persist" {
+			return "permission denied", errors.New("exit status 1")
+		}
+		if strings.HasPrefix(command, "add ") {
+			return "Error: File exists", errors.New("exit status 1")
+		}
+		if strings.HasPrefix(command, "list chain ") {
+			return "ip6 saddr @banned_ips drop", nil
+		}
+		return "", nil
+	}
+	if err := EnsurePersistNftables(); err == nil {
+		t.Fatal("EnsurePersistNftables succeeded despite IPv4 failure")
+	}
+	if !strings.Contains(strings.Join(commands, "\n"), "add table ip6 yubwpanel_persist") {
+		t.Fatalf("IPv6 family was skipped after IPv4 failure: %v", commands)
+	}
+}
+
+func TestReconcilePanelManagedBansContinuesAfterPersistFailure(t *testing.T) {
+	openTestDB(t)
+	oldAdd := syncAddPersistBan
+	t.Cleanup(func() { syncAddPersistBan = oldAdd })
+	for _, ip := range []string{"192.0.2.31", "2001:db8::31"} {
+		if _, err := database.GetDB().Exec(`INSERT INTO firewall_bans
+			(ip_address,ban_level,reason,source_jail,ban_count,expires_at)
+			VALUES (?,4,'scan','panel_scan',1,datetime('now','+1 day'))`, ip); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var called []string
+	syncAddPersistBan = func(ip string) error {
+		called = append(called, ip)
+		if ip == "192.0.2.31" {
+			return errors.New("injected failure")
+		}
+		return nil
+	}
+	reconcilePanelManagedBans(database.GetDB(), time.Now(), map[string]bool{})
+	if len(called) != 2 {
+		t.Fatalf("persist add calls = %v, want both IPs", called)
+	}
+}
+
+func TestUnbanAllIPsFlushesBothPersistFamilies(t *testing.T) {
+	openTestDB(t)
+	oldExec := persistNftExec
+	oldShell := shellExec
+	oldReplace := unbanAllReplaceNginxBannedIPs
+	t.Cleanup(func() {
+		persistNftExec = oldExec
+		shellExec = oldShell
+		unbanAllReplaceNginxBannedIPs = oldReplace
+	})
+	var flushed []string
+	persistNftExec = func(args ...string) (string, error) {
+		if len(args) >= 3 && args[0] == "flush" {
+			flushed = append(flushed, args[2])
+		}
+		return "", nil
+	}
+	shellExec = func(string, ...string) (string, error) { return "", errors.New("not running") }
+	unbanAllReplaceNginxBannedIPs = func(map[string]bool) error { return nil }
+	UnbanAllIPs()
+	if strings.Join(flushed, ",") != "ip,ip6" {
+		t.Fatalf("flushed families = %v, want [ip ip6]", flushed)
+	}
+}
+
+func TestFail2banSensitive404RegexBehavior(t *testing.T) {
+	pattern := strings.ReplaceAll(fail2banSensitive404Regex, "<HOST>", `[0-9a-f:.]+`)
+	re := regexp.MustCompile(pattern)
+
+	for _, line := range []string{
+		`203.0.113.7 - - [28/Aug/2026:15:45:47 +0800] "GET /.ENV HTTP/1.1" 404 146 "-" "curl/8"`,
+		`2001:db8::7 - - [28/Aug/2026:15:45:47 +0800] "POST /.ds_store HTTP/2.0" 404 146 "-" "curl/8"`,
+		`203.0.113.7 - - [28/Aug/2026:15:45:47 +0800] "GET /SECRETS.YAML HTTP/1.1" 404 146 "-" "curl/8"`,
+	} {
+		if !re.MatchString(line) {
+			t.Fatalf("sensitive 404 regex did not match %q", line)
+		}
+	}
+
+	for _, line := range []string{
+		`203.0.113.7 - - [28/Aug/2026:15:45:47 +0800] "GET /.gitignore HTTP/1.1" 404 146 "-" "curl/8"`,
+		`203.0.113.7 - - [28/Aug/2026:15:45:47 +0800] "GET /.ENV HTTP/1.1" 200 146 "-" "curl/8"`,
+	} {
+		if re.MatchString(line) {
+			t.Fatalf("sensitive 404 regex unexpectedly matched %q", line)
+		}
+	}
+}
+
+func TestNormalizeOfficialIPRangesRejectsUnsafeInput(t *testing.T) {
+	if _, err := NormalizeOfficialIPRanges("0.0.0.0/0"); err == nil {
+		t.Fatal("expected overly broad range to be rejected")
+	}
+	if _, err := NormalizeOfficialIPRanges("127.0.0.1/32"); err == nil {
+		t.Fatal("expected loopback range to be rejected")
+	}
+	ips, err := NormalizeOfficialIPRanges("66.249.64.0/19\n66.249.64.0/19")
+	if err != nil || len(ips) != 1 {
+		t.Fatalf("ips=%v err=%v", ips, err)
+	}
+	ips, err = NormalizeOfficialIPRanges(`{"prefixes":[{"ipv4Prefix":"66.249.64.0/19"}]}`)
+	if err != nil || len(ips) != 1 || ips[0] != "66.249.64.0/19" {
+		t.Fatalf("JSON import ips=%v err=%v", ips, err)
+	}
+}
+
+func TestWriteFail2banLocalPreservesExistingSettings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fail2ban.local")
+	before := "[DEFAULT]\nloglevel = INFO\ndbpurgeage = 1d\n\n[Thread]\nstacksize = 0\n"
+	if err := os.WriteFile(path, []byte(before), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFail2banLocal(path); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "loglevel = INFO") || !strings.Contains(content, "stacksize = 0") {
+		t.Fatalf("existing settings were lost:\n%s", content)
+	}
+	if strings.Count(content, "dbpurgeage = 30d") != 1 {
+		t.Fatalf("dbpurgeage was not updated exactly once:\n%s", content)
+	}
+}
+
+func TestWriteFail2banLocalRemovesDuplicatePurgeSettings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fail2ban.local")
+	if err := os.WriteFile(path, []byte("[DEFAULT]\ndbpurgeage=1d\nloglevel=INFO\ndbpurgeage=2d\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFail2banLocal(path); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(data), "dbpurgeage") != 1 || !strings.Contains(string(data), "dbpurgeage = 30d") {
+		t.Fatalf("duplicate setting was not repaired:\n%s", data)
+	}
+}
+
+func TestFail2banLoginFilterAllowsQueriesAndIgnoresCoreNonLoginActions(t *testing.T) {
+	lines := strings.Split(fail2banLoginFilterConfig, "\n")
+	var failPattern, ignorePattern string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "failregex = ") {
+			failPattern = strings.TrimPrefix(trimmed, "failregex = ")
+		}
+		if strings.HasPrefix(trimmed, "^<HOST>") && strings.Contains(trimmed, "action=(?:") {
+			ignorePattern = trimmed
+		}
+	}
+	failRE := regexp.MustCompile(strings.ReplaceAll(failPattern, "<HOST>", `\S+`))
+	ignorePattern = strings.ReplaceAll(ignorePattern, "<HOST>", `\S+`)
+	pythonMatch := func(pattern, value string) bool {
+		t.Helper()
+		if _, err := exec.LookPath("python3"); err != nil {
+			t.Skip("python3 is required to validate Fail2ban-compatible regex")
+		}
+		cmd := exec.Command("python3", "-c", `import re,sys;sys.exit(0 if re.search(sys.argv[1],sys.argv[2]) else 1)`, pattern, value)
+		return cmd.Run() == nil
+	}
+	line := func(target, status string) string {
+		return `203.0.113.9 - - [14/Aug/2026:12:00:00 +0800] "POST ` + target + ` HTTP/2.0" ` + status + ` 123 "-" "test"`
+	}
+	for _, target := range []string{"/wp-login.php", "/wp-login.php?x=1", "/wp-login.php?action=login", "/wp-login.php?x=1&action=unknown"} {
+		if !failRE.MatchString(line(target, "200")) || pythonMatch(ignorePattern, line(target, "200")) {
+			t.Fatalf("login failure should be counted: %s", target)
+		}
+	}
+	if failRE.MatchString(line("/wp-login.php?x=1", "302")) {
+		t.Fatal("successful login response matched failure rule")
+	}
+	for _, target := range []string{"/wp-login.php?action=lostpassword", "/wp-login.php?x=1&action=register", "/wp-login.php?action=rp&key=abc&login=user"} {
+		if !failRE.MatchString(line(target, "200")) || !pythonMatch(ignorePattern, line(target, "200")) {
+			t.Fatalf("core non-login action should be ignored: %s", target)
+		}
+	}
+	for _, target := range []string{
+		"/wp-login.php?action=lostpassword&action=login",
+		"/wp-login.php?action=lostpassword&%61ction=login",
+		"/wp-login.php?action=lostpassword&action%5B%5D=login",
+	} {
+		if pythonMatch(ignorePattern, line(target, "200")) {
+			t.Fatalf("ambiguous action parameters must not be ignored: %s", target)
+		}
+	}
+	if !pythonMatch(ignorePattern, line("/wp-login.php?action=login&action=lostpassword", "200")) {
+		t.Fatal("the final safe action should be ignored")
+	}
+	if strings.Contains(fail2banLoginFilterConfig, " 444 ") {
+		t.Fatal("444 must not be included in Fail2ban filters")
+	}
+}
+
+// TestFail2banLoginFilterIsUriAgnostic 证明登录/XML-RPC 爆破 failregex 的判定
+// 只依赖状态码结构（POST ... 200/403），不要求路径斜杠数量——因为"是不是
+// wp-login.php/xmlrpc.php"这件事已经由 Nginx 侧基于规范化 $uri 的 map 判断完，
+// 写进 wp-login-security.log 的每一行本身就是候选事件，这里只做防御性结构校验。
+func TestFail2banLoginFilterIsUriAgnostic(t *testing.T) {
+	lines := strings.Split(fail2banLoginFilterConfig, "\n")
+	var failPatterns []string
+	inFailregex := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "failregex = ") {
+			failPatterns = append(failPatterns, strings.TrimPrefix(trimmed, "failregex = "))
+			inFailregex = true
+			continue
+		}
+		if strings.HasPrefix(trimmed, "ignoreregex") {
+			inFailregex = false
+			continue
+		}
+		if inFailregex && trimmed != "" {
+			failPatterns = append(failPatterns, trimmed)
+		}
+	}
+	if len(failPatterns) != 2 {
+		t.Fatalf("expected exactly 2 failregex lines (200 + 403), got %d: %v", len(failPatterns), failPatterns)
+	}
+	loginRE := regexp.MustCompile(strings.ReplaceAll(failPatterns[0], "<HOST>", `\S+`))
+	xmlrpcRE := regexp.MustCompile(strings.ReplaceAll(failPatterns[1], "<HOST>", `\S+`))
+	line := func(target, status string) string {
+		return `203.0.113.9 - - [14/Aug/2026:12:00:00 +0800] "POST ` + target + ` HTTP/2.0" ` + status + ` 123 "-" "test"`
+	}
+	for _, target := range []string{"/wp-login.php", "//wp-login.php", "///wp-login.php", "/%2Fwp-login.php"} {
+		if !loginRE.MatchString(line(target, "200")) {
+			t.Fatalf("login failregex should not care about slash count: %s", target)
+		}
+	}
+	for _, target := range []string{"/xmlrpc.php", "//xmlrpc.php", "///xmlrpc.php"} {
+		if !xmlrpcRE.MatchString(line(target, "403")) {
+			t.Fatalf("xmlrpc failregex should not care about slash count: %s", target)
+		}
+	}
+}
+
+// TestFail2banWebFilterNoLongerCountsLoginOrXmlrpc 防止未来有人把登录/XML-RPC
+// 检测重新加回 yubwpanel 的 filter，导致同一次失败登录被 yubwpanel 和 yubwpanel-login
+// 两个 jail 分别计数、触发两次独立封禁。
+func TestFail2banWebFilterNoLongerCountsLoginOrXmlrpc(t *testing.T) {
+	if strings.Contains(fail2banFilterConfig, "wp-login") || strings.Contains(fail2banFilterConfig, "xmlrpc") {
+		t.Fatalf("yubwpanel filter must not reference wp-login/xmlrpc any more, that belongs to yubwpanel-login now:\n%s", fail2banFilterConfig)
+	}
+	if strings.Contains(fail2banFilterConfig, " 200 ") {
+		t.Fatalf("yubwpanel filter must not match on HTTP 200 any more, that belongs to yubwpanel-login now:\n%s", fail2banFilterConfig)
+	}
+}
+
+func TestFail2banLoginJailIsRecognizedAsWebSource(t *testing.T) {
+	if normalizeFail2banJail("yubwpanel-login") != "yubwpanel-login" {
+		t.Fatal("normalizeFail2banJail should recognize yubwpanel-login")
+	}
+	if !isWebBanSource("yubwpanel-login") {
+		t.Fatal("isWebBanSource should treat yubwpanel-login as a web ban source")
+	}
+}
+
+func TestFail2banSQLiJailIsRecognizedAsWebSource(t *testing.T) {
+	if normalizeFail2banJail("yubwpanel-sqli") != "yubwpanel-sqli" {
+		t.Fatal("normalizeFail2banJail should recognize yubwpanel-sqli")
+	}
+	if !isWebBanSource("yubwpanel-sqli") {
+		t.Fatal("isWebBanSource should treat yubwpanel-sqli as a web ban source")
+	}
+	for _, want := range []string{"<HOST>", `"[A-Z]+ [^"]*" 403`} {
+		if !strings.Contains(fail2banSQLiFilterConfig, want) {
+			t.Fatalf("SQLi filter missing %q", want)
+		}
+	}
+}
+
+func TestValidateGeneratedFail2banJailConfigRequiresFixedLadderForAllJails(t *testing.T) {
+	block := "bantime = 600\nbantime.increment = true\nbantime.multipliers = 1 6 36 144 1008\nbantime.maxtime = 7d\nbantime.overalljails = false\n"
+	valid := "[yubwpanel]\n" + block + "[yubwpanel-404]\n" + block + "[yubwpanel-login]\n" + block + "[yubwpanel-sshd]\naction = nftables-multiport\n         yubwpanel-record[name=yubwpanel-sshd]\n" + block + "[yubwpanel-sqli]\n" + block
+	if err := validateGeneratedFail2banJailConfig(valid); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateGeneratedFail2banJailConfig("[yubwpanel]\n" + block + "[yubwpanel-404]\n" + block); err == nil {
+		t.Fatal("config missing one jail ladder was accepted")
+	}
+	misplaced := "[yubwpanel]\n" + block + "bantime.increment = true\n[yubwpanel-404]\n" + block + "[yubwpanel-login]\n" + block + "[yubwpanel-sshd]\nyubwpanel-record[name=yubwpanel-sshd]\n" + strings.Replace(block, "bantime.increment = true\n", "", 1) + "[yubwpanel-sqli]\n" + block
+	if err := validateGeneratedFail2banJailConfig(misplaced); err == nil {
+		t.Fatal("globally balanced but misplaced directive was accepted")
+	}
+	if err := validateGeneratedFail2banJailConfig(strings.Replace(valid, "         yubwpanel-record[name=yubwpanel-sshd]\n", "", 1)); err == nil {
+		t.Fatal("sshd config missing record action was accepted")
+	}
+	for banTime, want := range map[int]int{600: 2, 3600: 3, 21600: 3, 86400: 3, 604800: 4} {
+		if got := fail2banBanLevel(banTime); got != want {
+			t.Fatalf("ban level for %d = %d, want %d", banTime, got, want)
+		}
+	}
+}
+
+func TestSyncFail2banBansDoesNotSplitLongSSHBanIntoTenMinuteRows(t *testing.T) {
+	openTestDB(t)
+	oldShellExec := shellExec
+	oldReplace := syncReplaceNginxBannedIPs
+	t.Cleanup(func() {
+		shellExec = oldShellExec
+		syncReplaceNginxBannedIPs = oldReplace
+	})
+
+	ip := "203.0.113.97"
+	if _, err := database.GetDB().Exec(`INSERT INTO firewall_bans
+		(ip_address,ban_level,reason,source_jail,ban_count,expires_at)
+		VALUES (?,2,'SSH 暴力破解','yubwpanel-sshd',1,datetime('now','-10 seconds'))`, ip); err != nil {
+		t.Fatal(err)
+	}
+	shellExec = func(binary string, args ...string) (string, error) {
+		if binary != "fail2ban-client" || len(args) != 2 || args[0] != "status" {
+			return "", errors.New("unexpected command")
+		}
+		if args[1] == "yubwpanel-sshd" {
+			return "Status\n|- Currently banned: 1\n`- Banned IP list: " + ip, nil
+		}
+		return "Status\n|- Currently banned: 0\n`- Banned IP list:", nil
+	}
+	syncReplaceNginxBannedIPs = func(map[string]bool) error { return nil }
+
+	SyncFail2banBans()
+	SyncFail2banBans()
+
+	var count int
+	if err := database.GetDB().QueryRow(`SELECT COUNT(*) FROM firewall_bans
+		WHERE ip_address=? AND source_jail='yubwpanel-sshd'`, ip).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("long SSH ban was split into %d panel rows, want 1", count)
+	}
+	var active int
+	if err := database.GetDB().QueryRow(`SELECT COUNT(*) FROM firewall_bans
+		WHERE ip_address=? AND source_jail='yubwpanel-sshd' AND unbanned_at IS NULL
+		AND (expires_at IS NULL OR expires_at > datetime('now'))`, ip).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active != 1 {
+		t.Fatalf("active long SSH ban is hidden by an expired receipt: active=%d", active)
+	}
+}
+
+func TestSyncFail2banBansPreservesPanelManagedBan(t *testing.T) {
+	openTestDB(t)
+	oldShellExec := shellExec
+	oldReplace := syncReplaceNginxBannedIPs
+	oldAddPersist := syncAddPersistBan
+	oldRemovePersist := syncRemovePersistBan
+	t.Cleanup(func() {
+		shellExec = oldShellExec
+		syncReplaceNginxBannedIPs = oldReplace
+		syncAddPersistBan = oldAddPersist
+		syncRemovePersistBan = oldRemovePersist
+	})
+
+	shellExec = func(binary string, args ...string) (string, error) {
+		if binary == "fail2ban-client" && len(args) == 2 && args[0] == "status" {
+			return "Status\n|- Currently banned: 0\n`- Banned IP list:", nil
+		}
+		return "", errors.New("unexpected command")
+	}
+	syncReplaceNginxBannedIPs = func(map[string]bool) error { return nil }
+	var added, removed []string
+	syncAddPersistBan = func(ip string) error { added = append(added, ip); return nil }
+	syncRemovePersistBan = func(ip string) error { removed = append(removed, ip); return nil }
+
+	ip := "203.0.113.96"
+	if _, err := database.GetDB().Exec(`INSERT INTO firewall_bans
+		(ip_address,ban_level,reason,source_jail,ban_count,expires_at)
+		VALUES (?,4,'scan','panel_scan',1,datetime('now','+30 days'))`, ip); err != nil {
+		t.Fatal(err)
+	}
+
+	SyncFail2banBans()
+
+	var active int
+	if err := database.GetDB().QueryRow(`SELECT COUNT(*) FROM firewall_bans
+		WHERE ip_address=? AND source_jail='panel_scan' AND unbanned_at IS NULL
+		AND expires_at > datetime('now')`, ip).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active != 1 {
+		t.Fatalf("panel-managed scan ban was closed by Fail2ban reconciliation: active=%d", active)
+	}
+	if len(added) != 1 || added[0] != ip || len(removed) != 0 {
+		t.Fatalf("persistent ban reconciliation added=%v removed=%v", added, removed)
+	}
+}
+
+func TestReconcilePanelManagedBansDoesNotRemoveIPWithAnotherActiveOwner(t *testing.T) {
+	openTestDB(t)
+	oldAddPersist := syncAddPersistBan
+	oldRemovePersist := syncRemovePersistBan
+	t.Cleanup(func() {
+		syncAddPersistBan = oldAddPersist
+		syncRemovePersistBan = oldRemovePersist
+	})
+
+	ip := "203.0.113.95"
+	for _, expires := range []string{"-1 minute", "+30 days"} {
+		if _, err := database.GetDB().Exec(`INSERT INTO firewall_bans
+			(ip_address,ban_level,reason,source_jail,ban_count,expires_at)
+			VALUES (?,4,'scan','panel_scan',1,datetime('now',?))`, ip, expires); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var removed []string
+	syncAddPersistBan = func(string) error { return nil }
+	syncRemovePersistBan = func(ip string) error { removed = append(removed, ip); return nil }
+
+	reconcilePanelManagedBans(database.GetDB(), time.Now(), map[string]bool{})
+
+	if len(removed) != 0 {
+		t.Fatalf("shared persistent IP was removed while another owner remained: %v", removed)
+	}
+	var active int
+	if err := database.GetDB().QueryRow(`SELECT COUNT(*) FROM firewall_bans WHERE ip_address=?
+		AND unbanned_at IS NULL AND expires_at>datetime('now')`, ip).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active != 1 {
+		t.Fatalf("active panel-managed owner count = %d, want 1", active)
+	}
+}
+
+func TestCleanExpiredBansDoesNotRemoveIPWithAnotherActiveOwner(t *testing.T) {
+	openTestDB(t)
+	oldRemovePersist := syncRemovePersistBan
+	oldRemoveNginx := conditionalRemoveNginxBan
+	t.Cleanup(func() {
+		syncRemovePersistBan = oldRemovePersist
+		conditionalRemoveNginxBan = oldRemoveNginx
+	})
+
+	ip := "203.0.113.94"
+	for _, row := range []struct {
+		jail, expires string
+	}{
+		{"manual", "-1 minute"},
+		{"manual", "+1 day"},
+	} {
+		if _, err := database.GetDB().Exec(`INSERT INTO firewall_bans
+			(ip_address,ban_level,reason,source_jail,is_manual,ban_count,expires_at)
+			VALUES (?,3,'manual',?,1,1,datetime('now',?))`, ip, row.jail, row.expires); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var persistRemoved, nginxRemoved int
+	syncRemovePersistBan = func(string) error { persistRemoved++; return nil }
+	conditionalRemoveNginxBan = func(string) error { nginxRemoved++; return nil }
+
+	CleanExpiredBans()
+
+	if persistRemoved != 0 || nginxRemoved != 0 {
+		t.Fatalf("shared ban was removed while another owner remained: persist=%d nginx=%d", persistRemoved, nginxRemoved)
+	}
+	var active int
+	if err := database.GetDB().QueryRow(`SELECT COUNT(*) FROM firewall_bans WHERE ip_address=?
+		AND unbanned_at IS NULL AND expires_at>datetime('now')`, ip).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active != 1 {
+		t.Fatalf("active panel-managed owner count = %d, want 1", active)
+	}
+}
+
+func TestRecordFail2banRestoredDoesNotCreateHistory(t *testing.T) {
+	openTestDB(t)
+	if err := RecordFail2banBan("203.0.113.70", "yubwpanel", 600, 1, true); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := database.GetDB().QueryRow(`SELECT COUNT(*) FROM firewall_bans WHERE ip_address='203.0.113.70'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("restored ban created %d history rows", count)
+	}
+	if err := database.GetDB().QueryRow(`SELECT COUNT(*) FROM firewall_ban_history`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("restored ban created %d independent history rows", count)
+	}
+
+	ip := "203.0.113.71"
+	if err := RecordFail2banBan(ip, "yubwpanel", 3600, 2, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.GetDB().Exec(`UPDATE firewall_bans SET unbanned_at=datetime('now')
+		WHERE ip_address=? AND source_jail='yubwpanel'`, ip); err != nil {
+		t.Fatal(err)
+	}
+	if err := RecordFail2banBan(ip, "yubwpanel", 3600, 2, true); err != nil {
+		t.Fatal(err)
+	}
+	var rows, active, banCount int
+	if err := database.GetDB().QueryRow(`SELECT COUNT(*),
+		SUM(CASE WHEN unbanned_at IS NULL THEN 1 ELSE 0 END), MAX(ban_count)
+		FROM firewall_bans WHERE ip_address=? AND source_jail='yubwpanel'`, ip).Scan(&rows, &active, &banCount); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 || active != 1 || banCount != 2 {
+		t.Fatalf("restored ban was not reactivated in place: rows=%d active=%d count=%d", rows, active, banCount)
+	}
+}
+
+func TestParseFail2banTicketsWithTime(t *testing.T) {
+	location := time.FixedZone("UTC+8", 8*60*60)
+	output := "195.178.110.137 \t2026-09-02 18:40:14 + 3600 = 2026-09-02 19:40:14\n" +
+		"invalid line\n" +
+		"203.0.113.8 2026-09-02 18:50:00 + 600 = 2026-09-02 19:00:00\n"
+	tickets := parseFail2banTickets(output, location)
+	if len(tickets) != 2 {
+		t.Fatalf("tickets = %#v", tickets)
+	}
+	ticket := tickets["195.178.110.137"]
+	if ticket.duration != 3600 || ticket.bannedAt.UTC().Format(time.RFC3339) != "2026-09-02T10:40:14Z" || ticket.expiresAt.UTC().Format(time.RFC3339) != "2026-09-02T11:40:14Z" {
+		t.Fatalf("ticket = %+v", ticket)
+	}
+}
+
+func TestRestoreActiveFail2banReceiptUsesTicketTimes(t *testing.T) {
+	openTestDB(t)
+	ip := "203.0.113.81"
+	if _, err := database.GetDB().Exec(`INSERT INTO firewall_bans
+		(ip_address,ban_level,reason,source_jail,ban_count,banned_at,expires_at)
+		VALUES (?,2,'fallback','yubwpanel',1,'2026-09-02 10:40:36',NULL)`, ip); err != nil {
+		t.Fatal(err)
+	}
+	bannedAt := time.Now().UTC().Truncate(time.Second).Add(-time.Minute)
+	expiresAt := bannedAt.Add(time.Hour)
+	found, err := restoreActiveFail2banReceipt(database.GetDB(), fail2banJailIP{jail: "yubwpanel", ip: ip}, fail2banTicket{
+		bannedAt: bannedAt, expiresAt: expiresAt, duration: 3600,
+	}, true)
+	if err != nil || !found {
+		t.Fatalf("restoreActiveFail2banReceipt() = %v, %v", found, err)
+	}
+	var level int
+	var gotBannedAt, gotExpiresAt time.Time
+	if err := database.GetDB().QueryRow(`SELECT ban_level,banned_at,expires_at FROM firewall_bans WHERE ip_address=?`, ip).Scan(&level, &gotBannedAt, &gotExpiresAt); err != nil {
+		t.Fatal(err)
+	}
+	if level != 3 || !gotBannedAt.Equal(bannedAt) || !gotExpiresAt.Equal(expiresAt) {
+		t.Fatalf("receipt = level %d, banned %s, expires %s", level, gotBannedAt, gotExpiresAt)
+	}
+}
+
+func TestRecordFail2banUnbanClosesOnlyMatchingJail(t *testing.T) {
+	openTestDB(t)
+	oldRemove := conditionalRemoveNginxBan
+	removeCalls := 0
+	conditionalRemoveNginxBan = func(string) error { removeCalls++; return nil }
+	t.Cleanup(func() { conditionalRemoveNginxBan = oldRemove })
+	ip := "203.0.113.71"
+	for _, jail := range []string{"yubwpanel", "yubwpanel-404"} {
+		if _, err := database.GetDB().Exec(`INSERT INTO firewall_bans
+			(ip_address,ban_level,reason,source_jail,ban_count,expires_at)
+			VALUES (?,2,'test',?,1,datetime('now','+600 seconds'))`, ip, jail); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := RecordFail2banUnban(ip, "yubwpanel"); err != nil {
+		t.Fatal(err)
+	}
+	var active404, activeWeb int
+	_ = database.GetDB().QueryRow(`SELECT COUNT(*) FROM firewall_bans WHERE ip_address=? AND source_jail='yubwpanel-404' AND unbanned_at IS NULL`, ip).Scan(&active404)
+	_ = database.GetDB().QueryRow(`SELECT COUNT(*) FROM firewall_bans WHERE ip_address=? AND source_jail='yubwpanel' AND unbanned_at IS NULL`, ip).Scan(&activeWeb)
+	if active404 != 1 || activeWeb != 0 {
+		t.Fatalf("unexpected active rows: yubwpanel=%d yubwpanel-404=%d", activeWeb, active404)
+	}
+	if removeCalls != 0 {
+		t.Fatal("nginx ban was removed while another web jail remained active")
+	}
+	if err := RecordFail2banUnban(ip, "yubwpanel-404"); err != nil {
+		t.Fatal(err)
+	}
+	if removeCalls != 1 {
+		t.Fatalf("nginx ban should be removed after the last web jail, calls=%d", removeCalls)
+	}
+}
+
+func TestRecordFail2banUnbanDoesNotRewriteStaticHistory(t *testing.T) {
+	openTestDB(t)
+	ip := "203.0.113.74"
+	if err := RecordFail2banBan(ip, "yubwpanel-sshd", 3600, 2, false); err != nil {
+		t.Fatal(err)
+	}
+	var beforeExpires int64
+	if err := database.GetDB().QueryRow(`SELECT unixepoch(expires_at) FROM firewall_ban_history WHERE ip_address=?`, ip).Scan(&beforeExpires); err != nil {
+		t.Fatal(err)
+	}
+	if err := RecordFail2banUnban(ip, "yubwpanel-sshd"); err != nil {
+		t.Fatal(err)
+	}
+	var rows int
+	var afterExpires int64
+	if err := database.GetDB().QueryRow(`SELECT COUNT(*),MAX(unixepoch(expires_at))
+		FROM firewall_ban_history WHERE ip_address=?`, ip).Scan(&rows, &afterExpires); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 || afterExpires != beforeExpires {
+		t.Fatalf("unban rewrote static history: rows=%d before=%d after=%d", rows, beforeExpires, afterExpires)
+	}
+}
+
+func TestRecordFail2banKeepsPerJailCountersSeparate(t *testing.T) {
+	openTestDB(t)
+	ip := "203.0.113.72"
+	if err := RecordFail2banBan(ip, "yubwpanel", 3600, 2, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := RecordFail2banBan(ip, "yubwpanel-404", 600, 1, false); err != nil {
+		t.Fatal(err)
+	}
+	var rows int
+	if err := database.GetDB().QueryRow(`SELECT COUNT(*) FROM firewall_bans WHERE ip_address=? AND unbanned_at IS NULL`, ip).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 2 {
+		t.Fatalf("expected one active receipt per jail, got %d", rows)
+	}
+}
+
+func TestRecordFail2banBanUpdatesActiveRecord(t *testing.T) {
+	openTestDB(t)
+
+	ip := "203.0.113.77"
+	if err := RecordFail2banBan(ip, "yubwpanel-404", 600, 1, false); err != nil {
+		t.Fatalf("first record failed: %v", err)
+	}
+	if err := RecordFail2banBan(ip, "yubwpanel-404", 3600, 2, false); err != nil {
+		t.Fatalf("second record failed: %v", err)
+	}
+
+	var rows, level, count int
+	var jail string
+	if err := database.GetDB().QueryRow(
+		`SELECT COUNT(*), MAX(ban_level), MAX(source_jail), MAX(ban_count)
+		 FROM firewall_bans WHERE ip_address = ? AND unbanned_at IS NULL`, ip,
+	).Scan(&rows, &level, &jail, &count); err != nil {
+		t.Fatalf("query records: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("expected one active record, got %d", rows)
+	}
+	if level != 3 || jail != "yubwpanel-404" || count != 2 {
+		t.Fatalf("unexpected active record: level=%d jail=%q count=%d", level, jail, count)
+	}
+
+	if err := RecordFail2banBan(ip, "yubwpanel-404", 21600, 3, false); err != nil {
+		t.Fatalf("third record failed: %v", err)
+	}
+	if err := database.GetDB().QueryRow(
+		`SELECT COUNT(*), MAX(ban_level), MAX(source_jail), MAX(ban_count)
+		 FROM firewall_bans WHERE ip_address = ? AND unbanned_at IS NULL`, ip,
+	).Scan(&rows, &level, &jail, &count); err != nil {
+		t.Fatalf("query records after third event: %v", err)
+	}
+	if rows != 1 || level != 3 || jail != "yubwpanel-404" || count != 3 {
+		t.Fatalf("unexpected incremental active record: rows=%d level=%d jail=%q count=%d", rows, level, jail, count)
+	}
+	var historyRows, minDuration, maxDuration int
+	if err := database.GetDB().QueryRow(`SELECT COUNT(*),MIN(duration_seconds),MAX(duration_seconds)
+		FROM firewall_ban_history WHERE ip_address=? AND source_jail='yubwpanel-404'`, ip).
+		Scan(&historyRows, &minDuration, &maxDuration); err != nil {
+		t.Fatal(err)
+	}
+	if historyRows != 3 || minDuration != 600 || maxDuration != 21600 {
+		t.Fatalf("unexpected independent history: rows=%d min=%d max=%d", historyRows, minDuration, maxDuration)
+	}
+}
+
+func TestRecordFail2banBanKeepsExistingSourceWhenExistingLevelIsHigher(t *testing.T) {
+	openTestDB(t)
+
+	ip := "203.0.113.78"
+	if _, err := database.GetDB().Exec(
+		`INSERT INTO firewall_bans (ip_address, ban_level, reason, source_jail, ban_count, expires_at)
+		 VALUES (?, 5, '404 泛滥检测（高危：累计3次严重违规，永久封禁）', 'yubwpanel-404', 3, NULL)`,
+		ip,
+	); err != nil {
+		t.Fatalf("insert active ban: %v", err)
+	}
+	if err := RecordFail2banBan(ip, "yubwpanel-sshd", 600, 1, false); err != nil {
+		t.Fatalf("record sshd event: %v", err)
+	}
+
+	var rows, level, count int
+	var jail, reason string
+	if err := database.GetDB().QueryRow(
+		`SELECT COUNT(*), MAX(ban_level), MAX(source_jail), MAX(reason), MAX(ban_count)
+		 FROM firewall_bans WHERE ip_address = ? AND unbanned_at IS NULL`, ip,
+	).Scan(&rows, &level, &jail, &reason, &count); err != nil {
+		t.Fatalf("query active record: %v", err)
+	}
+	if rows != 1 || level != 5 || jail != "yubwpanel-404" || count != 3 {
+		t.Fatalf("unexpected active record: rows=%d level=%d jail=%q count=%d", rows, level, jail, count)
+	}
+	if !strings.Contains(reason, "404 泛滥检测") {
+		t.Fatalf("expected existing 404 reason to be kept, got %q", reason)
+	}
+}
+
+func TestRecordFail2banBanDoesNotReuseExpiredActiveRecord(t *testing.T) {
+	openTestDB(t)
+
+	ip := "203.0.113.79"
+	if _, err := database.GetDB().Exec(
+		`INSERT INTO firewall_bans (ip_address, ban_level, reason, source_jail, ban_count, expires_at)
+		 VALUES (?, 3, 'expired', 'yubwpanel-404', 1, datetime('now', '-60 seconds'))`,
+		ip,
+	); err != nil {
+		t.Fatalf("insert expired ban: %v", err)
+	}
+	if err := RecordFail2banBan(ip, "yubwpanel-404", 600, 1, false); err != nil {
+		t.Fatalf("record new event: %v", err)
+	}
+
+	var totalRows, activeRows int
+	if err := database.GetDB().QueryRow(
+		`SELECT COUNT(*),
+		        SUM(CASE WHEN unbanned_at IS NULL AND (expires_at IS NULL OR expires_at > datetime('now')) THEN 1 ELSE 0 END)
+		 FROM firewall_bans WHERE ip_address = ?`, ip,
+	).Scan(&totalRows, &activeRows); err != nil {
+		t.Fatalf("query rows: %v", err)
+	}
+	if totalRows != 2 || activeRows != 1 {
+		t.Fatalf("expected expired row plus one fresh active row, got total=%d active=%d", totalRows, activeRows)
+	}
+}
+
+func TestDeduplicateActiveFirewallBansKeepsMostSevereRecord(t *testing.T) {
+	openTestDB(t)
+	db := database.GetDB()
+
+	seed := []struct {
+		ip       string
+		level    int
+		count    int
+		bannedAt string
+	}{
+		{"203.0.113.10", 5, 25, "2026-07-07 18:00:00"},
+		{"203.0.113.10", 5, 30, "2026-07-07 19:00:00"},
+		{"203.0.113.10", 3, 24, "2026-07-07 20:00:00"},
+		{"203.0.113.11", 3, 1, "2026-07-07 18:00:00"},
+	}
+	for _, row := range seed {
+		if _, err := db.Exec(
+			`INSERT INTO firewall_bans (ip_address, ban_level, reason, source_jail, ban_count, banned_at, expires_at)
+			 VALUES (?, ?, 'test', 'yubwpanel-404', ?, ?, NULL)`,
+			row.ip, row.level, row.count, row.bannedAt,
+		); err != nil {
+			t.Fatalf("insert seed row: %v", err)
+		}
+	}
+
+	if err := deduplicateActiveFirewallBans(db); err != nil {
+		t.Fatalf("deduplicate active bans: %v", err)
+	}
+
+	var activeRows, level, count int
+	var bannedAt string
+	if err := db.QueryRow(
+		`SELECT COUNT(*), MAX(ban_level), MAX(ban_count), MAX(banned_at)
+		 FROM firewall_bans
+		 WHERE ip_address = '203.0.113.10' AND unbanned_at IS NULL`,
+	).Scan(&activeRows, &level, &count, &bannedAt); err != nil {
+		t.Fatalf("query active duplicate group: %v", err)
+	}
+	if activeRows != 1 || level != 5 || count != 30 || bannedAt != "2026-07-07 19:00:00" {
+		t.Fatalf("unexpected kept record: rows=%d level=%d count=%d bannedAt=%q", activeRows, level, count, bannedAt)
+	}
+
+	var unbannedRows int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM firewall_bans
+		 WHERE ip_address = '203.0.113.10' AND unbanned_at IS NOT NULL`,
+	).Scan(&unbannedRows); err != nil {
+		t.Fatalf("query unbanned duplicates: %v", err)
+	}
+	if unbannedRows != 2 {
+		t.Fatalf("expected two duplicate rows to be marked unbanned, got %d", unbannedRows)
+	}
+
+	var otherActiveRows int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM firewall_bans
+		 WHERE ip_address = '203.0.113.11' AND unbanned_at IS NULL`,
+	).Scan(&otherActiveRows); err != nil {
+		t.Fatalf("query non-duplicate active row: %v", err)
+	}
+	if otherActiveRows != 1 {
+		t.Fatalf("expected unrelated active row to remain, got %d", otherActiveRows)
+	}
+}
+
+func TestDeduplicateActiveFirewallBansKeepsDifferentJails(t *testing.T) {
+	openTestDB(t)
+	db := database.GetDB()
+	ip := "203.0.113.13"
+	for _, jail := range []string{"yubwpanel", "yubwpanel-404"} {
+		if _, err := db.Exec(`INSERT INTO firewall_bans
+			(ip_address,ban_level,reason,source_jail,ban_count,expires_at)
+			VALUES (?,2,'test',?,1,datetime('now','+600 seconds'))`, ip, jail); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := deduplicateActiveFirewallBans(db); err != nil {
+		t.Fatal(err)
+	}
+	var active int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM firewall_bans WHERE ip_address=? AND unbanned_at IS NULL`, ip).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active != 2 {
+		t.Fatalf("different jails were incorrectly merged: active=%d", active)
+	}
+}
+
+func TestUpgradeDeduplicatesActiveFirewallBans(t *testing.T) {
+	openTestDB(t)
+	db := database.GetDB()
+
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_version (
+		version TEXT NOT NULL,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	)`); err != nil {
+		t.Fatalf("create schema_version: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO schema_version (version) VALUES ('1.0.25')`); err != nil {
+		t.Fatalf("seed schema_version: %v", err)
+	}
+	for _, row := range []struct {
+		level    int
+		count    int
+		bannedAt string
+	}{
+		{5, 5, "2026-07-07 18:00:00"},
+		{5, 9, "2026-07-07 19:00:00"},
+		{3, 4, "2026-07-07 20:00:00"},
+	} {
+		if _, err := db.Exec(
+			`INSERT INTO firewall_bans (ip_address, ban_level, reason, source_jail, ban_count, banned_at, expires_at)
+			 VALUES ('203.0.113.12', ?, 'test', 'yubwpanel-404', ?, ?, NULL)`,
+			row.level, row.count, row.bannedAt,
+		); err != nil {
+			t.Fatalf("insert duplicate ban: %v", err)
+		}
+	}
+
+	if err := database.RunUpgrades(); err != nil {
+		t.Fatalf("run upgrades: %v", err)
+	}
+
+	var activeRows, count int
+	if err := db.QueryRow(
+		`SELECT COUNT(*), MAX(ban_count)
+		 FROM firewall_bans
+		 WHERE ip_address = '203.0.113.12' AND unbanned_at IS NULL`,
+	).Scan(&activeRows, &count); err != nil {
+		t.Fatalf("query active bans: %v", err)
+	}
+	if activeRows != 1 || count != 9 {
+		t.Fatalf("expected upgrade to keep one active ban with max count, got rows=%d count=%d", activeRows, count)
+	}
+
+	var version string
+	if err := db.QueryRow(`SELECT version FROM schema_version ORDER BY updated_at DESC, rowid DESC LIMIT 1`).Scan(&version); err != nil {
+		t.Fatalf("query schema version: %v", err)
+	}
+	if version != database.LatestVersion() {
+		t.Fatalf("schema_version = %q, want %q", version, database.LatestVersion())
+	}
+}
+
+func TestExecuteManualBanCreatesSingleManualRecord(t *testing.T) {
+	openTestDB(t)
+
+	oldAddNginxBan := manualAddNginxBan
+	oldRemoveNginxBan := manualRemoveNginxBan
+	oldShellExec := shellExec
+	t.Cleanup(func() {
+		manualAddNginxBan = oldAddNginxBan
+		manualRemoveNginxBan = oldRemoveNginxBan
+		shellExec = oldShellExec
+	})
+
+	var nginxBanned []string
+	manualAddNginxBan = func(ip string) error {
+		nginxBanned = append(nginxBanned, ip)
+		return nil
+	}
+	manualRemoveNginxBan = func(string) error { return nil }
+	shellExec = func(binary string, args ...string) (string, error) {
+		if binary == "fail2ban-client" && strings.Join(args, " ") == "set yubwpanel banip 203.0.113.88" {
+			t.Fatalf("manual ban must not call fail2ban banip")
+		}
+		return "", errors.New("unexpected command")
+	}
+
+	result := executeManualBan(&Task{Payload: &ManualBanPayload{IP: "203.0.113.88", Duration: 86400}})
+	if !result.Success {
+		t.Fatalf("manual ban failed: %s", result.Message)
+	}
+	if len(nginxBanned) != 1 || nginxBanned[0] != "203.0.113.88" {
+		t.Fatalf("expected one nginx ban, got %v", nginxBanned)
+	}
+
+	var count, level, isManual, banCount int
+	var reason, jail string
+	if err := database.GetDB().QueryRow(
+		`SELECT COUNT(*), MAX(ban_level), MAX(is_manual), MAX(ban_count), MAX(reason), MAX(source_jail)
+		 FROM firewall_bans WHERE ip_address = ?`,
+		"203.0.113.88",
+	).Scan(&count, &level, &isManual, &banCount, &reason, &jail); err != nil {
+		t.Fatalf("query manual ban: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected one ban record, got %d", count)
+	}
+	if level != 3 || isManual != 1 || banCount != 1 || reason != "管理员手动封禁" || jail != "manual" {
+		t.Fatalf("unexpected manual ban record: level=%d manual=%d count=%d reason=%q jail=%q", level, isManual, banCount, reason, jail)
+	}
+	var historyCount, duration int
+	if err := database.GetDB().QueryRow(`SELECT COUNT(*),MAX(duration_seconds)
+		FROM firewall_ban_history WHERE ip_address=?`, "203.0.113.88").Scan(&historyCount, &duration); err != nil {
+		t.Fatal(err)
+	}
+	if historyCount != 1 || duration != 86400 {
+		t.Fatalf("unexpected manual history: count=%d duration=%d", historyCount, duration)
+	}
+}
+
+func TestSyncFail2banBansKeepsActiveManualBan(t *testing.T) {
+	openTestDB(t)
+
+	oldShellExec := shellExec
+	oldReplace := syncReplaceNginxBannedIPs
+	t.Cleanup(func() {
+		shellExec = oldShellExec
+		syncReplaceNginxBannedIPs = oldReplace
+	})
+
+	shellExec = func(binary string, args ...string) (string, error) {
+		if binary == "fail2ban-client" && len(args) == 2 && args[0] == "status" {
+			return "Status\n|- Currently banned: 0\n`- Banned IP list:", nil
+		}
+		return "", errors.New("unexpected command")
+	}
+
+	var synced map[string]bool
+	syncReplaceNginxBannedIPs = func(ips map[string]bool) error {
+		synced = map[string]bool{}
+		for ip, banned := range ips {
+			synced[ip] = banned
+		}
+		return nil
+	}
+
+	if _, err := database.GetDB().Exec(
+		`INSERT INTO firewall_bans (ip_address, ban_level, reason, source_jail, is_manual, ban_count, expires_at)
+		 VALUES ('203.0.113.99', 2, '管理员手动封禁', 'manual', 1, 1, datetime('now', '+600 seconds'))`,
+	); err != nil {
+		t.Fatalf("insert manual ban: %v", err)
+	}
+
+	SyncFail2banBans()
+
+	var unbannedAt *string
+	if err := database.GetDB().QueryRow(`SELECT unbanned_at FROM firewall_bans WHERE ip_address = '203.0.113.99'`).Scan(&unbannedAt); err != nil {
+		t.Fatalf("query manual ban: %v", err)
+	}
+	if unbannedAt != nil {
+		t.Fatalf("active manual ban was marked unbanned: %v", *unbannedAt)
+	}
+	if !synced["203.0.113.99"] {
+		t.Fatalf("active manual ban was not synced to nginx set: %v", synced)
+	}
+}
+
+func TestSyncFail2banBansPreservesFailedJailState(t *testing.T) {
+	openTestDB(t)
+	oldShellExec := shellExec
+	oldReplace := syncReplaceNginxBannedIPs
+	t.Cleanup(func() {
+		shellExec = oldShellExec
+		syncReplaceNginxBannedIPs = oldReplace
+	})
+
+	shellExec = func(binary string, args ...string) (string, error) {
+		if binary != "fail2ban-client" || len(args) != 2 || args[0] != "status" {
+			return "", errors.New("unexpected command")
+		}
+		if args[1] == "yubwpanel" {
+			return "", errors.New("temporary socket failure")
+		}
+		return "Status\n|- Currently banned: 0\n`- Banned IP list:", nil
+	}
+	var synced map[string]bool
+	syncReplaceNginxBannedIPs = func(ips map[string]bool) error {
+		synced = make(map[string]bool, len(ips))
+		for ip, active := range ips {
+			synced[ip] = active
+		}
+		return nil
+	}
+	ip := "203.0.113.98"
+	if _, err := database.GetDB().Exec(`INSERT INTO firewall_bans
+		(ip_address,ban_level,reason,source_jail,ban_count,expires_at)
+		VALUES (?,2,'test','yubwpanel',1,datetime('now','+600 seconds'))`, ip); err != nil {
+		t.Fatal(err)
+	}
+
+	SyncFail2banBans()
+
+	var active int
+	_ = database.GetDB().QueryRow(`SELECT COUNT(*) FROM firewall_bans WHERE ip_address=? AND unbanned_at IS NULL`, ip).Scan(&active)
+	if active != 1 || !synced[ip] {
+		t.Fatalf("failed jail state was not preserved: active=%d nginx=%v", active, synced)
+	}
+}
+
+func TestRestoreCDNRealIPGroupWithBindings(t *testing.T) {
+	openTestDB(t)
+	db := database.GetDB()
+
+	for _, site := range []struct {
+		id     int
+		domain string
+	}{
+		{101, "one.example.com"},
+		{102, "two.example.com"},
+	} {
+		if _, err := db.Exec(`INSERT INTO websites
+			(id, name, domain, system_user, web_root, log_dir, db_name, db_user, php_pool_path, nginx_conf_path)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			site.id, site.domain, site.domain, "wpuser", "/www/wwwroot/"+site.domain, "/www/wwwlogs/"+site.domain,
+			"db_"+site.domain, "dbu_"+site.domain, "/etc/php/"+site.domain+".conf", "/etc/nginx/sites-available/"+site.domain+".conf"); err != nil {
+			t.Fatalf("insert website %s: %v", site.domain, err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO cdn_realip_groups
+		(id, name, provider, header_name, ip_ranges, builtin, enabled, description)
+		VALUES (99, 'EdgeOne', 'custom', 'X-Forwarded-For', '203.0.113.0/24', 0, 1, 'test group')`); err != nil {
+		t.Fatalf("insert cdn group: %v", err)
+	}
+	for _, siteID := range []int{101, 102} {
+		if _, err := db.Exec(`INSERT INTO website_cdn_realip_groups (website_id, group_id) VALUES (?, 99)`, siteID); err != nil {
+			t.Fatalf("insert binding: %v", err)
+		}
+	}
+
+	group, err := GetCDNRealIPGroup(99)
+	if err != nil {
+		t.Fatalf("get cdn group: %v", err)
+	}
+	bindings, err := WebsiteIDsForCDNRealIPGroup(99)
+	if err != nil {
+		t.Fatalf("get bindings: %v", err)
+	}
+	if _, err := db.Exec(`DELETE FROM cdn_realip_groups WHERE id = 99`); err != nil {
+		t.Fatalf("delete cdn group: %v", err)
+	}
+
+	if err := RestoreCDNRealIPGroupWithBindings(group, bindings); err != nil {
+		t.Fatalf("restore cdn group: %v", err)
+	}
+	restoredBindings, err := WebsiteIDsForCDNRealIPGroup(99)
+	if err != nil {
+		t.Fatalf("get restored bindings: %v", err)
+	}
+	if len(restoredBindings) != 2 || restoredBindings[0] != 101 || restoredBindings[1] != 102 {
+		t.Fatalf("unexpected restored bindings: %v", restoredBindings)
+	}
+}
+
+func TestReloadOrStartFail2banReturnsStartError(t *testing.T) {
+	reloadErr := errors.New("reload failed")
+	startErr := errors.New("start failed")
+
+	oldShellExec := shellExec
+	t.Cleanup(func() { shellExec = oldShellExec })
+	shellExec = func(binary string, args ...string) (string, error) {
+		command := binary + " " + strings.Join(args, " ")
+		switch command {
+		case "fail2ban-client reload":
+			return "", reloadErr
+		case "systemctl is-active --quiet fail2ban":
+			return "", errors.New("inactive")
+		case "systemctl start fail2ban":
+			return "", startErr
+		default:
+			t.Fatalf("unexpected command: %s", command)
+			return "", nil
+		}
+	}
+
+	if err := reloadOrStartFail2ban(); !errors.Is(err, startErr) {
+		t.Fatalf("expected start error, got %v", err)
+	}
+}
+
+func TestFail2banRestartReloadCommandIsAllowed(t *testing.T) {
+	if !IsCommandAllowed("fail2ban-client", []string{"reload", "--restart", "yubwpanel-sshd"}) {
+		t.Fatal("Fail2ban restart reload must be allowed so newly added jail actions take effect")
+	}
+	if IsCommandAllowed("fail2ban-client", []string{"reload", "--restart", "--all"}) {
+		t.Fatal("global --all restart must remain disallowed because it clears active bans")
+	}
+	if IsCommandAllowed("fail2ban-client", []string{"stop", "--restart", "yubwpanel-sshd"}) ||
+		IsCommandAllowed("fail2ban-client", []string{"reload", "--restart", "yubwpanel"}) {
+		t.Fatal("--restart must be restricted to the fixed yubwpanel-sshd reload command")
+	}
+}
+
+func TestFail2banBanIPWithTimeIsAllowed(t *testing.T) {
+	if !IsCommandAllowed("fail2ban-client", []string{"get", "yubwpanel", "banip", "--with-time"}) {
+		t.Fatal("Fail2ban per-IP ticket time query must be allowed")
+	}
+	if IsCommandAllowed("fail2ban-client", []string{"get", "yubwpanel", "banip", "--with-time=unsafe"}) {
+		t.Fatal("unexpected --with-time variant was allowed")
+	}
+}
+
+func TestEnsureFail2banSSHRecordActionRestartsOnlyWhenMissing(t *testing.T) {
+	oldShellExec := shellExec
+	t.Cleanup(func() {
+		shellExec = oldShellExec
+		sshRecordActionPending.Store(false)
+	})
+
+	var commands []string
+	shellExec = func(binary string, args ...string) (string, error) {
+		command := binary + " " + strings.Join(args, " ")
+		commands = append(commands, command)
+		if command == "fail2ban-client get yubwpanel-sshd actions" {
+			return "nftables-multiport", nil
+		}
+		if command == "fail2ban-client status yubwpanel-sshd" {
+			return "Status\n|- Currently banned: 0\n`- Banned IP list:", nil
+		}
+		if command == "fail2ban-client reload --restart yubwpanel-sshd" {
+			return "OK", nil
+		}
+		return "", errors.New("unexpected command")
+	}
+	if err := ensureFail2banSSHRecordAction(); err != nil {
+		t.Fatal(err)
+	}
+	if len(commands) != 3 || commands[2] != "fail2ban-client reload --restart yubwpanel-sshd" {
+		t.Fatalf("unexpected commands: %v", commands)
+	}
+
+	commands = nil
+	shellExec = func(binary string, args ...string) (string, error) {
+		commands = append(commands, binary+" "+strings.Join(args, " "))
+		return "nftables-multiport, yubwpanel-record", nil
+	}
+	if err := ensureFail2banSSHRecordAction(); err != nil {
+		t.Fatal(err)
+	}
+	if len(commands) != 1 {
+		t.Fatalf("existing record action caused restart: %v", commands)
+	}
+
+	commands = nil
+	shellExec = func(binary string, args ...string) (string, error) {
+		command := binary + " " + strings.Join(args, " ")
+		commands = append(commands, command)
+		if command == "fail2ban-client get yubwpanel-sshd actions" {
+			return "nftables-multiport", nil
+		}
+		if command == "fail2ban-client status yubwpanel-sshd" {
+			return "Status\n|- Currently banned: 1\n`- Banned IP list: 203.0.113.9", nil
+		}
+		return "", errors.New("unexpected command")
+	}
+	if err := ensureFail2banSSHRecordAction(); err != nil {
+		t.Fatal(err)
+	}
+	if len(commands) != 2 {
+		t.Fatalf("active SSH bans must defer jail restart: %v", commands)
+	}
+	if !sshRecordActionPending.Load() {
+		t.Fatal("deferred SSH action restart was not scheduled for retry")
+	}
+}
+
+func TestNginxTemplateErrorOnlyAccessLog(t *testing.T) {
+	engine := NewTemplateEngine(t.TempDir())
+	config, err := engine.RenderNginxConfig(&NginxSiteData{
+		Domain:        "example.com",
+		ServerNames:   "example.com",
+		WebRoot:       "/www/wwwroot/example.com",
+		PHPProxy:      "unix:/run/php/example.sock",
+		TemplateVer:   "v1.0",
+		AccessLogMode: "error_only",
+	})
+	if err != nil {
+		t.Fatalf("render nginx config: %v", err)
+	}
+	if !strings.Contains(config, `access_log /www/wwwlogs/example.com/access.log yubwpanel_combined if=$wp_loggable;`) {
+		t.Fatalf("expected error-only access log in config:\n%s", config)
+	}
+	if strings.Contains(config, "access_log off;") {
+		t.Fatalf("did not expect access_log off in error-only config:\n%s", config)
+	}
+}
+
+func TestNginxTemplateIncludesFastCGIHeaderBuffers(t *testing.T) {
+	engine := NewTemplateEngine(t.TempDir())
+	config, err := engine.RenderNginxConfig(&NginxSiteData{
+		Domain:        "example.com",
+		ServerNames:   "example.com",
+		WebRoot:       "/www/wwwroot/example.com",
+		PHPProxy:      "unix:/run/php/example.sock",
+		TemplateVer:   "v1.0",
+		AccessLogMode: "full",
+	})
+	if err != nil {
+		t.Fatalf("render nginx config: %v", err)
+	}
+
+	for _, directive := range []string{
+		"fastcgi_buffer_size 128k;",
+		"fastcgi_buffers 8 128k;",
+		"fastcgi_busy_buffers_size 256k;",
+	} {
+		if !strings.Contains(config, directive) {
+			t.Fatalf("expected %q in config:\n%s", directive, config)
+		}
+	}
+}
+
+func TestWordPressTemplateIncludesSecurityLogAndTryFiles(t *testing.T) {
+	engine := NewTemplateEngine(t.TempDir())
+	config, err := engine.RenderNginxConfig(&NginxSiteData{
+		Domain:        "example.com",
+		ServerNames:   "example.com",
+		WebRoot:       "/www/wwwroot/example.com",
+		PHPProxy:      "unix:/run/php/example.sock",
+		TemplateVer:   "v1.0",
+		AccessLogMode: "error_only",
+		SiteType:      "wordpress",
+	})
+	if err != nil {
+		t.Fatalf("render nginx config: %v", err)
+	}
+	if !strings.Contains(config, `access_log /www/wwwlogs/example.com/wp-security.log yubwpanel_combined if=$wp_security_loggable;`) {
+		t.Fatalf("expected WordPress security log in config:\n%s", config)
+	}
+	if !strings.Contains(config, "try_files $uri =404;") {
+		t.Fatalf("expected php location to reject missing php files before FastCGI:\n%s", config)
+	}
+	if !strings.Contains(config, "location ~* /dup-installer/") {
+		t.Fatalf("expected explicit dup-installer block before WordPress fallback:\n%s", config)
+	}
+}
+
+func TestWordPressTemplateKeepsSecurityLogWhenAccessLogIsOff(t *testing.T) {
+	engine := NewTemplateEngine(t.TempDir())
+	config, err := engine.RenderNginxConfig(&NginxSiteData{
+		Domain:        "example.com",
+		ServerNames:   "example.com",
+		WebRoot:       "/www/wwwroot/example.com",
+		PHPProxy:      "unix:/run/php/example.sock",
+		TemplateVer:   "v1.0",
+		AccessLogMode: "off",
+		SiteType:      "wordpress",
+	})
+	if err != nil {
+		t.Fatalf("render nginx config: %v", err)
+	}
+	if strings.Contains(config, "access_log off;") {
+		t.Fatalf("wordpress config must not disable security logs with access_log off:\n%s", config)
+	}
+	if !strings.Contains(config, `access_log /www/wwwlogs/example.com/access.log yubwpanel_combined if=$wp_access_log_disabled;`) {
+		t.Fatalf("expected ordinary access log to be disabled by condition:\n%s", config)
+	}
+	if !strings.Contains(config, `access_log /www/wwwlogs/example.com/wp-security.log yubwpanel_combined if=$wp_security_loggable;`) {
+		t.Fatalf("expected WordPress security log to remain enabled:\n%s", config)
+	}
+}
+
+func TestPHPTemplateDoesNotIncludeWordPressSecurityLog(t *testing.T) {
+	engine := NewTemplateEngine(t.TempDir())
+	config, err := engine.RenderNginxConfig(&NginxSiteData{
+		Domain:        "example.com",
+		ServerNames:   "example.com",
+		WebRoot:       "/www/wwwroot/example.com",
+		PHPProxy:      "unix:/run/php/example.sock",
+		TemplateVer:   "v1.0",
+		AccessLogMode: "error_only",
+		SiteType:      "php",
+	})
+	if err != nil {
+		t.Fatalf("render nginx config: %v", err)
+	}
+	if strings.Contains(config, "wp-security.log") {
+		t.Fatalf("did not expect WordPress security log in generic PHP config:\n%s", config)
+	}
+}
+
+func TestNginxTemplateUsesGlobalLimitStatusAndBotDefaultOff(t *testing.T) {
+	openTestDB(t)
+	engine := NewTemplateEngine(t.TempDir())
+	config, err := engine.RenderNginxConfig(&NginxSiteData{
+		Domain:        "example.com",
+		ServerNames:   "example.com",
+		WebRoot:       "/www/wwwroot/example.com",
+		PHPProxy:      "unix:/run/php/example.sock",
+		TemplateVer:   "v1.0",
+		AccessLogMode: "error_only",
+		SiteType:      "wordpress",
+	})
+	if err != nil {
+		t.Fatalf("render nginx config: %v", err)
+	}
+	if !strings.Contains(config, "limit_req zone=wp_req_limit burst=300 nodelay;") {
+		t.Fatalf("expected existing IP rate limit in config:\n%s", config)
+	}
+	if strings.Contains(config, "limit_req zone=wp_bot_limit") {
+		t.Fatalf("bot limit should be disabled by default:\n%s", config)
+	}
+	if strings.Contains(config, "limit_req_status 429") {
+		t.Fatalf("limit_req_status must be managed globally, not per site:\n%s", config)
+	}
+}
+
+func TestNginxTemplateIncludesBotLimit(t *testing.T) {
+	openTestDB(t)
+	if _, err := database.GetDB().Exec(`UPDATE security_settings SET svalue = 'true' WHERE skey = 'bot_limit_enabled'`); err != nil {
+		t.Fatalf("enable bot limit: %v", err)
+	}
+	if _, err := database.GetDB().Exec(`UPDATE security_settings SET svalue = '25' WHERE skey = 'bot_limit_burst'`); err != nil {
+		t.Fatalf("set bot burst: %v", err)
+	}
+
+	engine := NewTemplateEngine(t.TempDir())
+	config, err := engine.RenderNginxConfig(&NginxSiteData{
+		Domain:           "example.com",
+		ServerNames:      "example.com",
+		WebRoot:          "/www/wwwroot/example.com",
+		PHPProxy:         "unix:/run/php/example.sock",
+		TemplateVer:      "v1.0",
+		AccessLogMode:    "error_only",
+		SiteType:         "wordpress",
+		CDNRealIPEnabled: true,
+		CDNRealIPHeader:  "X-Forwarded-For",
+		CDNRealIPCompat:  true,
+	})
+	if err != nil {
+		t.Fatalf("render nginx config: %v", err)
+	}
+	if !strings.Contains(config, "limit_req zone=wp_bot_limit burst=25 nodelay;") {
+		t.Fatalf("expected bot limit in config:\n%s", config)
+	}
+	if strings.Contains(config, "limit_req_status 429") {
+		t.Fatalf("limit_req_status must be managed globally, not per site:\n%s", config)
+	}
+}
+
+func TestRenderVerifiedSearchBotGeoEntries(t *testing.T) {
+	openTestDB(t)
+	if _, err := database.GetDB().Exec(`UPDATE security_settings SET svalue = ? WHERE skey = 'googlebot_ips'`, "66.249.64.0/19\n2001:4860:4801::/48\nbad"); err != nil {
+		t.Fatalf("set googlebot ips: %v", err)
+	}
+	if _, err := database.GetDB().Exec(`UPDATE security_settings SET svalue = ? WHERE skey = 'bingbot_ips'`, "40.77.167.0/24\n66.249.64.0/19"); err != nil {
+		t.Fatalf("set bingbot ips: %v", err)
+	}
+	entries := renderVerifiedSearchBotGeoEntries()
+	for _, want := range []string{
+		"66.249.64.0/19 1;",
+		"2001:4860:4801::/48 1;",
+		"40.77.167.0/24 1;",
+	} {
+		if !strings.Contains(entries, want) {
+			t.Fatalf("missing %q in geo entries:\n%s", want, entries)
+		}
+	}
+	if strings.Contains(entries, "bad") {
+		t.Fatalf("invalid ranges must not be rendered:\n%s", entries)
+	}
+	if strings.Count(entries, "66.249.64.0/19 1;") != 1 {
+		t.Fatalf("duplicate ranges must be collapsed:\n%s", entries)
+	}
+}
+
+func TestWriteBotRateLimitConfigUsesVerifiedSearchBotExemption(t *testing.T) {
+	openTestDB(t)
+	config := renderBotRateLimitConfig(30)
+	for _, want := range []string{
+		`map "$wp_bot_ua:$wp_search_bot_ua:$wp_verified_search_bot_ip" $wp_bot_rate_key`,
+		`"1:1:1" "";`,
+	} {
+		if !strings.Contains(config, want) {
+			t.Fatalf("missing %q in bot config:\n%s", want, config)
+		}
+	}
+	if strings.Contains(config, "wp_cdn_realip_compat") {
+		t.Fatalf("verified search bot exemption must not depend on CDN compat mode:\n%s", config)
+	}
+}
+
+func TestRewriteRateLimitDirectivesCombinations(t *testing.T) {
+	base := `server {
+    # server_name ignored.example.com;
+    listen 80;
+    server_name example.com;
+    limit_req zone=wp_req_limit burst=10 nodelay;
+    limit_req zone=wp_bot_limit burst=5 nodelay;
+    limit_req_status 429;
+}`
+	ipLine := "    limit_req zone=wp_req_limit burst=300 nodelay;"
+	botLine := "    limit_req zone=wp_bot_limit burst=20 nodelay;"
+
+	tests := []struct {
+		name      string
+		ip        bool
+		bot       bool
+		wantIP    bool
+		wantBot   bool
+		wantCount int
+	}{
+		{"both on", true, true, true, true, 2},
+		{"ip only", true, false, true, false, 1},
+		{"bot only", false, true, false, true, 1},
+		{"both off", false, false, false, false, 0},
+	}
+	for _, tt := range tests {
+		got := rewriteRateLimitDirectives(base, ipLine, botLine, tt.ip, tt.bot)
+		if strings.Contains(got, "limit_req_status 429") {
+			t.Fatalf("%s: per-site status should be removed:\n%s", tt.name, got)
+		}
+		if strings.Contains(got, "# server_name ignored.example.com;\n    limit_req") {
+			t.Fatalf("%s: must not inject after commented server_name:\n%s", tt.name, got)
+		}
+		if strings.Contains(got, "zone=wp_req_limit") != tt.wantIP {
+			t.Fatalf("%s: IP limit presence mismatch:\n%s", tt.name, got)
+		}
+		if strings.Contains(got, "zone=wp_bot_limit") != tt.wantBot {
+			t.Fatalf("%s: bot limit presence mismatch:\n%s", tt.name, got)
+		}
+		if count := strings.Count(got, "limit_req zone="); count != tt.wantCount {
+			t.Fatalf("%s: limit count = %d, want %d:\n%s", tt.name, count, tt.wantCount, got)
+		}
+	}
+}
+
+func TestNormalizeWPSecurityLogWhitelist(t *testing.T) {
+	patterns, err := NormalizeWPSecurityLogWhitelist("/google*.html\n/BingSiteAuth.xml\n/google*.html")
+	if err != nil {
+		t.Fatalf("normalize whitelist: %v", err)
+	}
+	if got := strings.Join(patterns, ","); got != "/google*.html,/BingSiteAuth.xml" {
+		t.Fatalf("unexpected normalized whitelist: %s", got)
+	}
+	if _, err := NormalizeWPSecurityLogWhitelist("relative.txt"); err == nil {
+		t.Fatal("expected relative path to be rejected")
+	}
+	if _, err := NormalizeWPSecurityLogWhitelist("/bad;path"); err == nil {
+		t.Fatal("expected dangerous characters to be rejected")
+	}
+	for _, pattern := range []string{"/foo(.*)", "/foo[bar]", "/foo^bar", "/foo~bar"} {
+		if _, err := NormalizeWPSecurityLogWhitelist(pattern); err == nil {
+			t.Fatalf("expected %q to be rejected", pattern)
+		}
+	}
+}
+
+func TestBuildWPSecurityLogWhitelistMapEntriesEscapesWildcard(t *testing.T) {
+	openTestDB(t)
+	if _, err := database.GetDB().Exec(`UPDATE security_settings SET svalue = ? WHERE skey = 'wp_security_log_whitelist'`, "/verify-*.txt"); err != nil {
+		t.Fatalf("save whitelist: %v", err)
+	}
+	entries := buildWPSecurityLogWhitelistMapEntries()
+	if !strings.Contains(entries, `~^/verify-[^/]*\.txt$ 0;`) {
+		t.Fatalf("expected escaped wildcard map entry, got:\n%s", entries)
+	}
+}
+
+func TestWPSecurityReportCacheReturnsClone(t *testing.T) {
+	wpSecurityReportCacheMu.Lock()
+	wpSecurityReportCache = map[int]wpSecurityReportCacheEntry{}
+	wpSecurityReportCacheMu.Unlock()
+
+	items := []WPSecurityReportItem{{
+		IPAddress:   "203.0.113.10",
+		SamplePaths: []string{"GET /test.php x 1"},
+		Evidence:    []string{"Primary script unknown"},
+	}}
+	setWPSecurityReportCache(30, items)
+
+	got, ok := getWPSecurityReportCache(30)
+	if !ok {
+		t.Fatal("expected cache hit")
+	}
+	got[0].SamplePaths[0] = "mutated"
+	got[0].Evidence[0] = "mutated"
+
+	gotAgain, ok := getWPSecurityReportCache(30)
+	if !ok {
+		t.Fatal("expected second cache hit")
+	}
+	if gotAgain[0].SamplePaths[0] == "mutated" || gotAgain[0].Evidence[0] == "mutated" {
+		t.Fatalf("cache returned mutable internals: %+v", gotAgain[0])
+	}
+}
+
+func TestNginxTemplateIncludesCDNRealIPTrustedRanges(t *testing.T) {
+	engine := NewTemplateEngine(t.TempDir())
+	config, err := engine.RenderNginxConfig(&NginxSiteData{
+		Domain:           "example.com",
+		ServerNames:      "example.com",
+		WebRoot:          "/www/wwwroot/example.com",
+		PHPProxy:         "unix:/run/php/example.sock",
+		TemplateVer:      "v1.0",
+		AccessLogMode:    "error_only",
+		SiteType:         "wordpress",
+		CDNRealIPEnabled: true,
+		CDNRealIPHeader:  "X-Forwarded-For",
+		CDNRealIPRanges:  []string{"203.0.113.0/24", "2001:db8::/32"},
+		CDNRealIPCompat:  false,
+	})
+	if err != nil {
+		t.Fatalf("render nginx config: %v", err)
+	}
+	for _, want := range []string{
+		"set_real_ip_from 203.0.113.0/24;",
+		"set_real_ip_from 2001:db8::/32;",
+		"real_ip_header X-Forwarded-For;",
+		"real_ip_recursive on;",
+	} {
+		if !strings.Contains(config, want) {
+			t.Fatalf("missing %q in config:\n%s", want, config)
+		}
+	}
+}
+
+func TestNginxTemplateIncludesCDNRealIPCompatibleMode(t *testing.T) {
+	engine := NewTemplateEngine(t.TempDir())
+	config, err := engine.RenderNginxConfig(&NginxSiteData{
+		Domain:           "example.com",
+		ServerNames:      "example.com",
+		WebRoot:          "/www/wwwroot/example.com",
+		PHPProxy:         "unix:/run/php/example.sock",
+		TemplateVer:      "v1.0",
+		AccessLogMode:    "error_only",
+		SiteType:         "php",
+		CDNRealIPEnabled: true,
+		CDNRealIPHeader:  "X-Real-IP",
+		CDNRealIPCompat:  true,
+	})
+	if err != nil {
+		t.Fatalf("render nginx config: %v", err)
+	}
+	for _, want := range []string{
+		"set_real_ip_from 0.0.0.0/0;",
+		"set_real_ip_from ::/0;",
+		"real_ip_header X-Real-IP;",
+	} {
+		if !strings.Contains(config, want) {
+			t.Fatalf("missing %q in config:\n%s", want, config)
+		}
+	}
+}
+
+func TestSQLiProtectionRenderScopeAndTrustedClientGate(t *testing.T) {
+	openTestDB(t)
+	engine := NewTemplateEngine(t.TempDir())
+	render := func(siteType string, compat bool) string {
+		t.Helper()
+		config, err := engine.RenderNginxConfig(&NginxSiteData{
+			Domain:           "example.com",
+			ServerNames:      "example.com",
+			WebRoot:          "/www/wwwroot/example.com",
+			PHPProxy:         "unix:/run/php/example.sock",
+			TemplateVer:      "v1.0",
+			AccessLogMode:    "error_only",
+			SiteType:         siteType,
+			CDNRealIPEnabled: compat,
+			CDNRealIPHeader:  "X-Forwarded-For",
+			CDNRealIPCompat:  compat,
+		})
+		if err != nil {
+			t.Fatalf("render nginx config: %v", err)
+		}
+		return config
+	}
+
+	direct := render("wordpress", false)
+	if !strings.Contains(direct, "if ($wp_sqli_block_hit) { return 403; }") || !strings.Contains(direct, "wp-sqli-security.log") {
+		t.Fatal("direct WordPress traffic must be blocked and eligible for automatic banning")
+	}
+	compatibleProxy := render("wordpress", true)
+	if !strings.Contains(compatibleProxy, "if ($wp_sqli_block_hit) { return 403; }") || strings.Contains(compatibleProxy, "wp-sqli-security.log") {
+		t.Fatal("compatible real-IP mode must block but must not feed automatic banning")
+	}
+	php := render("php", false)
+	if strings.Contains(php, "$wp_sqli_block_hit") || strings.Contains(php, "wp-sqli-security.log") {
+		t.Fatal("generic PHP templates must not enable WordPress SQL injection protection")
+	}
+
+	if _, err := database.GetDB().Exec(`UPDATE security_settings SET svalue='false' WHERE skey='wp_sqli_block_enabled'`); err != nil {
+		t.Fatal(err)
+	}
+	disabled := render("wordpress", false)
+	if strings.Contains(disabled, "if ($wp_sqli_block_hit) { return 403; }") || strings.Contains(disabled, "wp-sqli-security.log") {
+		t.Fatal("disabled SQL injection protection must neither block nor feed automatic banning")
+	}
+}
+
+func TestResolveCDNRealIPRuntimeRejectsCompatibleMixedWithStrictGroup(t *testing.T) {
+	site := &models.Website{CDNRealIPEnabled: true, CDNRealIPGroups: []models.CDNRealIPGroup{
+		{ID: 1, Name: "Compatible", Provider: CDNProviderCompatible, HeaderName: CDNHeaderXForwardedFor, Enabled: true},
+		{ID: 2, Name: "ESA", Provider: CDNProviderCustom, HeaderName: CDNHeaderXForwardedFor, IPRanges: "203.0.113.0/24", Enabled: true},
+	}}
+	if _, err := ResolveCDNRealIPRuntime(site); err == nil || !strings.Contains(err.Error(), "不能与其他") {
+		t.Fatalf("ResolveCDNRealIPRuntime error = %v", err)
+	}
+}
+
+func TestNormalizeCDNRealIPHeaderAndRanges(t *testing.T) {
+	if _, err := NormalizeCDNRealIPHeader("X_Real_IP"); err == nil {
+		t.Fatal("expected underscore header to be rejected")
+	}
+	if got, err := NormalizeCDNRealIPHeader("X-Real-IP"); err != nil || got != "X-Real-IP" {
+		t.Fatalf("NormalizeCDNRealIPHeader = %q, %v", got, err)
+	}
+	ranges, err := NormalizeCDNRealIPRanges("203.0.113.0/24\n203.0.113.5\n203.0.113.5")
+	if err != nil {
+		t.Fatalf("NormalizeCDNRealIPRanges: %v", err)
+	}
+	if got := strings.Join(ranges, ","); got != "203.0.113.0/24,203.0.113.5" {
+		t.Fatalf("unexpected ranges: %s", got)
+	}
+}
+
+func openTestDB(t *testing.T) {
+	t.Helper()
+
+	if database.DB != nil {
+		_ = database.Close()
+		database.DB = nil
+	}
+	dbPath := filepath.Join(t.TempDir(), "yub-wpanel-test.db")
+	if err := database.Open(dbPath); err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = database.Close()
+		database.DB = nil
+	})
+	if err := database.RunMigrations(); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
+}

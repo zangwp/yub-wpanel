@@ -1,0 +1,1296 @@
+{{define "wp_inventory_panel"}}
+<section x-data="wpInventoryPanel()" x-init="mount()" x-effect="setSite(site)" x-show="site && site.site_type === 'wordpress'" class="mt-6">
+    <div class="card">
+        <div class="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+                <div class="flex flex-wrap items-center gap-3">
+                    <h3 class="text-lg font-semibold text-white">{{t .Lang "wp_inventory.title"}}</h3>
+                    <span x-show="summary" :class="statusClass()" class="text-xs px-2 py-1 rounded-full" x-text="t(statusKey())"></span>
+                </div>
+                <p class="mt-1 text-sm text-gray-400">{{t .Lang "wp_inventory.description"}}</p>
+            </div>
+            <button @click="refreshInventory()" :disabled="refreshing || summaryLoading || !summary || hasActiveTask()" class="btn-primary whitespace-nowrap" x-text="refreshing ? t('wp_inventory.refreshing') : t('wp_inventory.refresh')"></button>
+        </div>
+
+        <div x-show="summaryError" class="mt-4 flex flex-col gap-3 rounded border border-red-800 bg-red-950/40 p-3 text-sm text-red-200 sm:flex-row sm:items-center sm:justify-between">
+            <span x-text="summaryError"></span>
+            <button @click="loadSummary()" :disabled="summaryLoading" class="text-left text-red-100 underline hover:text-white sm:text-right">{{t .Lang "wp_inventory.retry"}}</button>
+        </div>
+
+        <div x-show="summaryLoading && !summary" class="py-10 text-center text-sm text-gray-400">
+            <span>{{t .Lang "wp_inventory.loading"}}</span>
+        </div>
+
+        <template x-if="summary">
+            <div>
+                <div x-show="summary.update_checks_disabled" class="mt-4 rounded border border-yellow-700 bg-yellow-950/30 p-3 text-sm text-yellow-200">{{t .Lang "wp_inventory.update_checks_disabled_warning"}}</div>
+                <div x-show="statusKey() !== 'wp_inventory.status_complete'" class="mt-4 rounded border p-3 text-sm" :class="statusNoticeClass()">
+                    <div class="font-medium" x-text="t(statusKey())"></div>
+                    <p x-show="summary.collection_status === 'failed' && summary.has_successful_inventory" class="mt-1" x-text="t('wp_inventory.stale_notice', { time: displayTime(summary.last_success_at) })"></p>
+                    <template x-if="summary.last_error">
+                        <div class="mt-1">
+                            <p x-text="errorMessage(summary.last_error)"></p>
+                            <p class="mt-1 text-xs opacity-80" x-text="t(retryHintKey(summary.last_error))"></p>
+                            <details class="mt-2">
+                                <summary class="cursor-pointer list-none text-xs underline opacity-70">{{t .Lang "wp_inventory.tech_details"}}</summary>
+                                <p class="mt-1 text-xs opacity-70" x-text="t('wp_inventory.error_code', { code: summary.last_error?.code })"></p>
+                            </details>
+                        </div>
+                    </template>
+                </div>
+
+                <div x-show="summary.has_successful_inventory" class="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-3">
+                    <div class="rounded-lg border border-gray-700 bg-gray-900/40 p-3">
+                        <div class="text-xs font-medium text-gray-400">{{t .Lang "wp_inventory.group_site"}}</div>
+                        <dl class="mt-2 space-y-1.5 text-sm">
+                            <div class="flex items-baseline gap-2"><dt class="shrink-0 text-gray-500">{{t .Lang "wp_inventory.site_url"}}</dt><dd class="min-w-0 truncate"><a x-show="siteURL" :href="siteURL" target="_blank" rel="noopener" class="text-blue-400 hover:text-blue-300 hover:underline" x-text="siteURL"></a><span x-show="!siteURL" class="text-gray-200">{{t .Lang "common.none"}}</span></dd></div>
+                            <div class="flex items-baseline gap-2"><dt class="shrink-0 text-gray-500">{{t .Lang "wp_inventory.wordpress_version"}}</dt><dd class="min-w-0 truncate text-gray-200" x-text="summary.wordpress.version || t('common.none')"></dd></div>
+                            <div class="flex items-baseline gap-2"><dt class="shrink-0 text-gray-500">{{t .Lang "wp_inventory.locale"}}</dt><dd class="min-w-0 truncate text-gray-200" x-text="summary.wordpress.locale || t('common.none')"></dd></div>
+                            <div class="flex items-baseline gap-2"><dt class="shrink-0 text-gray-500">{{t .Lang "wp_inventory.multisite"}}</dt><dd class="min-w-0 truncate text-gray-200" x-text="summary.wordpress.multisite ? t('wp_inventory.yes') : t('wp_inventory.no')"></dd></div>
+                            <div class="flex items-baseline gap-2"><dt class="shrink-0 text-gray-500">{{t .Lang "wp_inventory.current_theme"}}</dt><dd class="min-w-0 truncate text-gray-200" x-text="summary.wordpress.current_theme_key || t('common.none')"></dd></div>
+                        </dl>
+                    </div>
+                    <div class="rounded-lg border border-gray-700 bg-gray-900/40 p-3">
+                        <div class="text-xs font-medium text-gray-400">{{t .Lang "wp_inventory.group_updates"}}</div>
+                        <dl class="mt-2 space-y-1.5 text-sm">
+                            <div class="flex items-baseline gap-2"><dt class="shrink-0 text-gray-500">{{t .Lang "wp_inventory.updates_overall"}}</dt><dd class="min-w-0 truncate" :class="updatesOverallClass()" x-text="t(updatesOverallKey())"></dd></div>
+                            <p x-show="updatesOverallState() === 'unknown'" class="text-xs text-gray-500" x-text="t('wp_inventory.status_unknown_updates')"></p>
+                            <div class="flex items-baseline gap-2"><dt class="shrink-0 text-gray-500">{{t .Lang "wp_inventory.core_update"}}</dt><dd class="min-w-0 truncate" :class="summary.core_upgrade_available ? 'text-yellow-300' : 'text-green-300'" x-text="summary.core_upgrade_available ? t('wp_inventory.core_update_available') : t('wp_inventory.core_update_none')"></dd></div>
+                            <div class="flex items-baseline gap-2"><dt class="shrink-0 text-gray-500">{{t .Lang "wp_inventory.plugin_updates"}}</dt><dd class="min-w-0 truncate text-gray-200" x-text="summary.counts.plugin_updates"></dd></div>
+                            <div class="flex items-baseline gap-2"><dt class="shrink-0 text-gray-500">{{t .Lang "wp_inventory.theme_updates"}}</dt><dd class="min-w-0 truncate text-gray-200" x-text="summary.counts.theme_updates"></dd></div>
+                            <div class="flex items-baseline gap-2"><dt class="shrink-0 text-gray-500">{{t .Lang "wp_inventory.plugins"}}</dt><dd class="min-w-0 truncate text-gray-200"><span x-text="summary.counts.plugins"></span> <span class="text-xs text-gray-400" x-text="t('wp_inventory.active_plugins', { count: summary.counts.active_plugins })"></span></dd></div>
+                            <div class="flex items-baseline gap-2"><dt class="shrink-0 text-gray-500">{{t .Lang "wp_inventory.themes"}}</dt><dd class="min-w-0 truncate text-gray-200" x-text="summary.counts.themes"></dd></div>
+                        </dl>
+                    </div>
+                    <div class="rounded-lg border border-gray-700 bg-gray-900/40 p-3">
+                        <div class="text-xs font-medium text-gray-400">{{t .Lang "wp_inventory.group_scan"}}</div>
+                        <dl class="mt-2 space-y-1.5 text-sm">
+                            <div class="flex items-baseline gap-2"><dt class="shrink-0 text-gray-500">{{t .Lang "wp_inventory.last_attempt"}}</dt><dd class="min-w-0 truncate text-gray-200" x-text="displayTime(summary.last_attempt_at)"></dd></div>
+                            <div class="flex items-baseline gap-2"><dt class="shrink-0 text-gray-500">{{t .Lang "wp_inventory.last_success"}}</dt><dd class="min-w-0 truncate text-gray-200" x-text="displayTime(summary.last_success_at)"></dd></div>
+                        </dl>
+                        <p class="mt-2 text-xs text-gray-500">{{t .Lang "wp_inventory.next_scan"}}</p>
+                    </div>
+                </div>
+
+                <div x-show="!summary.has_successful_inventory" class="mt-5 rounded-lg border border-dashed border-gray-700 py-10 text-center text-sm text-gray-400">
+                    {{t .Lang "wp_inventory.no_inventory"}}
+                </div>
+
+                <div x-show="summary.has_successful_inventory" class="mt-6 border-t border-gray-700 pt-5">
+                    <div class="flex flex-wrap gap-2 border-b border-gray-700">
+                        <button @click="selectTab('plugins')" :class="activeTab === 'plugins' ? 'border-blue-400 text-blue-300' : 'border-transparent text-gray-400 hover:text-white'" class="border-b-2 px-4 py-2 text-sm font-medium">{{t .Lang "wp_inventory.tab_plugins"}}</button>
+                        <button @click="selectTab('themes')" :class="activeTab === 'themes' ? 'border-blue-400 text-blue-300' : 'border-transparent text-gray-400 hover:text-white'" class="border-b-2 px-4 py-2 text-sm font-medium">{{t .Lang "wp_inventory.tab_themes"}}</button>
+                        <button @click="selectTab('updates')" :class="activeTab === 'updates' ? 'border-blue-400 text-blue-300' : 'border-transparent text-gray-400 hover:text-white'" class="inline-flex items-center gap-1.5 border-b-2 px-4 py-2 text-sm font-medium">{{t .Lang "wp_inventory.tab_updates"}}<span x-show="hasAvailableUpdates()" class="h-1.5 w-1.5 rounded-full bg-red-500"></span></button>
+                        <button @click="selectTab('backups')" :class="activeTab === 'backups' ? 'border-blue-400 text-blue-300' : 'border-transparent text-gray-400 hover:text-white'" class="border-b-2 px-4 py-2 text-sm font-medium">{{t .Lang "wp_update_backup.tab"}}</button>
+                        <button @click="selectTab('logs')" :class="activeTab === 'logs' ? 'border-blue-400 text-blue-300' : 'border-transparent text-gray-400 hover:text-white'" class="border-b-2 px-4 py-2 text-sm font-medium">{{t .Lang "wp_update_log.tab"}}</button>
+                    </div>
+
+                    <div x-show="currentPage().error" class="mt-3 rounded border border-red-800 bg-red-950/40 p-3 text-sm text-red-200" x-text="currentPage().error"></div>
+                    <div x-show="currentPage().loading" class="py-6 text-center text-sm text-gray-400">{{t .Lang "wp_inventory.loading"}}</div>
+
+                    <div x-show="activeTab !== 'updates' && activeTab !== 'backups' && !currentPage().loading" class="mt-4 overflow-x-auto">
+                        <table class="w-full text-sm">
+                            <thead><tr><th class="table-header">{{t .Lang "wp_inventory.column_name"}}</th><th class="table-header">{{t .Lang "wp_inventory.column_key"}}</th><th class="table-header">{{t .Lang "wp_inventory.column_version"}}</th><th class="table-header">{{t .Lang "wp_inventory.column_status"}}</th></tr></thead>
+                            <tbody>
+                                <template x-for="item in currentPage().items" :key="item.type + ':' + item.key">
+                                    <tr class="table-row">
+                                        <td class="table-cell text-white" x-text="item.name || item.key"></td>
+                                        <td class="table-cell break-all font-mono text-xs" x-text="item.key"></td>
+                                        <td class="table-cell" x-text="item.version || t('common.none')"></td>
+                                        <td class="table-cell">
+                                            <span x-show="!item.current_theme && item.network_active" class="badge-info" x-text="t('wp_inventory.network_active')"></span>
+                                            <span x-show="!item.current_theme && !item.network_active && item.active" class="badge-success" x-text="t('wp_inventory.active')"></span>
+                                            <span x-show="!item.network_active && !item.active && !item.current_theme" class="badge-info" x-text="t('wp_inventory.inactive')"></span>
+                                            <span x-show="item.current_theme" class="badge-success ml-1" x-text="t('wp_inventory.current_theme_badge')"></span>
+                                        </td>
+                                    </tr>
+                                </template>
+                                <tr x-show="currentPage().items.length === 0"><td colspan="4" class="table-cell py-8 text-center text-gray-500">{{t .Lang "wp_inventory.no_components"}}</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div x-show="activeTab === 'updates' && !currentPage().loading" class="mt-4 flex justify-end">
+                        <button x-show="pluginBatch.activeBatchID" @click="openPluginBatchProgress()" class="btn-secondary text-sm mr-2" x-text="t('wp_plugin_batch.button_tracking')"></button>
+                        <button x-show="!pluginBatch.activeBatchID" @click="openPluginBatchSelect()" :disabled="pluginTaskActive()" class="btn-secondary text-sm" x-text="t('wp_plugin_batch.button')"></button>
+                    </div>
+                    <div x-show="activeTab === 'updates' && !currentPage().loading" class="mt-2 overflow-x-auto">
+                        <table class="w-full text-sm">
+                            <thead><tr><th class="table-header">{{t .Lang "wp_inventory.column_type"}}</th><th class="table-header">{{t .Lang "wp_inventory.column_key"}}</th><th class="table-header">{{t .Lang "wp_inventory.column_version"}}</th><th class="table-header">{{t .Lang "wp_inventory.column_target_version"}}</th><th class="table-header text-right">{{t .Lang "wp_plugin_update.column_action"}}</th></tr></thead>
+                            <tbody>
+                                <template x-for="item in currentPage().items" :key="item.type + ':' + item.key + ':' + item.target_version + ':' + item.locale">
+                                    <tr class="table-row">
+                                        <td class="table-cell"><span class="badge-info" x-text="typeLabel(item.type)"></span></td>
+                                        <td class="table-cell break-all font-mono text-xs" x-text="item.key"></td>
+                                        <td class="table-cell" x-text="item.current_version || t('common.none')"></td>
+                                        <td class="table-cell text-white" x-text="item.target_version"></td>
+                                        <td class="table-cell text-right">
+                                            <button x-show="canUpdateComponent(item)" @click="openPluginUpdate(item)" :disabled="pluginUpdate.loading || pluginUpdate.submitting || (pluginTaskActive() && pluginUpdate.componentKey !== item.key)" class="btn-primary text-sm" x-text="pluginUpdate.loading && pluginUpdate.componentKey === item.key ? componentUpdateText('wp_plugin_update.checking', 'wp_theme_update.checking') : (pluginTaskActive() && pluginUpdate.componentKey === item.key ? componentUpdateText('wp_plugin_update.tracking', 'wp_theme_update.tracking') : componentUpdateText('wp_plugin_update.action', 'wp_theme_update.action', item.type))"></button>
+                                            <span x-show="item.type !== 'plugin' && item.type !== 'theme'" class="text-gray-600">—</span>
+                                        </td>
+                                    </tr>
+                                </template>
+                                <tr x-show="currentPage().items.length === 0"><td colspan="5" class="table-cell py-8 text-center text-gray-500">{{t .Lang "wp_inventory.no_updates"}}</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div x-show="activeTab === 'backups' && !currentPage().loading" class="mt-4">
+                        <p class="mb-3 text-sm text-gray-400">{{t .Lang "wp_update_backup.description"}}</p>
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-sm">
+                                <thead><tr><th class="table-header">{{t .Lang "wp_update_backup.column_time"}}</th><th class="table-header">{{t .Lang "wp_update_backup.column_component"}}</th><th class="table-header">{{t .Lang "wp_update_backup.column_version"}}</th><th class="table-header">{{t .Lang "wp_update_backup.column_kind"}}</th><th class="table-header">{{t .Lang "wp_update_backup.column_size"}}</th><th class="table-header text-right">{{t .Lang "wp_update_backup.column_action"}}</th></tr></thead>
+                                <tbody>
+                                    <template x-for="backup in currentPage().items" :key="backup.backup_id">
+                                        <tr class="table-row">
+                                            <td class="table-cell whitespace-nowrap" x-text="fmtTime(backup.created_at)"></td>
+                                            <td class="table-cell"><span class="badge-info" x-text="typeLabel(backup.component_type)"></span><div class="mt-1 break-all font-mono text-xs text-gray-400" x-text="backup.component_key"></div></td>
+                                            <td class="table-cell whitespace-nowrap" x-text="backup.current_version + ' → ' + backup.target_version"></td>
+                                            <td class="table-cell"><span x-text="backupKindText(backup.kind)"></span><div x-show="backup.batch_shared" class="mt-1"><span class="badge-warning" x-text="t('wp_update_backup.batch_shared')"></span></div></td>
+                                            <td class="table-cell whitespace-nowrap" x-text="formatBytes(backup.file_size)"></td>
+                                            <td class="table-cell text-right">
+                                                <button x-show="backup.restore_allowed" @click="restoreUpdateBackup(backup)" :disabled="currentPage().restoringID !== null" class="btn-danger text-xs" x-text="currentPage().restoringID === backup.backup_id ? t('wp_update_backup.restoring') : t('wp_update_backup.restore')"></button>
+                                                <span x-show="!backup.restore_allowed" class="text-gray-600">—</span>
+                                            </td>
+                                        </tr>
+                                    </template>
+                                    <tr x-show="currentPage().items.length === 0"><td colspan="6" class="table-cell py-8 text-center text-gray-500">{{t .Lang "wp_update_backup.empty"}}</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <div x-show="activeTab === 'logs' && !currentPage().loading" class="mt-4">
+                        <p class="mb-3 text-sm text-gray-400">{{t .Lang "wp_update_log.description"}}</p>
+                        <div class="space-y-3">
+                            <template x-for="task in currentPage().items" :key="task.task_id">
+                                <div class="rounded border border-gray-700 bg-gray-950/40 p-4">
+                                    <div class="flex flex-wrap items-center justify-between gap-2">
+                                        <div class="flex flex-wrap items-center gap-2 text-sm">
+                                            <span class="whitespace-nowrap text-gray-400" x-text="fmtTime(task.created_at)"></span>
+                                            <span class="badge-info" x-text="typeLabel(task.component_type)"></span>
+                                            <span class="break-all font-mono text-xs text-gray-400" x-text="task.component_key"></span>
+                                            <span class="whitespace-nowrap text-gray-300" x-text="(task.current_version || t('common.none')) + ' → ' + (task.target_version || t('common.none'))"></span>
+                                            <span class="badge-info" x-text="task.task_kind === 'rollback' ? t('wp_update_log.kind_rollback') : t('wp_update_log.kind_update')"></span>
+                                            <span :class="logStatusClass(task)" x-text="logStatusText(task)"></span>
+                                            <span x-show="task.requires_attention" class="badge-danger" x-text="t('wp_update_log.requires_attention')"></span>
+                                            <span x-show="task.rollback_status === 'failed'" class="badge-danger" x-text="t('wp_update_log.rollback_failed')"></span>
+                                        </div>
+                                        <button @click="copyUpdateLog(task)" class="btn-secondary text-xs" x-text="t('wp_update_log.copy')"></button>
+                                    </div>
+                                    <div class="mt-3">
+                                        <div class="mb-1 text-xs text-gray-500">{{t .Lang "wp_update_log.event_timeline"}}</div>
+                                        <div x-show="task.events.length === 0" class="text-xs text-gray-600" x-text="t('wp_update_log.no_events')"></div>
+                                        <ul x-show="task.events.length > 0" class="space-y-0.5 font-mono text-xs">
+                                            <template x-for="(ev, idx) in task.events" :key="task.task_id + ':' + idx">
+                                                <li :class="logEventClass(ev.result)" x-text="logEventText(ev)"></li>
+                                            </template>
+                                        </ul>
+                                    </div>
+                                </div>
+                            </template>
+                            <div x-show="currentPage().items.length === 0" class="py-8 text-center text-sm text-gray-500">{{t .Lang "wp_update_log.empty"}}</div>
+                        </div>
+                    </div>
+
+                    <div x-show="activeTab !== 'backups' && activeTab !== 'logs' && !currentPage().loading && currentPage().total > currentPage().pageSize" class="mt-4 flex flex-col gap-3 text-sm text-gray-400 sm:flex-row sm:items-center sm:justify-between">
+                        <span x-text="t('wp_inventory.page_summary', { page: currentPage().page, total: currentPage().total })"></span>
+                        <div class="flex gap-2">
+                            <button @click="changePage(-1)" :disabled="currentPage().loading || currentPage().page <= 1" class="btn-secondary text-sm">{{t .Lang "wp_inventory.previous"}}</button>
+                            <button @click="changePage(1)" :disabled="currentPage().loading || currentPage().page * currentPage().pageSize >= currentPage().total" class="btn-secondary text-sm">{{t .Lang "wp_inventory.next"}}</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </template>
+    </div>
+
+    <div x-cloak x-show="pluginUpdate.open" class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" @keydown.escape.window="closePluginUpdate()">
+        <div class="w-full max-w-xl rounded-lg border border-gray-700 bg-gray-900 p-5 shadow-2xl" @click.outside="closePluginUpdate()">
+            <div class="flex items-start justify-between gap-4">
+                <div>
+                    <h3 class="text-lg font-semibold text-white" x-text="componentUpdateText('wp_plugin_update.title', 'wp_theme_update.title')"></h3>
+                    <p class="mt-1 text-sm text-gray-400" x-text="componentUpdateText('wp_plugin_update.description', 'wp_theme_update.description')"></p>
+                </div>
+                <button @click="pluginUpdate.submitting ? cancelPluginPreparation() : closePluginUpdate()" class="text-xl text-gray-400 hover:text-white" aria-label="{{t .Lang "common.cancel"}}">×</button>
+            </div>
+
+            <div x-show="pluginUpdate.error" class="mt-4 rounded border border-red-800 bg-red-950/40 p-3 text-sm text-red-200" x-text="pluginUpdate.error"></div>
+            <div x-show="pluginUpdate.loading" class="py-8 text-center text-sm text-gray-400" x-text="componentUpdateText('wp_plugin_update.checking', 'wp_theme_update.checking')"></div>
+
+            <div x-show="pluginUpdate.preview && !pluginUpdate.task && !pluginUpdate.loading" class="mt-5 space-y-4">
+                <div class="grid grid-cols-1 gap-3 rounded border border-gray-700 bg-gray-950/40 p-4 sm:grid-cols-2">
+                    <div><div class="text-xs text-gray-500" x-text="componentUpdateText('wp_plugin_update.plugin', 'wp_theme_update.theme')"></div><div class="mt-1 break-all text-sm text-white" x-text="pluginUpdate.preview?.name || pluginUpdate.componentKey"></div></div>
+                    <div><div class="text-xs text-gray-500">{{t .Lang "wp_plugin_update.component_key"}}</div><div class="mt-1 break-all font-mono text-xs text-gray-300" x-text="pluginUpdate.componentKey"></div></div>
+                    <div><div class="text-xs text-gray-500">{{t .Lang "wp_plugin_update.current_version"}}</div><div class="mt-1 text-white" x-text="pluginUpdate.preview?.current_version"></div></div>
+                    <div><div class="text-xs text-gray-500">{{t .Lang "wp_plugin_update.target_version"}}</div><div class="mt-1 text-white" x-text="pluginUpdate.preview?.target_version"></div></div>
+                    <div><div class="text-xs text-gray-500">{{t .Lang "wp_plugin_update.verification"}}</div><div class="mt-1 text-green-300">{{t .Lang "wp_plugin_update.structure_only"}}</div></div>
+                    <div><div class="text-xs text-gray-500">{{t .Lang "wp_plugin_update.backup_scope"}}</div><div class="mt-1 text-gray-200" x-text="componentUpdateText('wp_plugin_update.backup_scope_value', 'wp_theme_update.backup_scope_value')"></div></div>
+                </div>
+                <div class="rounded border border-yellow-800 bg-yellow-950/30 p-3 text-sm text-yellow-200" x-text="pluginUpdate.preview?.current_theme ? t('wp_theme_update.current_theme_warning') : componentUpdateText('wp_plugin_update.confirm_warning', 'wp_theme_update.confirm_warning')"></div>
+                <label x-show="pluginUpdate.preview?.current_theme" class="flex items-start gap-3 rounded border border-red-800 bg-red-950/30 p-3 text-sm text-red-100">
+                    <input type="checkbox" x-model="pluginUpdate.riskAccepted" class="mt-1">
+                    <span>{{t .Lang "wp_theme_update.current_theme_confirm"}}</span>
+                </label>
+                <div x-show="pluginUpdate.preview?.recent_database_backup" class="space-y-2 rounded border border-yellow-800 bg-yellow-950/30 p-3 text-sm">
+                    <div class="font-medium text-yellow-100" x-text="t('wp_plugin_update.recent_backup_found', { time: fmtTime(pluginUpdate.preview?.recent_database_backup?.created_at) })"></div>
+                    <label class="flex items-start gap-2 text-gray-200"><input type="radio" value="fresh" x-model="pluginUpdate.databaseBackupMode" class="mt-1"><span>{{t .Lang "wp_plugin_update.backup_fresh"}}</span></label>
+                    <label class="flex items-start gap-2 text-gray-200"><input type="radio" value="reuse" x-model="pluginUpdate.databaseBackupMode" class="mt-1"><span>{{t .Lang "wp_plugin_update.backup_reuse"}}</span></label>
+                    <p x-show="pluginUpdate.databaseBackupMode === 'reuse'" class="text-red-200">{{t .Lang "wp_plugin_update.backup_reuse_warning"}}</p>
+                </div>
+                <div class="flex justify-end gap-3">
+                    <button @click="pluginUpdate.submitting ? cancelPluginPreparation() : closePluginUpdate()" class="btn-secondary" x-text="pluginUpdate.submitting ? t('wp_plugin_update.cancel_preparation') : t('common.cancel')"></button>
+                    <button @click="confirmPluginUpdate()" :disabled="pluginUpdate.submitting || (pluginUpdate.preview?.current_theme === true && !pluginUpdate.riskAccepted)" class="btn-primary" x-text="pluginUpdate.submitting ? componentUpdateText('wp_plugin_update.submitting', 'wp_theme_update.submitting') : componentUpdateText('wp_plugin_update.confirm', 'wp_theme_update.confirm')"></button>
+                </div>
+            </div>
+
+            <div x-show="pluginUpdate.task && !pluginUpdate.loading" class="mt-5 space-y-4">
+                <div class="rounded border p-4" :class="pluginTaskNoticeClass()">
+                    <div class="font-medium" x-text="pluginTaskStatusText()"></div>
+                    <div class="mt-1 text-sm" x-text="t('wp_plugin_update.stage_value', { stage: pluginTaskStageText() })"></div>
+                    <div x-show="pluginUpdate.task?.requires_attention" class="mt-3 text-sm font-medium">{{t .Lang "wp_plugin_update.requires_attention"}}</div>
+                </div>
+                <div x-show="pluginUpdate.task?.status === 'success'" class="rounded border border-blue-800 bg-blue-950/30 p-3 text-sm text-blue-200" x-text="componentUpdateText('wp_plugin_update.rescan_after_success', 'wp_theme_update.rescan_after_success')"></div>
+                <div class="flex justify-end">
+                    <button @click="closePluginUpdate()" class="btn-secondary">{{t .Lang "wp_plugin_update.close"}}</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div x-cloak x-show="pluginBatch.mode === 'select'" class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" @keydown.escape.window="closePluginBatch()">
+        <div class="w-full max-w-xl rounded-lg border border-gray-700 bg-gray-900 p-5 shadow-2xl" @click.outside="closePluginBatch()">
+            <div class="flex items-start justify-between gap-4">
+                <h3 class="text-lg font-semibold text-white">{{t .Lang "wp_plugin_batch.title"}}</h3>
+                <button @click="closePluginBatch()" class="text-xl text-gray-400 hover:text-white" aria-label="{{t .Lang "common.cancel"}}">×</button>
+            </div>
+            <p class="mt-2 text-sm text-gray-400">{{t .Lang "wp_plugin_batch.select_description"}}</p>
+            <div x-show="pluginBatch.error" class="mt-4 rounded border border-red-800 bg-red-950/40 p-3 text-sm text-red-200" x-text="pluginBatch.error"></div>
+
+            <div x-show="pluginBatchSelectableItems().length === 0" class="mt-5 rounded border border-dashed border-gray-700 py-8 text-center text-sm text-gray-500">{{t .Lang "wp_plugin_batch.select_none"}}</div>
+
+            <template x-if="pluginBatchSelectableItems().length > 0">
+                <div class="mt-4">
+                    <div class="flex items-center justify-between text-xs text-gray-400">
+                        <span x-text="t('wp_plugin_batch.selected_count', { count: pluginBatch.selected.size })"></span>
+                        <span class="space-x-3">
+                            <button @click="pluginBatchSelectAll()" class="underline hover:text-white">{{t .Lang "wp_plugin_batch.select_all"}}</button>
+                            <button @click="pluginBatchSelectClear()" class="underline hover:text-white">{{t .Lang "wp_plugin_batch.select_clear"}}</button>
+                        </span>
+                    </div>
+                    <ul class="mt-2 max-h-72 space-y-1 overflow-y-auto rounded border border-gray-700 bg-gray-950/40 p-2">
+                        <template x-for="item in pluginBatchSelectableItems()" :key="item.key">
+                            <li>
+                                <label class="flex items-start gap-2 rounded px-2 py-1.5 text-sm hover:bg-gray-800/60">
+                                    <input type="checkbox" class="mt-1" :checked="pluginBatch.selected.has(item.key)" @change="togglePluginBatchItem(item.key)">
+                                    <span class="min-w-0">
+                                        <span class="block truncate text-white" x-text="item.name || item.key"></span>
+                                        <span class="block break-all font-mono text-xs text-gray-500" x-text="item.key + ': ' + (item.current_version || '?') + ' → ' + item.target_version"></span>
+                                    </span>
+                                </label>
+                            </li>
+                        </template>
+                    </ul>
+                </div>
+            </template>
+
+            <div class="mt-5 flex justify-end gap-3">
+                <button @click="closePluginBatch()" class="btn-secondary">{{t .Lang "common.cancel"}}</button>
+                <button @click="submitPluginBatch()" :disabled="pluginBatch.submitting || pluginBatch.selected.size === 0" class="btn-primary" x-text="pluginBatch.submitting ? t('wp_plugin_batch.starting') : t('wp_plugin_batch.start')"></button>
+            </div>
+        </div>
+    </div>
+
+    <div x-cloak x-show="pluginBatch.mode === 'progress'" class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" @keydown.escape.window="closePluginBatch()">
+        <div class="w-full max-w-2xl rounded-lg border border-gray-700 bg-gray-900 p-5 shadow-2xl" @click.outside="closePluginBatch()">
+            <div class="flex items-start justify-between gap-4">
+                <div>
+                    <h3 class="text-lg font-semibold text-white">{{t .Lang "wp_plugin_batch.progress_title"}}</h3>
+                    <p class="mt-1 text-sm text-gray-400">{{t .Lang "wp_plugin_batch.progress_description"}}</p>
+                </div>
+                <span class="whitespace-nowrap rounded-full px-2 py-1 text-xs" :class="pluginBatch.batch?.status === 'completed' ? 'bg-green-900/60 text-green-200' : 'bg-blue-900/60 text-blue-200'" x-text="pluginBatch.batch?.status === 'completed' ? t('wp_plugin_batch.status_completed') : t('wp_plugin_batch.status_running')"></span>
+            </div>
+            <div x-show="pluginBatch.error" class="mt-4 rounded border border-red-800 bg-red-950/40 p-3 text-sm text-red-200" x-text="pluginBatch.error"></div>
+            <ul class="mt-4 max-h-96 space-y-2 overflow-y-auto">
+                <template x-for="item in (pluginBatch.batch?.items || [])" :key="item.position">
+                    <li class="rounded border border-gray-700 bg-gray-950/40 p-3">
+                        <div class="flex flex-wrap items-center justify-between gap-2">
+                            <span class="break-all font-mono text-xs text-gray-400" x-text="item.component_key"></span>
+                            <span class="text-sm" :class="pluginBatchItemClass(item)" x-text="pluginBatchItemText(item)"></span>
+                        </div>
+                        <div x-show="pluginBatchItemNeedsDecision(item)" class="mt-2 flex justify-end gap-2">
+                            <button @click="ignorePluginBatchItem(item)" :disabled="pluginBatch.decidingTaskID === item.task_id" class="btn-secondary text-xs" x-text="t('wp_plugin_batch.ignore_button')"></button>
+                            <button x-show="pluginBatchItemCanRollback(item)" @click="rollbackPluginBatchItem(item)" :disabled="pluginBatch.decidingTaskID === item.task_id" class="btn-danger text-xs" x-text="pluginBatch.decidingTaskID === item.task_id ? t('wp_plugin_batch.rollback_submitting') : t('wp_plugin_batch.rollback_button')"></button>
+                        </div>
+                    </li>
+                </template>
+            </ul>
+            <div class="mt-5 flex justify-end">
+                <button @click="closePluginBatch()" class="btn-secondary">{{t .Lang "wp_plugin_batch.close"}}</button>
+            </div>
+        </div>
+    </div>
+</section>
+
+<script>
+function wpInventoryPanel() {
+    const newPage = () => ({ items: [], total: 0, page: 1, pageSize: 50, loading: false, error: '', loaded: false, restoringID: null });
+    const newPluginUpdate = () => ({ open: false, loading: false, submitting: false, componentType: '', componentKey: '', preview: null, task: null, error: '', riskAccepted: false, databaseBackupMode: 'fresh', preparationController: null, preparationCancelled: false, pollStartedAt: 0 });
+    const newPluginBatch = () => ({ mode: '', activeBatchID: '', submitting: false, error: '', selected: new Set(), batch: null, decidingTaskID: null, pollTimer: null, pollStartedAt: 0 });
+    return {
+        siteID: null,
+        siteURL: '',
+        summary: null,
+        summaryLoading: false,
+        summaryError: '',
+        refreshing: false,
+        activeTab: 'plugins',
+        pages: { plugins: newPage(), themes: newPage(), updates: newPage(), backups: newPage(), logs: newPage() },
+        pollTimer: null,
+        pollStartedAt: 0,
+        pluginUpdate: newPluginUpdate(),
+        pluginPollTimer: null,
+        pluginBatch: newPluginBatch(),
+        backupRestoreTimer: null,
+        requestGeneration: 0,
+        pagehideHandler: null,
+        mount() {
+            if (this.pagehideHandler) return;
+            this.pagehideHandler = () => this.teardown();
+            window.addEventListener('pagehide', this.pagehideHandler);
+        },
+        teardown() {
+            if (this.pluginUpdate.preparationController) this.pluginUpdate.preparationController.abort();
+            this.stopPolling();
+            this.stopPluginPolling();
+            this.stopBackupRestorePolling();
+            this.stopPluginBatchPolling();
+            this.requestGeneration++;
+            if (this.pagehideHandler) window.removeEventListener('pagehide', this.pagehideHandler);
+            this.pagehideHandler = null;
+        },
+        async setSite(site) {
+            const nextID = site && site.site_type === 'wordpress' ? Number(site.id) : null;
+            if (nextID === this.siteID) return;
+            if (this.pluginUpdate.preparationController) this.pluginUpdate.preparationController.abort();
+            this.stopPolling();
+            this.stopPluginPolling();
+            this.stopBackupRestorePolling();
+            this.stopPluginBatchPolling();
+            this.requestGeneration++;
+            this.siteID = Number.isInteger(nextID) && nextID > 0 ? nextID : null;
+            this.siteURL = this.siteID && typeof site.domain === 'string' && site.domain !== ''
+                ? (site.ssl_enabled ? 'https://' : 'http://') + site.domain : '';
+            this.summary = null;
+            this.summaryLoading = false;
+            this.summaryError = '';
+            this.refreshing = false;
+            this.activeTab = 'plugins';
+            this.pages = { plugins: newPage(), themes: newPage(), updates: newPage(), backups: newPage(), logs: newPage() };
+            this.pluginUpdate = newPluginUpdate();
+            this.pluginBatch = newPluginBatch();
+            if (this.siteID) {
+                await this.loadSummary();
+                await this.checkActivePluginBatch();
+            }
+        },
+        hasActiveTask() {
+            return this.summary?.active_task?.status === 'queued' || this.summary?.active_task?.status === 'running';
+        },
+        hasAvailableUpdates() {
+            return ((this.summary?.counts?.plugin_updates || 0) + (this.summary?.counts?.theme_updates || 0)) > 0;
+        },
+        updatesOverallState() {
+            if (!this.summary) return 'unknown';
+            if (this.summary.update_checks_disabled) return 'unknown';
+            if (this.summary.core_upgrade_available || this.hasAvailableUpdates()) return 'available';
+            const checks = this.summary.update_checks;
+            if (checks && !checks.core && !checks.plugins && !checks.themes) return 'unknown';
+            return 'up_to_date';
+        },
+        updatesOverallKey() {
+            const state = this.updatesOverallState();
+            if (state === 'available') return 'wp_inventory.status_updates_available';
+            if (state === 'up_to_date') return 'wp_inventory.status_up_to_date';
+            return 'wp_inventory.status_unknown_updates_label';
+        },
+        updatesOverallClass() {
+            const state = this.updatesOverallState();
+            if (state === 'available') return 'text-yellow-300';
+            if (state === 'up_to_date') return 'text-green-300';
+            return 'text-gray-400';
+        },
+        statusKey() {
+            if (this.summary?.active_task?.status === 'running') return 'wp_inventory.status_running';
+            if (this.summary?.active_task?.status === 'queued') return 'wp_inventory.status_queued';
+            if (!this.summary) return 'wp_inventory.status_unexpected';
+            if (this.summary.collection_status === 'failed' && this.summary.has_successful_inventory) return 'wp_inventory.status_failed_stale';
+            if (this.summary.collection_status === 'failed') return 'wp_inventory.status_failed_empty';
+            if (this.summary.collection_status === 'complete') return 'wp_inventory.status_complete';
+            if (this.summary.collection_status === 'unknown') return 'wp_inventory.status_unknown';
+            return 'wp_inventory.status_unexpected';
+        },
+        statusClass() {
+            const key = this.statusKey();
+            if (key === 'wp_inventory.status_complete') return 'bg-green-900/60 text-green-200';
+            if (key === 'wp_inventory.status_queued' || key === 'wp_inventory.status_running') return 'bg-blue-900/60 text-blue-200';
+            if (key === 'wp_inventory.status_failed_stale' || key === 'wp_inventory.status_failed_empty') return 'bg-red-900/60 text-red-200';
+            return 'bg-gray-700 text-gray-200';
+        },
+        statusNoticeClass() {
+            const key = this.statusKey();
+            if (key === 'wp_inventory.status_complete') return 'border-green-800 bg-green-950/30 text-green-200';
+            if (key === 'wp_inventory.status_queued' || key === 'wp_inventory.status_running') return 'border-blue-800 bg-blue-950/30 text-blue-200';
+            if (key === 'wp_inventory.status_failed_stale' || key === 'wp_inventory.status_failed_empty') return 'border-red-800 bg-red-950/30 text-red-200';
+            return 'border-gray-700 bg-gray-900/40 text-gray-300';
+        },
+        errorKey(error) {
+            const code = error?.code || '';
+            const direct = {
+                memory_limit_exhausted: 'wp_inventory.error_memory_limit',
+                runner_policy_mismatch: 'wp_inventory.error_policy_mismatch',
+                runner_timeout: 'wp_inventory.error_timeout',
+                runner_canceled: 'wp_inventory.error_timeout',
+                wordpress_bootstrap_failed: 'wp_inventory.error_bootstrap',
+                wordpress_terminated: 'wp_inventory.error_terminated',
+                inventory_limit_exceeded: 'wp_inventory.error_inventory_limit',
+                stdout_limit_exceeded: 'wp_inventory.error_output_limit',
+                stderr_limit_exceeded: 'wp_inventory.error_output_limit',
+                protocol_limit_exceeded: 'wp_inventory.error_output_limit',
+                protocol_invalid: 'wp_inventory.error_protocol',
+                runner_internal_error: 'wp_inventory.error_protocol',
+                json_encode_failed: 'wp_inventory.error_protocol',
+                runner_start_failed: 'wp_inventory.error_start_failed',
+            };
+            if (direct[code]) return direct[code];
+            if (['unsupported_platform', 'invalid_site', 'invalid_site_path', 'site_user_unavailable', 'insufficient_privileges', 'php_cli_unavailable', 'runuser_unavailable', 'runner_prepare_failed', 'runner_integrity_failed', 'runner_lock_failed'].includes(code)) return 'wp_inventory.error_policy';
+            if (code === 'site_changed_during_collection') return 'wp_inventory.error_site_changed';
+            if (code === 'inventory_worker_repeated_crash') return 'wp_inventory.error_worker';
+            return 'wp_inventory.error_unknown';
+        },
+        errorMessage(error) {
+            return t(this.errorKey(error));
+        },
+        retryUselessCodes: ['memory_limit_exhausted', 'runner_policy_mismatch', 'inventory_limit_exceeded', 'stdout_limit_exceeded', 'stderr_limit_exceeded', 'protocol_limit_exceeded', 'wordpress_bootstrap_failed', 'runner_start_failed', 'unsupported_platform', 'invalid_site', 'invalid_site_path', 'site_user_unavailable', 'insufficient_privileges', 'php_cli_unavailable', 'runuser_unavailable', 'runner_prepare_failed', 'runner_integrity_failed', 'runner_lock_failed'],
+        retryHintKey(error) {
+            const code = error?.code || '';
+            return this.retryUselessCodes.includes(code) ? 'wp_inventory.retry_useless' : 'wp_inventory.retry_hint';
+        },
+        displayTime(value) {
+            return value ? fmtTime(value) : t('wp_inventory.never');
+        },
+        isSummary(value) {
+            return value && typeof value === 'object' && value.site_id === this.siteID && typeof value.update_checks_disabled === 'boolean' && typeof value.collection_status === 'string' && typeof value.has_successful_inventory === 'boolean' && value.wordpress && typeof value.wordpress === 'object' && value.counts && typeof value.counts === 'object' && (!value.active_task || (typeof value.active_task.id === 'string' && ['queued', 'running'].includes(value.active_task.status)));
+        },
+        async loadSummary() {
+            if (!this.siteID || this.summaryLoading) return;
+            const generation = this.requestGeneration;
+            const siteID = this.siteID;
+            this.summaryLoading = true;
+            this.summaryError = '';
+            try {
+                const response = await api('/websites/' + siteID + '/wp-inventory', { suppressToast: true });
+                if (generation !== this.requestGeneration || siteID !== this.siteID) return;
+                if (!this.isSummary(response.data)) throw new Error(t('wp_inventory.load_failed'));
+                this.summary = response.data;
+                if (this.summary.active_task) this.startPolling(this.summary.active_task);
+                if (this.summary.has_successful_inventory && !this.currentPage().loaded) await this.loadPage(this.activeTab);
+            } catch (error) {
+                if (generation === this.requestGeneration && siteID === this.siteID) this.summaryError = error.message || t('wp_inventory.load_failed');
+            } finally {
+                if (generation === this.requestGeneration && siteID === this.siteID) this.summaryLoading = false;
+            }
+        },
+        async refreshInventory() {
+            if (!this.siteID || !this.summary || this.refreshing || this.hasActiveTask()) return;
+            const generation = this.requestGeneration;
+            const siteID = this.siteID;
+            this.refreshing = true;
+            try {
+                const response = await api('/websites/' + siteID + '/wp-inventory/refresh', { method: 'POST', suppressToast: true });
+                if (generation !== this.requestGeneration || siteID !== this.siteID) return;
+                const task = response.data?.task;
+                if (!task || typeof task.id !== 'string' || task.site_id !== siteID || !['queued', 'running'].includes(task.status)) throw new Error(t('wp_inventory.load_failed'));
+                this.summary.active_task = task;
+                this.summaryError = '';
+                showToast(t(response.data.created ? 'wp_inventory.refresh_created' : 'wp_inventory.refresh_existing'), 'success');
+                this.startPolling(task);
+            } catch (error) {
+                if (generation === this.requestGeneration && siteID === this.siteID) showToast(error.message || t('wp_inventory.refresh_failed'), 'error');
+            } finally {
+                if (generation === this.requestGeneration && siteID === this.siteID) this.refreshing = false;
+            }
+        },
+        pollDelay(elapsed) {
+            return elapsed < 30000 ? 2000 : 5000;
+        },
+        startPolling(task) {
+            if (!task || !['queued', 'running'].includes(task.status)) return;
+            this.stopPolling();
+            this.pollStartedAt = Date.now();
+            this.schedulePoll(task.id, this.pollDelay(0));
+        },
+        schedulePoll(taskID, delay) {
+            this.stopPolling();
+            this.pollTimer = setTimeout(() => {
+                this.pollTimer = null;
+                this.pollTask(taskID);
+            }, delay);
+        },
+        stopPolling() {
+            if (this.pollTimer !== null) clearTimeout(this.pollTimer);
+            this.pollTimer = null;
+        },
+        async pollTask(taskID) {
+            const generation = this.requestGeneration;
+            const siteID = this.siteID;
+            if (!siteID || !taskID) return;
+            try {
+                const response = await api('/websites/' + siteID + '/wp-inventory/tasks/' + encodeURIComponent(taskID), { suppressToast: true });
+                if (generation !== this.requestGeneration || siteID !== this.siteID) return;
+                const task = response.data;
+                if (!task || task.id !== taskID || task.site_id !== siteID) throw new Error(t('wp_inventory.task_read_failed'));
+                if (task.status === 'queued' || task.status === 'running') {
+                    this.summary.active_task = task;
+                    this.summaryError = '';
+                    this.schedulePoll(taskID, this.pollDelay(Date.now() - this.pollStartedAt));
+                    return;
+                }
+                if (task.status === 'succeeded' || task.status === 'failed') {
+                    this.stopPolling();
+                    this.summary.active_task = null;
+                    this.invalidatePages();
+                    await this.loadSummary();
+                    return;
+                }
+                this.stopPolling();
+                this.summary.active_task = null;
+                this.summaryError = t('wp_inventory.task_read_failed');
+            } catch (error) {
+                if (generation !== this.requestGeneration || siteID !== this.siteID) return;
+                this.summaryError = t('wp_inventory.task_read_failed');
+                this.schedulePoll(taskID, 5000);
+            }
+        },
+        currentPage() {
+            return this.pages[this.activeTab];
+        },
+        selectTab(tab) {
+            if (!['plugins', 'themes', 'updates', 'backups', 'logs'].includes(tab) || tab === this.activeTab) return;
+            this.activeTab = tab;
+            if (!this.currentPage().loaded) this.loadPage(tab);
+        },
+        pagePath(tab) {
+            return tab === 'updates' ? 'updates' : 'components';
+        },
+        pageType(tab) {
+            if (tab === 'plugins') return 'plugin';
+            if (tab === 'themes') return 'theme';
+            return '';
+        },
+        validPageData(value) {
+            return value && Array.isArray(value.items) && Number.isInteger(value.total) && value.total >= 0 && Number.isInteger(value.page) && value.page > 0 && Number.isInteger(value.page_size) && value.page_size > 0 && value.page_size <= 100;
+        },
+        async loadPage(tab, requestedPage) {
+            const state = this.pages[tab];
+            if (!this.siteID || !state || state.loading || !this.summary?.has_successful_inventory) return;
+            if (tab === 'backups') {
+                await this.loadUpdateBackups();
+                return;
+            }
+            if (tab === 'logs') {
+                await this.loadUpdateLogs();
+                return;
+            }
+            const generation = this.requestGeneration;
+            const siteID = this.siteID;
+            const page = requestedPage || state.page;
+            const params = new URLSearchParams();
+            params.set('page', String(page));
+            params.set('page_size', String(state.pageSize));
+            const type = this.pageType(tab);
+            if (type) params.set('type', type);
+            state.loading = true;
+            state.error = '';
+            try {
+                const response = await api('/websites/' + siteID + '/wp-inventory/' + this.pagePath(tab) + '?' + params.toString(), { suppressToast: true });
+                if (generation !== this.requestGeneration || siteID !== this.siteID) return;
+                if (!this.validPageData(response.data)) throw new Error(t('wp_inventory.load_failed'));
+                state.items = response.data.items;
+                state.total = response.data.total;
+                state.page = response.data.page;
+                state.pageSize = response.data.page_size;
+                state.loaded = true;
+            } catch (error) {
+                if (generation === this.requestGeneration && siteID === this.siteID) state.error = error.message || t('wp_inventory.load_failed');
+            } finally {
+                if (generation === this.requestGeneration && siteID === this.siteID) state.loading = false;
+            }
+        },
+        changePage(direction) {
+            const state = this.currentPage();
+            const next = state.page + direction;
+            if (state.loading || next < 1 || (direction > 0 && state.page * state.pageSize >= state.total)) return;
+            this.loadPage(this.activeTab, next);
+        },
+        invalidatePages() {
+            Object.values(this.pages).forEach(page => {
+                page.page = 1;
+                page.loaded = false;
+                page.error = '';
+            });
+        },
+        async loadUpdateBackups() {
+            const state = this.pages.backups;
+            if (!this.siteID || state.loading) return;
+            const generation = this.requestGeneration;
+            const siteID = this.siteID;
+            state.loading = true;
+            state.error = '';
+            try {
+                const response = await api('/websites/' + siteID + '/wp-update-backups', { suppressToast: true });
+                if (generation !== this.requestGeneration || siteID !== this.siteID) return;
+                if (!Array.isArray(response.data)) throw new Error(t('wp_update_backup.load_failed'));
+                state.items = response.data;
+                state.total = response.data.length;
+                state.loaded = true;
+            } catch (error) {
+                if (generation === this.requestGeneration && siteID === this.siteID) state.error = error.message || t('wp_update_backup.load_failed');
+            } finally {
+                if (generation === this.requestGeneration && siteID === this.siteID) state.loading = false;
+            }
+        },
+        backupKindText(kind) {
+            const keys = {
+                database: 'wp_update_backup.kind_database',
+                core_files: 'wp_update_backup.kind_core_files',
+                plugin_files: 'wp_update_backup.kind_plugin_files',
+                theme_files: 'wp_update_backup.kind_theme_files',
+            };
+            return t(keys[kind] || 'common.none');
+        },
+        async loadUpdateLogs() {
+            const state = this.pages.logs;
+            if (!this.siteID || state.loading) return;
+            const generation = this.requestGeneration;
+            const siteID = this.siteID;
+            state.loading = true;
+            state.error = '';
+            try {
+                const response = await api('/websites/' + siteID + '/wp-update-logs', { suppressToast: true });
+                if (generation !== this.requestGeneration || siteID !== this.siteID) return;
+                if (!Array.isArray(response.data)) throw new Error(t('wp_update_log.load_failed'));
+                state.items = response.data;
+                state.total = response.data.length;
+                state.loaded = true;
+            } catch (error) {
+                if (generation === this.requestGeneration && siteID === this.siteID) state.error = error.message || t('wp_update_log.load_failed');
+            } finally {
+                if (generation === this.requestGeneration && siteID === this.siteID) state.loading = false;
+            }
+        },
+        logStatusKey(task) {
+            if (task.requires_attention) return 'wp_update_log.requires_attention';
+            if (task.rollback_status === 'failed') return 'wp_update_log.rollback_failed';
+            const map = {
+                success: 'wp_update_log.status_success',
+                failed: 'wp_update_log.status_failed',
+                running: 'wp_update_log.status_running',
+                queued: 'wp_update_log.status_queued',
+                preparing: 'wp_update_log.status_preparing',
+                interrupted_unknown: 'wp_update_log.status_interrupted_unknown',
+            };
+            return map[task.status] || 'common.none';
+        },
+        logStatusText(task) {
+            return t(this.logStatusKey(task));
+        },
+        logStatusClass(task) {
+            const key = this.logStatusKey(task);
+            if (key === 'wp_update_log.status_success') return 'badge-success';
+            if (key === 'wp_update_log.requires_attention' || key === 'wp_update_log.rollback_failed' || key === 'wp_update_log.status_failed') return 'badge-danger';
+            if (key === 'wp_update_log.status_interrupted_unknown') return 'badge-warning';
+            return 'badge-info';
+        },
+        logEventText(ev) {
+            const resultKey = {
+                info: 'wp_update_log.event_result_info',
+                success: 'wp_update_log.event_result_success',
+                failed: 'wp_update_log.event_result_failed',
+                interrupted: 'wp_update_log.event_result_interrupted',
+                manual: 'wp_update_log.event_result_manual',
+            }[ev.result] || ev.result;
+            return fmtTime(ev.created_at) + '  ' + ev.stage + ' · ' + t(resultKey) + (ev.error_code ? ' · ' + ev.error_code : '');
+        },
+        logEventClass(result) {
+            if (result === 'failed') return 'text-red-300';
+            if (result === 'success') return 'text-green-300';
+            if (result === 'interrupted') return 'text-yellow-300';
+            return 'text-gray-300';
+        },
+        async copyUpdateLog(task) {
+            const lines = [];
+            lines.push(t('wp_update_log.copy_title'));
+            if (this.siteURL) lines.push(t('wp_update_log.copy_site') + ': ' + this.siteURL);
+            lines.push(t('wp_update_log.copy_task') + ': ' + task.task_id);
+            lines.push(t('wp_update_log.copy_type') + ': ' + t(task.task_kind === 'rollback' ? 'wp_update_log.kind_rollback' : 'wp_update_log.kind_update') + '  ' + t('wp_update_log.copy_component') + ': ' + task.component_type + '  ' + task.component_key);
+            lines.push(t('wp_update_log.copy_version') + ': ' + (task.current_version || '-') + ' → ' + (task.target_version || '-'));
+            lines.push(t('wp_update_log.copy_status') + ': ' + this.logStatusText(task) + '  ' + t('wp_update_log.copy_rollback') + ': ' + task.rollback_status);
+            lines.push(t('wp_update_log.copy_started') + ': ' + (task.started_at ? fmtTime(task.started_at) : '-') + '  ' + t('wp_update_log.copy_finished') + ': ' + (task.finished_at ? fmtTime(task.finished_at) : '-'));
+            lines.push(t('wp_update_log.copy_events_divider'));
+            if (task.events.length === 0) {
+                lines.push(t('wp_update_log.no_events'));
+            } else {
+                for (const ev of task.events) lines.push(this.logEventText(ev));
+            }
+            try {
+                await navigator.clipboard.writeText(lines.join('\n'));
+                showToast(t('wp_update_log.copied'), 'success');
+            } catch (e) {
+                showToast(t('wp_update_log.copy_failed'), 'error');
+            }
+        },
+        async restoreUpdateBackup(backup) {
+            const state = this.pages.backups;
+            if (!this.siteID || state.restoringID !== null || !backup?.restore_allowed) return;
+            const confirmKey = backup.batch_shared ? 'wp_update_backup.restore_batch_confirm' : 'wp_update_backup.restore_confirm';
+            const accepted = await confirmModal(t(confirmKey, { time: fmtTime(backup.created_at) }));
+            if (!accepted) return;
+            const generation = this.requestGeneration;
+            const siteID = this.siteID;
+            state.restoringID = backup.backup_id;
+            state.error = '';
+            try {
+                const response = await api('/websites/' + siteID + '/wp-update-backups/' + encodeURIComponent(backup.backup_id) + '/restore', {
+                    method: 'POST', suppressToast: true, body: { confirm: true }
+                });
+                if (generation !== this.requestGeneration || siteID !== this.siteID) return;
+                const taskID = response.data?.task_id;
+                if (typeof taskID !== 'string' || taskID === '') throw new Error(t('wp_update_backup.restore_failed'));
+                showToast(t('wp_update_backup.restore_started'), 'success');
+                this.pollUpdateBackupRestore(taskID, generation, siteID);
+            } catch (error) {
+                if (generation === this.requestGeneration && siteID === this.siteID) {
+                    state.error = error.message || t('wp_update_backup.restore_failed');
+                    state.restoringID = null;
+                }
+            }
+        },
+        async pollUpdateBackupRestore(taskID, generation, siteID) {
+            if (generation !== this.requestGeneration || siteID !== this.siteID) return;
+            try {
+                const response = await api('/websites/' + siteID + '/backups/restore-tasks/' + encodeURIComponent(taskID), { suppressToast: true });
+                if (generation !== this.requestGeneration || siteID !== this.siteID) return;
+                const status = response.data?.status;
+                if (status === 'waiting' || status === 'running') {
+                    this.backupRestoreTimer = setTimeout(() => {
+                        this.backupRestoreTimer = null;
+                        this.pollUpdateBackupRestore(taskID, generation, siteID);
+                    }, 1500);
+                    return;
+                }
+                this.pages.backups.restoringID = null;
+                if (response.data?.success) {
+                    showToast(t('wp_update_backup.restore_success'), 'success');
+                } else {
+                    this.pages.backups.error = response.data?.message || t('wp_update_backup.restore_task_failed');
+                }
+            } catch (error) {
+                if (generation !== this.requestGeneration || siteID !== this.siteID) return;
+                this.pages.backups.error = error.message || t('wp_update_backup.restore_status_failed');
+                this.backupRestoreTimer = setTimeout(() => {
+                    this.backupRestoreTimer = null;
+                    this.pollUpdateBackupRestore(taskID, generation, siteID);
+                }, 3000);
+            }
+        },
+        stopBackupRestorePolling() {
+            if (this.backupRestoreTimer !== null) clearTimeout(this.backupRestoreTimer);
+            this.backupRestoreTimer = null;
+        },
+        canUpdatePlugin(item) {
+            return item?.type === 'plugin' &&
+                typeof item.key === 'string' &&
+                /^[a-z0-9]+(?:-[a-z0-9]+)*\/[A-Za-z0-9][A-Za-z0-9._-]*\.php$/.test(item.key) &&
+                typeof item.current_version === 'string' && item.current_version !== '' &&
+                typeof item.target_version === 'string' && item.target_version !== '';
+        },
+        canUpdateComponent(item) {
+            if (this.canUpdatePlugin(item)) return true;
+            return item?.type === 'theme' && typeof item.key === 'string' &&
+                /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(item.key) &&
+                typeof item.current_version === 'string' && item.current_version !== '' &&
+                typeof item.target_version === 'string' && item.target_version !== '';
+        },
+        componentUpdateText(pluginKey, themeKey, componentType = '') {
+            return t((componentType || this.pluginUpdate.componentType) === 'theme' ? themeKey : pluginKey);
+        },
+        componentUpdateAPI() {
+            return this.pluginUpdate.componentType === 'theme' ? 'wp-theme-update' : 'wp-plugin-update';
+        },
+        validPluginPreview(value) {
+            const common = value && value.available === true && value.site_id === this.siteID &&
+                value.component_key === this.pluginUpdate.componentKey &&
+                typeof value.current_version === 'string' && value.current_version !== '' &&
+                typeof value.target_version === 'string' && value.target_version !== '' &&
+                typeof value.confirmation_token === 'string' && value.confirmation_token !== '' &&
+                value.package_source === 'wordpress.org' &&
+                value.verification_required === 'structure_only' &&
+                value.database_backup === true &&
+                (!value.recent_database_backup ||
+                    (Number.isInteger(value.recent_database_backup.backup_id) && value.recent_database_backup.backup_id > 0 &&
+                     typeof value.recent_database_backup.created_at === 'string'));
+            if (!common) return false;
+            if (this.pluginUpdate.componentType === 'theme') {
+                return value.theme_files_backup === true && typeof value.current_theme === 'boolean' &&
+                    typeof value.template === 'string' &&
+                    (!value.current_theme || (typeof value.risk_token === 'string' && value.risk_token !== ''));
+            }
+            return value.plugin_files_backup === true;
+        },
+        validPluginTask(value) {
+            return value && typeof value.task_id === 'string' && value.task_id !== '' &&
+                value.site_id === this.siteID && value.component_type === this.pluginUpdate.componentType &&
+                value.component_key === this.pluginUpdate.componentKey && value.task_kind === 'update' &&
+                ['preparing', 'queued', 'running', 'success', 'failed', 'interrupted_unknown'].includes(value.status) &&
+                (!value.database_backup_mode || ['fresh', 'reuse'].includes(value.database_backup_mode));
+        },
+        pluginTaskActive() {
+            return ['preparing', 'queued', 'running'].includes(this.pluginUpdate.task?.status);
+        },
+        async openPluginUpdate(item) {
+            if (!this.siteID || !this.canUpdateComponent(item) || this.pluginUpdate.loading || this.pluginUpdate.submitting) return;
+            if (this.pluginTaskActive()) {
+                if (this.pluginUpdate.componentKey === item.key) this.pluginUpdate.open = true;
+                return;
+            }
+            this.stopPluginPolling();
+            this.pluginUpdate = newPluginUpdate();
+            this.pluginUpdate.open = true;
+            this.pluginUpdate.loading = true;
+            this.pluginUpdate.componentType = item.type;
+            this.pluginUpdate.componentKey = item.key;
+            const generation = this.requestGeneration;
+            const siteID = this.siteID;
+            try {
+                const response = await api('/websites/' + siteID + '/' + this.componentUpdateAPI() + '/preview?component_key=' + encodeURIComponent(item.key), { suppressToast: true, timeout: 30000 });
+                if (generation !== this.requestGeneration || siteID !== this.siteID || item.key !== this.pluginUpdate.componentKey) return;
+                if (!this.validPluginPreview(response.data)) throw new Error(this.componentUpdateText('wp_plugin_update.preview_invalid', 'wp_theme_update.preview_invalid'));
+                this.pluginUpdate.preview = response.data;
+            } catch (error) {
+                if (generation !== this.requestGeneration || siteID !== this.siteID || item.key !== this.pluginUpdate.componentKey) return;
+                if (error?.status === 409 && await this.loadLatestPluginTask(item.key)) {
+                    this.pluginUpdate.error = '';
+                } else {
+                    this.pluginUpdate.error = error.message || this.componentUpdateText('wp_plugin_update.preview_failed', 'wp_theme_update.preview_failed');
+                }
+            } finally {
+                if (generation === this.requestGeneration && siteID === this.siteID && item.key === this.pluginUpdate.componentKey) this.pluginUpdate.loading = false;
+            }
+        },
+        closePluginUpdate() {
+            if (this.pluginUpdate.submitting) return;
+            if (this.pluginTaskActive()) {
+                this.pluginUpdate.open = false;
+                return;
+            }
+            this.stopPluginPolling();
+            this.pluginUpdate = newPluginUpdate();
+        },
+        cancelPluginPreparation() {
+            if (!this.pluginUpdate.preparationController) return;
+            this.pluginUpdate.preparationCancelled = true;
+            this.pluginUpdate.preparationController.abort();
+        },
+        async confirmPluginUpdate() {
+            const preview = this.pluginUpdate.preview;
+            if (!this.siteID || !this.validPluginPreview(preview) || this.pluginUpdate.submitting ||
+                (preview.current_theme && !this.pluginUpdate.riskAccepted)) return;
+            const generation = this.requestGeneration;
+            const siteID = this.siteID;
+            const componentKey = this.pluginUpdate.componentKey;
+            const expected = {
+                componentKey,
+                currentVersion: preview.current_version,
+                targetVersion: preview.target_version,
+                since: Date.now(),
+                previousTaskID: this.pluginUpdate.task?.task_id || ''
+            };
+            this.pluginUpdate.submitting = true;
+            this.pluginUpdate.preparationController = new AbortController();
+            this.pluginUpdate.error = '';
+            try {
+                const body = {
+                    component_key: componentKey,
+                    confirmation_token: preview.confirmation_token,
+                    target_version: preview.target_version,
+                    database_backup_mode: this.pluginUpdate.databaseBackupMode,
+                    confirm: true
+                };
+                if (this.pluginUpdate.componentType === 'theme') body.risk_token = preview.risk_token || '';
+                const response = await api('/websites/' + siteID + '/' + this.componentUpdateAPI() + '/confirm', {
+                    method: 'POST',
+                    suppressToast: true,
+                    timeout: 30 * 60 * 1000,
+                    signal: this.pluginUpdate.preparationController.signal,
+                    body
+                });
+                if (generation !== this.requestGeneration || siteID !== this.siteID || componentKey !== this.pluginUpdate.componentKey) return;
+                if (!this.validPluginTask(response.data) || response.data.status !== 'queued') throw new Error(this.componentUpdateText('wp_plugin_update.task_invalid', 'wp_theme_update.task_invalid'));
+                this.pluginUpdate.task = response.data;
+                this.pluginUpdate.preview = null;
+                showToast(this.componentUpdateText('wp_plugin_update.submitted', 'wp_theme_update.submitted'), 'success');
+                this.startPluginPolling();
+            } catch (error) {
+                if (generation !== this.requestGeneration || siteID !== this.siteID || componentKey !== this.pluginUpdate.componentKey) return;
+                if (this.pluginUpdate.preparationCancelled) {
+                    this.stopPluginPolling();
+                    this.pluginUpdate = newPluginUpdate();
+                    showToast(t('common.request_cancelled'), 'warning');
+                    return;
+                }
+                const recovered = await this.loadLatestPluginTask(componentKey, expected);
+                if (recovered) {
+                    this.pluginUpdate.preview = null;
+                    this.pluginUpdate.error = '';
+                    showToast(this.componentUpdateText('wp_plugin_update.submission_recovered', 'wp_theme_update.submission_recovered'), 'success');
+                } else {
+                    this.pluginUpdate.error = error.message || this.componentUpdateText('wp_plugin_update.submit_failed', 'wp_theme_update.submit_failed');
+                }
+            } finally {
+                if (generation === this.requestGeneration && siteID === this.siteID && componentKey === this.pluginUpdate.componentKey) {
+                    this.pluginUpdate.submitting = false;
+                    this.pluginUpdate.preparationController = null;
+                }
+            }
+        },
+        async loadLatestPluginTask(componentKey, expected = null) {
+            if (!this.siteID || !componentKey || componentKey !== this.pluginUpdate.componentKey) return false;
+            try {
+                const response = await api('/websites/' + this.siteID + '/' + this.componentUpdateAPI() + '/tasks/latest?component_key=' + encodeURIComponent(componentKey), { suppressToast: true });
+                const task = response.data;
+                if (!this.validPluginTask(task)) return false;
+                if (expected) {
+                    const requestedAt = Date.parse(task.requested_at);
+                    if (task.task_id === expected.previousTaskID ||
+                        task.current_version !== expected.currentVersion ||
+                        task.target_version !== expected.targetVersion ||
+                        !Number.isFinite(requestedAt) || requestedAt < expected.since - 120000) return false;
+                } else if (!['preparing', 'queued', 'running'].includes(task.status)) {
+                    return false;
+                }
+                this.pluginUpdate.task = task;
+                this.pluginUpdate.preview = null;
+                if (this.pluginTaskActive()) this.startPluginPolling();
+                return true;
+            } catch (_) {
+                return false;
+            }
+        },
+        startPluginPolling() {
+            if (!this.pluginTaskActive()) return;
+            this.stopPluginPolling();
+            this.pluginUpdate.pollStartedAt = Date.now();
+            this.schedulePluginPoll(this.pollDelay(0));
+        },
+        schedulePluginPoll(delay) {
+            this.stopPluginPolling();
+            this.pluginPollTimer = setTimeout(() => {
+                this.pluginPollTimer = null;
+                this.pollPluginTask();
+            }, delay);
+        },
+        stopPluginPolling() {
+            if (this.pluginPollTimer !== null) clearTimeout(this.pluginPollTimer);
+            this.pluginPollTimer = null;
+        },
+        async pollPluginTask() {
+            const taskID = this.pluginUpdate.task?.task_id;
+            const componentKey = this.pluginUpdate.componentKey;
+            const generation = this.requestGeneration;
+            const siteID = this.siteID;
+            if (!siteID || !taskID || !componentKey) return;
+            try {
+                const response = await api('/websites/' + siteID + '/' + this.componentUpdateAPI() + '/tasks/' + encodeURIComponent(taskID), { suppressToast: true });
+                if (generation !== this.requestGeneration || siteID !== this.siteID || componentKey !== this.pluginUpdate.componentKey) return;
+                if (!this.validPluginTask(response.data) || response.data.task_id !== taskID) throw new Error(this.componentUpdateText('wp_plugin_update.task_invalid', 'wp_theme_update.task_invalid'));
+                this.pluginUpdate.task = response.data;
+                this.pluginUpdate.error = '';
+                if (this.pluginTaskActive()) {
+                    this.schedulePluginPoll(this.pollDelay(Date.now() - this.pluginUpdate.pollStartedAt));
+                    return;
+                }
+                this.stopPluginPolling();
+                if (response.data.status === 'success') {
+                    this.invalidatePages();
+                    await this.loadSummary();
+                }
+            } catch (error) {
+                if (generation !== this.requestGeneration || siteID !== this.siteID || componentKey !== this.pluginUpdate.componentKey) return;
+                if (error?.status === 404) {
+                    this.stopPluginPolling();
+                    this.pluginUpdate.task = null;
+                    this.pluginUpdate.error = this.componentUpdateText('wp_plugin_update.not_found', 'wp_theme_update.not_found');
+                    return;
+                }
+                this.pluginUpdate.error = this.componentUpdateText('wp_plugin_update.task_read_failed', 'wp_theme_update.task_read_failed');
+                this.schedulePluginPoll(5000);
+            }
+        },
+        pluginTaskStatusText() {
+            const status = this.pluginUpdate.task?.status;
+            if (status === 'preparing') return this.componentUpdateText('wp_plugin_update.status_preparing', 'wp_theme_update.status_preparing');
+            if (status === 'queued') return this.componentUpdateText('wp_plugin_update.status_queued', 'wp_theme_update.status_queued');
+            if (status === 'running') return this.componentUpdateText('wp_plugin_update.status_running', 'wp_theme_update.status_running');
+            if (status === 'success') return this.componentUpdateText('wp_plugin_update.status_success', 'wp_theme_update.status_success');
+            if (status === 'failed') return this.componentUpdateText('wp_plugin_update.status_failed', 'wp_theme_update.status_failed');
+            if (status === 'interrupted_unknown') return this.componentUpdateText('wp_plugin_update.status_interrupted_unknown', 'wp_theme_update.status_interrupted_unknown');
+            return this.componentUpdateText('wp_plugin_update.status_unknown', 'wp_theme_update.status_unknown');
+        },
+        pluginTaskStageText() {
+            const stage = this.pluginUpdate.task?.stage || 'unknown';
+            if (stage === 'queued') return this.componentUpdateText('wp_plugin_update.stage_queued', 'wp_theme_update.stage_queued');
+            if (stage === 'claimed') return this.componentUpdateText('wp_plugin_update.stage_claimed', 'wp_theme_update.stage_claimed');
+            if (stage === 'backups_ready') return this.componentUpdateText('wp_plugin_update.stage_backups_ready', 'wp_theme_update.stage_backups_ready');
+            if (stage === 'unlocking') return this.componentUpdateText('wp_plugin_update.stage_unlocking', 'wp_theme_update.stage_unlocking');
+            if (stage === 'updating_component') return this.componentUpdateText('wp_plugin_update.stage_updating_component', 'wp_theme_update.stage_updating_component');
+            if (stage === 'reactivating') return this.componentUpdateText('wp_plugin_update.stage_reactivating', 'wp_theme_update.stage_reactivating');
+            if (stage === 'health_check') return this.componentUpdateText('wp_plugin_update.stage_health_check', 'wp_theme_update.stage_health_check');
+            if (stage === 'rollback') return this.componentUpdateText('wp_plugin_update.stage_rollback', 'wp_theme_update.stage_rollback');
+            if (stage === 'restoring_file_lock') return this.componentUpdateText('wp_plugin_update.stage_restoring_file_lock', 'wp_theme_update.stage_restoring_file_lock');
+            if (stage === 'complete') return this.componentUpdateText('wp_plugin_update.stage_complete', 'wp_theme_update.stage_complete');
+            return this.componentUpdateText('wp_plugin_update.stage_unknown', 'wp_theme_update.stage_unknown');
+        },
+        pluginTaskNoticeClass() {
+            const status = this.pluginUpdate.task?.status;
+            if (status === 'success') return 'border-green-800 bg-green-950/30 text-green-200';
+            if (status === 'failed' || status === 'interrupted_unknown') return 'border-red-800 bg-red-950/30 text-red-200';
+            return 'border-blue-800 bg-blue-950/30 text-blue-200';
+        },
+        typeLabel(type) {
+            if (type === 'core') return t('wp_inventory.type_core');
+            if (type === 'plugin') return t('wp_inventory.type_plugin');
+            if (type === 'theme') return t('wp_inventory.type_theme');
+            return t('wp_inventory.error_generic');
+        },
+        validPluginBatch(value) {
+            return value && typeof value.batch_id === 'string' && value.batch_id !== '' && value.site_id === this.siteID &&
+                ['running', 'completed'].includes(value.status) && Array.isArray(value.items);
+        },
+        async checkActivePluginBatch() {
+            if (!this.siteID) return;
+            const generation = this.requestGeneration;
+            const siteID = this.siteID;
+            try {
+                const response = await api('/websites/' + siteID + '/wp-plugin-batch', { suppressToast: true });
+                if (generation !== this.requestGeneration || siteID !== this.siteID) return;
+                const running = Array.isArray(response.data) ? response.data.find(b => b.status === 'running') : null;
+                this.pluginBatch.activeBatchID = running && typeof running.batch_id === 'string' ? running.batch_id : '';
+            } catch (_) {
+                // 静默失败：这只是恢复「查看批量进度」按钮的可见性，不影响其他功能。
+            }
+        },
+        pluginBatchSelectableItems() {
+            return this.pages.updates.items.filter(item => this.canUpdatePlugin(item));
+        },
+        openPluginBatchSelect() {
+            if (!this.siteID || this.pluginTaskActive()) return;
+            const pluginItems = this.pluginBatchSelectableItems();
+            const hasThemeUpdates = this.pages.updates.items.some(item => item.type === 'theme');
+            if (pluginItems.length === 0 && hasThemeUpdates) {
+                alertModal(t('wp_plugin_batch.theme_not_supported'));
+                return;
+            }
+            this.pluginBatch = newPluginBatch();
+            this.pluginBatch.mode = 'select';
+        },
+        togglePluginBatchItem(key) {
+            if (this.pluginBatch.selected.has(key)) this.pluginBatch.selected.delete(key);
+            else this.pluginBatch.selected.add(key);
+        },
+        pluginBatchSelectAll() {
+            this.pluginBatch.selected = new Set(this.pluginBatchSelectableItems().map(item => item.key));
+        },
+        pluginBatchSelectClear() {
+            this.pluginBatch.selected = new Set();
+        },
+        closePluginBatch() {
+            if (this.pluginBatch.submitting) return;
+            const activeBatchID = this.pluginBatch.activeBatchID;
+            this.stopPluginBatchPolling();
+            this.pluginBatch = newPluginBatch();
+            this.pluginBatch.activeBatchID = activeBatchID;
+        },
+        async submitPluginBatch() {
+            if (!this.siteID || this.pluginBatch.submitting || this.pluginBatch.selected.size === 0) return;
+            const generation = this.requestGeneration;
+            const siteID = this.siteID;
+            this.pluginBatch.submitting = true;
+            this.pluginBatch.error = '';
+            try {
+                const response = await api('/websites/' + siteID + '/wp-plugin-batch', {
+                    method: 'POST', suppressToast: true,
+                    body: { component_keys: Array.from(this.pluginBatch.selected) },
+                });
+                if (generation !== this.requestGeneration || siteID !== this.siteID) return;
+                if (!this.validPluginBatch(response.data)) throw new Error(t('wp_plugin_batch.start_invalid'));
+                showToast(t('wp_plugin_batch.start'), 'success');
+                this.pluginBatch = newPluginBatch();
+                this.pluginBatch.activeBatchID = response.data.batch_id;
+                this.pluginBatch.mode = 'progress';
+                this.pluginBatch.batch = response.data;
+                this.startPluginBatchPolling();
+            } catch (error) {
+                if (generation !== this.requestGeneration || siteID !== this.siteID) return;
+                this.pluginBatch.error = error.message || t('wp_plugin_batch.start_failed');
+            } finally {
+                if (generation === this.requestGeneration && siteID === this.siteID) this.pluginBatch.submitting = false;
+            }
+        },
+        async openPluginBatchProgress() {
+            if (!this.siteID || !this.pluginBatch.activeBatchID) return;
+            const batchID = this.pluginBatch.activeBatchID;
+            this.pluginBatch.mode = 'progress';
+            this.pluginBatch.error = '';
+            await this.pollPluginBatch(batchID, true);
+        },
+        startPluginBatchPolling() {
+            this.stopPluginBatchPolling();
+            this.pluginBatch.pollStartedAt = Date.now();
+            this.schedulePluginBatchPoll(this.pollDelay(0));
+        },
+        schedulePluginBatchPoll(delay) {
+            this.stopPluginBatchPolling();
+            this.pluginBatch.pollTimer = setTimeout(() => {
+                this.pluginBatch.pollTimer = null;
+                this.pollPluginBatch(this.pluginBatch.activeBatchID, false);
+            }, delay);
+        },
+        stopPluginBatchPolling() {
+            if (this.pluginBatch.pollTimer !== null) clearTimeout(this.pluginBatch.pollTimer);
+            this.pluginBatch.pollTimer = null;
+        },
+        async pollPluginBatch(batchID, immediate) {
+            const generation = this.requestGeneration;
+            const siteID = this.siteID;
+            if (!siteID || !batchID) return;
+            try {
+                const response = await api('/websites/' + siteID + '/wp-plugin-batch/' + encodeURIComponent(batchID), { suppressToast: true });
+                if (generation !== this.requestGeneration || siteID !== this.siteID) return;
+                if (!this.validPluginBatch(response.data) || response.data.batch_id !== batchID) throw new Error(t('wp_plugin_batch.task_invalid'));
+                this.pluginBatch.batch = response.data;
+                this.pluginBatch.error = '';
+                if (response.data.status === 'completed') {
+                    this.stopPluginBatchPolling();
+                    this.pluginBatch.activeBatchID = '';
+                    this.pages.plugins.loaded = false;
+                    this.pages.updates.loaded = false;
+                    this.pages.backups.loaded = false;
+                    await this.loadSummary();
+                    return;
+                }
+                if (!immediate) this.schedulePluginBatchPoll(this.pollDelay(Date.now() - this.pluginBatch.pollStartedAt));
+                else this.startPluginBatchPolling();
+            } catch (error) {
+                if (generation !== this.requestGeneration || siteID !== this.siteID) return;
+                this.pluginBatch.error = error.message || t('wp_plugin_batch.load_failed');
+                this.schedulePluginBatchPoll(5000);
+            }
+        },
+        // 一个已派发的项需要人工决定，覆盖两种情况：更新失败挂起（或人工回滚本身也失败了，
+        // 只要 requires_attention 还是 1 就还没有处置结果）；或者 runner 执行结果不确定
+        // （interrupted_unknown 且 task_manual_disposition 还是空，说明还没有人确认过）。
+        pluginBatchItemNeedsDecision(item) {
+            if (item?.status !== 'dispatched') return false;
+            if (item.task_status === 'failed') return item.task_requires_attention === true;
+            if (item.task_status === 'interrupted_unknown') return !item.task_manual_disposition;
+            return false;
+        },
+        // interrupted_unknown 不允许回滚：执行结果本身不确定，贸然恢复文件/数据库可能
+        // 覆盖掉一次其实已经成功的更新，只能选择「忽略」去后台自行核实。
+        pluginBatchItemCanRollback(item) {
+            return item?.task_status === 'failed';
+        },
+        pluginBatchStageText(stage) {
+            if (stage === 'queued') return t('wp_plugin_update.stage_queued');
+            if (stage === 'claimed') return t('wp_plugin_update.stage_claimed');
+            if (stage === 'backups_ready') return t('wp_plugin_update.stage_backups_ready');
+            if (stage === 'unlocking') return t('wp_plugin_update.stage_unlocking');
+            if (stage === 'updating_component') return t('wp_plugin_update.stage_updating_component');
+            if (stage === 'reactivating') return t('wp_plugin_update.stage_reactivating');
+            if (stage === 'health_check') return t('wp_plugin_update.stage_health_check');
+            if (stage === 'rollback') return t('wp_plugin_update.stage_rollback');
+            if (stage === 'restoring_file_lock') return t('wp_plugin_update.stage_restoring_file_lock');
+            if (stage === 'complete') return t('wp_plugin_update.stage_complete');
+            return t('wp_plugin_update.stage_unknown');
+        },
+        pluginBatchItemText(item) {
+            if (item.status === 'pending') return t('wp_plugin_batch.item_pending');
+            if (item.status === 'failed') return t('wp_plugin_batch.item_dispatch_failed', { message: item.message || '' });
+            if (['preparing', 'queued', 'running'].includes(item.task_status)) {
+                if (item.task_stage) return t('wp_plugin_update.stage_value', { stage: this.pluginBatchStageText(item.task_stage) });
+                return t('wp_plugin_batch.item_updating');
+            }
+            if (item.task_status === 'success') return t('wp_plugin_batch.item_success');
+            if (item.task_status === 'interrupted_unknown') {
+                return item.task_manual_disposition ? t('wp_plugin_batch.item_interrupted_acknowledged') : t('wp_plugin_batch.item_interrupted');
+            }
+            if (item.task_status === 'failed') {
+                if (this.pluginBatchItemNeedsDecision(item)) return t('wp_plugin_batch.item_failed_awaiting_decision');
+                if (item.task_rollback_status === 'success') return t('wp_plugin_batch.item_failed_rolled_back');
+                if (item.task_rollback_status === 'failed') return t('wp_plugin_batch.item_failed_rollback_failed');
+                return t('wp_plugin_batch.item_failed_generic');
+            }
+            return t('wp_plugin_batch.item_pending');
+        },
+        pluginBatchItemClass(item) {
+            if (item.status === 'failed' || item.task_status === 'failed' || item.task_status === 'interrupted_unknown') return 'text-red-300';
+            if (item.task_status === 'success') return 'text-green-300';
+            if (['preparing', 'queued', 'running'].includes(item.task_status)) return 'text-blue-300';
+            return 'text-gray-400';
+        },
+        async rollbackPluginBatchItem(item) {
+            if (!this.siteID || !item?.task_id || this.pluginBatch.decidingTaskID) return;
+            const confirmKey = item.database_backup_mode === 'reuse' ? 'wp_plugin_batch.rollback_reuse_confirm' : 'wp_plugin_batch.rollback_confirm';
+            const accepted = await confirmModal(t(confirmKey));
+            if (!accepted) return;
+            const generation = this.requestGeneration;
+            const siteID = this.siteID;
+            const batchID = this.pluginBatch.activeBatchID;
+            this.pluginBatch.decidingTaskID = item.task_id;
+            try {
+                await api('/websites/' + siteID + '/wp-plugin-batch/tasks/' + encodeURIComponent(item.task_id) + '/rollback', { method: 'POST', suppressToast: true });
+                if (generation !== this.requestGeneration || siteID !== this.siteID) return;
+                showToast(t('wp_plugin_batch.rollback_success'), 'success');
+                await this.pollPluginBatch(batchID, true);
+            } catch (error) {
+                if (generation !== this.requestGeneration || siteID !== this.siteID) return;
+                showToast(error.message || t('wp_plugin_batch.rollback_failed'), 'error');
+            } finally {
+                if (generation === this.requestGeneration && siteID === this.siteID) this.pluginBatch.decidingTaskID = null;
+            }
+        },
+        async ignorePluginBatchItem(item) {
+            if (!this.siteID || !item?.task_id || this.pluginBatch.decidingTaskID) return;
+            const accepted = await confirmModal(t('wp_plugin_batch.ignore_confirm'));
+            if (!accepted) return;
+            const generation = this.requestGeneration;
+            const siteID = this.siteID;
+            const batchID = this.pluginBatch.activeBatchID;
+            this.pluginBatch.decidingTaskID = item.task_id;
+            try {
+                await api('/websites/' + siteID + '/wp-plugin-batch/tasks/' + encodeURIComponent(item.task_id) + '/ignore', { method: 'POST', suppressToast: true });
+                if (generation !== this.requestGeneration || siteID !== this.siteID) return;
+                showToast(t('wp_plugin_batch.ignore_success'), 'success');
+                await this.pollPluginBatch(batchID, true);
+            } catch (error) {
+                if (generation !== this.requestGeneration || siteID !== this.siteID) return;
+                showToast(error.message || t('wp_plugin_batch.ignore_failed'), 'error');
+            } finally {
+                if (generation === this.requestGeneration && siteID === this.siteID) this.pluginBatch.decidingTaskID = null;
+            }
+        }
+    };
+}
+</script>
+{{end}}

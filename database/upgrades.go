@@ -1,0 +1,1348 @@
+// Package database — 版本升级机制说明
+//
+// 两个文件的分工：
+//
+//   - migrations.go   全量建表 + 种子数据，给全新安装用，始终代表数据库的最新状态。
+//                     每次启动都会完整执行一遍（依赖 IF NOT EXISTS / OR IGNORE 保证幂等）。
+//   - upgrades.go     增量升级步骤，给老版本升级用。仅在版本落后时顺序执行。
+//
+// 数据库变更流程：
+//
+//   1. 在 migrations.go 对应位置添加 CREATE / INSERT 语句（新装用）。
+//   2. 在 upgrades.go 末尾追加 Upgrade 条目（升级用）。
+//   3. 升级条目永久保留，严禁删除。用户可能跨多个版本升级，删除升级条目会导致
+//      老版本跳过必要的 ALTER TABLE 等增量迁移。
+//
+// 运行时逻辑（main.go 启动 → database.Open → RunMigrations → RunUpgrades）：
+//
+//   新装：  migrations 创建全部表 + 种子 → upgrades 发现版本表为空 → 跳过所有升级 → 写入最新版本号
+//   升级：  migrations 幂等执行（无实际变化）→ upgrades 发现版本落后 → 逐条执行缺失的升级 → 更新版本号
+//   已最新：migrations 幂等执行 → upgrades 发现版本已是最新 → 跳过
+//
+// 版本号约定：
+//   使用语义化版本号（如 "1.0.0"），与 Git tag 保持一致。LatestVersion() 返回 upgrades 列表中
+//   最后一条的版本号（列表为空时返回 "1.0.0"），即当前代码所代表的数据库版本。
+
+package database
+
+import (
+	"database/sql"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/zangwp/yub-wpanel/config"
+)
+
+// Upgrade 定义一次版本升级需要执行的数据库变更。
+// SQL 中的语句应使用 IF NOT EXISTS / OR IGNORE 等幂等写法，确保重复执行安全。
+// Func 为可选的 Go 代码迁移，在 SQL 之后执行，用于文件系统清理等非数据库操作。
+type Upgrade struct {
+	Version     string       // 目标版本号，如 "1.0.0"
+	Description string       // 本次升级做了什么
+	SQL         []string     // 要执行的 SQL 语句
+	Func        func() error // 可选的 Go 函数迁移
+}
+
+// registeredFuncs 存放外部包注册的升级函数，解决循环依赖问题（database 不能 import executor）。
+var registeredFuncs = map[string]func() error{}
+
+// RegisterUpgrade 供外部包注册升级函数，version 必须与 upgrades 列表中的 Version 匹配。
+func RegisterUpgrade(version string, fn func() error) {
+	registeredFuncs[version] = fn
+}
+
+// upgrades 按版本顺序排列（旧→新），永久保留，严禁删除旧条目（跨版本升级依赖完整迁移链）。
+// v1.0.0 正式版发布时清空过一次历史，此后所有升级条目持续累积。
+var upgrades = []Upgrade{
+	{
+		Version:     "1.0.1",
+		Description: "迁移 yub-wpanel-config.json 到 Web 目录外，轮换 API Key",
+		Func:        migratePluginConfigs,
+	},
+	{
+		Version:     "1.0.2",
+		Description: "新增 XML-RPC 站点开关，默认禁用",
+		SQL: []string{
+			`ALTER TABLE websites ADD COLUMN xmlrpc_enabled INTEGER NOT NULL DEFAULT 0`,
+		},
+	},
+	{
+		Version:     "1.0.3",
+		Description: "cron_jobs 补充 running 列 + 默认插件新增 Redis Cache",
+		SQL: []string{
+			`ALTER TABLE cron_jobs ADD COLUMN running INTEGER NOT NULL DEFAULT 0`,
+			`INSERT OR IGNORE INTO wp_extension_config (etype, slug, name, enabled) VALUES ('plugin', 'redis-cache', 'Redis Cache', 1)`,
+		},
+	},
+	{
+		Version:     "1.0.4",
+		Description: "强化每站点 Unix 用户组隔离和敏感文件权限",
+	},
+	{
+		Version:     "1.0.5",
+		Description: "新增系统可用更新告警开关",
+		SQL: []string{
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('alert_system_update', 'true', '系统可用更新告警')`,
+		},
+	},
+	{
+		Version:     "1.0.6",
+		Description: "新增面板新版本告警开关",
+		SQL: []string{
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('alert_panel_update', 'true', '面板新版本告警')`,
+		},
+	},
+	{
+		Version:     "1.0.7",
+		Description: "新增 WP_DEBUG / 文章修订 / 内存限制 优化项",
+		SQL: []string{
+			`ALTER TABLE websites ADD COLUMN wp_debug_enabled INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE websites ADD COLUMN wp_post_revisions INTEGER NOT NULL DEFAULT -1`,
+			`ALTER TABLE websites ADD COLUMN wp_memory_limit TEXT NOT NULL DEFAULT ''`,
+		},
+	},
+	{
+		Version:     "1.0.8",
+		Description: "新增匿名安装统计开关",
+		SQL: []string{
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('telemetry_enabled', 'false', '匿名安装统计（自有统计服务配置前默认关闭）')`,
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('telemetry_url', '', '自定义统计上报地址（留空使用默认）')`,
+		},
+	},
+	{
+		Version:     "1.0.9",
+		Description: "新增 GitHub 反代地址设置",
+		SQL: []string{
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('github_proxy', '', 'GitHub 反代地址，留空直连')`,
+		},
+	},
+	{
+		Version:     "1.0.10",
+		Description: "Backfill WP_CACHE_KEY_SALT for existing WordPress sites",
+	},
+	{
+		Version:     "1.0.11",
+		Description: "新增 WordPress 安全日志路径白名单设置",
+		SQL: []string{
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('wp_security_log_whitelist', '', 'WordPress安全日志路径白名单')`,
+		},
+	},
+	{
+		Version:     "1.0.12",
+		Description: "新增网站级 CDN 真实 IP 配置组",
+		SQL: []string{
+			`CREATE TABLE IF NOT EXISTS cdn_realip_groups (
+				id          INTEGER PRIMARY KEY AUTOINCREMENT,
+				name        TEXT    NOT NULL UNIQUE,
+				provider    TEXT    NOT NULL DEFAULT 'custom',
+				header_name TEXT    NOT NULL,
+				ip_ranges   TEXT    NOT NULL DEFAULT '',
+				builtin     INTEGER NOT NULL DEFAULT 0,
+				enabled     INTEGER NOT NULL DEFAULT 1,
+				description TEXT    DEFAULT '',
+				created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_cdn_realip_groups_enabled ON cdn_realip_groups(enabled)`,
+			`CREATE TABLE IF NOT EXISTS website_cdn_realip_groups (
+				website_id INTEGER NOT NULL,
+				group_id   INTEGER NOT NULL,
+				created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				PRIMARY KEY (website_id, group_id),
+				FOREIGN KEY (website_id) REFERENCES websites(id) ON DELETE CASCADE,
+				FOREIGN KEY (group_id) REFERENCES cdn_realip_groups(id) ON DELETE CASCADE
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_website_cdn_realip_groups_group ON website_cdn_realip_groups(group_id)`,
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('cloudflare_realip_ips', '', 'Cloudflare Real IP 专用官方IP段')`,
+			`INSERT OR IGNORE INTO cdn_realip_groups (name, provider, header_name, ip_ranges, builtin, enabled, description) VALUES
+				('Cloudflare', 'cloudflare', 'CF-Connecting-IP', '', 1, 1, 'Cloudflare 官方 IP 段由面板自动拉取'),
+				('通用 CDN（兼容模式）', 'compatible', 'X-Forwarded-For', '', 1, 1, '不校验来源 IP，直接信任 X-Forwarded-For')`,
+		},
+		Func: ensureCDNRealIPEnabledColumn,
+	},
+	{
+		Version:     "1.0.13",
+		Description: "新增 Bot UA 统一限速设置",
+		SQL: []string{
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('bot_limit_enabled', 'false', '是否开启Bot UA统一限速')`,
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('bot_limit_rpm', '30', '每站点Bot每分钟最大请求数')`,
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('bot_limit_burst', '20', 'Bot突发缓冲允许量')`,
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('googlebot_ips', '', 'Googlebot官方IP段缓存')`,
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('bingbot_ips', '', 'Bingbot官方IP段缓存')`,
+		},
+	},
+	{
+		Version:     "1.0.14",
+		Description: "记录站点最近一次 SSL 申请失败原因",
+		Func:        ensureSSLLastErrorColumn,
+	},
+	{
+		Version:     "1.0.15",
+		Description: "新增面板自动更新设置",
+		SQL: []string{
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('panel_auto_update_enabled', 'false', '是否启用面板自动更新')`,
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('panel_auto_update_mode', 'patch_only', '面板自动更新模式：patch_only/all_stable')`,
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('panel_auto_update_window', '03:00-05:00', '面板自动更新时间窗口')`,
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('panel_auto_update_release_delay_minutes', '15', '面板自动更新发布延迟分钟数')`,
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('panel_auto_update_signature_timeout_minutes', '120', '面板自动更新等待签名超时分钟数')`,
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('panel_auto_update_last_target_version', '', '面板自动更新最近目标版本')`,
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('panel_auto_update_last_check_at', '', '面板自动更新最近检查时间')`,
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('panel_auto_update_last_attempt_at', '', '面板自动更新最近尝试时间')`,
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('panel_auto_update_last_status', '', '面板自动更新最近状态')`,
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('panel_auto_update_last_stage', '', '面板自动更新最近阶段')`,
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('panel_auto_update_last_error', '', '面板自动更新最近错误')`,
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('panel_auto_update_last_success_at', '', '面板自动更新最近成功时间')`,
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('panel_auto_update_last_success_version', '', '面板自动更新最近成功版本')`,
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('panel_auto_update_signature_wait_version', '', '面板自动更新等待签名版本')`,
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('panel_auto_update_signature_wait_at', '', '面板自动更新等待签名开始时间')`,
+		},
+	},
+	{
+		Version:     "1.0.16",
+		Description: "新增站点级 SSL 证书导出开关",
+		Func:        ensureSSLExportEnabledColumn,
+	},
+	{
+		Version:     "1.0.17",
+		Description: "新增 PHP 站点 Web 入口目录配置",
+		Func:        ensureDocumentRootSubdirColumn,
+	},
+	{
+		Version:     "1.0.18",
+		Description: "新增站点 AI 只读诊断设置和会话记录",
+		SQL: []string{
+			`CREATE TABLE IF NOT EXISTS ai_settings (
+				id              INTEGER PRIMARY KEY,
+				enabled         INTEGER NOT NULL DEFAULT 0,
+				provider        TEXT    NOT NULL DEFAULT 'deepseek',
+				base_url        TEXT    NOT NULL DEFAULT 'https://api.deepseek.com',
+				model           TEXT    NOT NULL DEFAULT 'deepseek-v4-pro',
+				api_key         TEXT    NOT NULL DEFAULT '',
+				timeout_seconds INTEGER NOT NULL DEFAULT 60,
+				created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				updated_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+			)`,
+			`INSERT OR IGNORE INTO ai_settings (id) VALUES (1)`,
+			`CREATE TABLE IF NOT EXISTS ai_sessions (
+				id             INTEGER PRIMARY KEY AUTOINCREMENT,
+				site_id        INTEGER NOT NULL,
+				symptom        TEXT    NOT NULL DEFAULT '',
+				status         TEXT    NOT NULL DEFAULT 'pending',
+				risk_level     TEXT    NOT NULL DEFAULT '',
+				summary        TEXT    NOT NULL DEFAULT '',
+				report_json    TEXT    NOT NULL DEFAULT '',
+				raw_text       TEXT    NOT NULL DEFAULT '',
+				prompt_chars   INTEGER NOT NULL DEFAULT 0,
+				response_chars INTEGER NOT NULL DEFAULT 0,
+				error_message  TEXT    NOT NULL DEFAULT '',
+				created_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				updated_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				FOREIGN KEY (site_id) REFERENCES websites(id) ON DELETE CASCADE
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_ai_sessions_site ON ai_sessions(site_id, created_at)`,
+			`CREATE INDEX IF NOT EXISTS idx_ai_sessions_status ON ai_sessions(site_id, status)`,
+		},
+	},
+	{
+		Version:     "1.0.19",
+		Description: "新增 AI 诊断会话追问消息记录",
+		SQL: []string{
+			`CREATE TABLE IF NOT EXISTS ai_messages (
+				id             INTEGER PRIMARY KEY AUTOINCREMENT,
+				session_id     INTEGER NOT NULL,
+				role           TEXT    NOT NULL DEFAULT '',
+				content        TEXT    NOT NULL DEFAULT '',
+				prompt_chars   INTEGER NOT NULL DEFAULT 0,
+				response_chars INTEGER NOT NULL DEFAULT 0,
+				error_message  TEXT    NOT NULL DEFAULT '',
+				created_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				FOREIGN KEY (session_id) REFERENCES ai_sessions(id) ON DELETE CASCADE
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_ai_messages_session ON ai_messages(session_id, created_at)`,
+		},
+	},
+	{
+		Version:     "1.0.20",
+		Description: "远程备份新增 S3 兼容对象存储后端",
+		SQL: []string{
+			`CREATE TABLE IF NOT EXISTS remote_backup_settings (
+				id          INTEGER PRIMARY KEY AUTOINCREMENT,
+				enabled     INTEGER NOT NULL DEFAULT 0,
+				backup_type TEXT    NOT NULL DEFAULT 'rsync',
+				host        TEXT    NOT NULL DEFAULT '',
+				port        INTEGER NOT NULL DEFAULT 22,
+				username    TEXT    NOT NULL DEFAULT 'root',
+				auth_type   TEXT    NOT NULL DEFAULT 'password',
+				password    TEXT    NOT NULL DEFAULT '',
+				ssh_key     TEXT    NOT NULL DEFAULT '',
+				remote_path TEXT    NOT NULL DEFAULT '',
+				keep_local  INTEGER NOT NULL DEFAULT 1,
+				s3_endpoint      TEXT NOT NULL DEFAULT '',
+				s3_bucket        TEXT NOT NULL DEFAULT '',
+				s3_region        TEXT NOT NULL DEFAULT 'auto',
+				s3_access_key_id TEXT NOT NULL DEFAULT '',
+				s3_secret_key    TEXT NOT NULL DEFAULT '',
+				s3_path_prefix   TEXT NOT NULL DEFAULT '',
+				created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+			)`,
+			`INSERT OR IGNORE INTO remote_backup_settings (id) VALUES (1)`,
+			`ALTER TABLE remote_backup_settings ADD COLUMN backup_type TEXT NOT NULL DEFAULT 'rsync'`,
+			`ALTER TABLE remote_backup_settings ADD COLUMN s3_endpoint TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE remote_backup_settings ADD COLUMN s3_bucket TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE remote_backup_settings ADD COLUMN s3_region TEXT NOT NULL DEFAULT 'auto'`,
+			`ALTER TABLE remote_backup_settings ADD COLUMN s3_access_key_id TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE remote_backup_settings ADD COLUMN s3_secret_key TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE remote_backup_settings ADD COLUMN s3_path_prefix TEXT NOT NULL DEFAULT ''`,
+		},
+	},
+	{
+		Version:     "1.0.21",
+		Description: "新增 WordPress 站点文件锁定开关",
+		Func:        ensureFileLockEnabledColumn,
+	},
+	{
+		Version:     "1.0.22",
+		Description: "新增 WordPress 文件安全事件记录",
+		SQL: []string{
+			`CREATE TABLE IF NOT EXISTS file_security_events (
+				id             INTEGER PRIMARY KEY AUTOINCREMENT,
+				site_id        INTEGER NOT NULL DEFAULT 0,
+				domain         TEXT    NOT NULL DEFAULT '',
+				event_type     TEXT    NOT NULL DEFAULT '',
+				source         TEXT    NOT NULL DEFAULT '',
+				risk_level     TEXT    NOT NULL DEFAULT 'medium',
+				path           TEXT    NOT NULL DEFAULT '',
+				request_method TEXT    NOT NULL DEFAULT '',
+				ip_address     TEXT    NOT NULL DEFAULT '',
+				user_agent     TEXT    NOT NULL DEFAULT '',
+				status         INTEGER NOT NULL DEFAULT 0,
+				file_size      INTEGER NOT NULL DEFAULT 0,
+				file_mtime     DATETIME,
+				message        TEXT    NOT NULL DEFAULT '',
+				first_seen     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				last_seen      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				event_count    INTEGER NOT NULL DEFAULT 1,
+				resolved_at    DATETIME,
+				created_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				updated_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				FOREIGN KEY (site_id) REFERENCES websites(id) ON DELETE CASCADE
+			)`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_file_security_events_unique ON file_security_events(site_id, event_type, path, ip_address, request_method)`,
+			`CREATE INDEX IF NOT EXISTS idx_file_security_events_last_seen ON file_security_events(resolved_at, last_seen)`,
+			`CREATE INDEX IF NOT EXISTS idx_file_security_events_site ON file_security_events(site_id, resolved_at, last_seen)`,
+		},
+	},
+	{
+		Version:     "1.0.23",
+		Description: "补充 WordPress 文件锁定开启时间字段",
+		Func:        ensureFileLockEnabledAtColumn,
+	},
+	{
+		Version:     "1.0.24",
+		Description: "新增网站文件备份记录表，支撑备份总览页面",
+		SQL: []string{
+			`CREATE TABLE IF NOT EXISTS file_backups (
+				id                INTEGER PRIMARY KEY AUTOINCREMENT,
+				site_id           INTEGER NOT NULL,
+				filename          TEXT    NOT NULL,
+				file_size         INTEGER DEFAULT 0,
+				mode              TEXT    NOT NULL DEFAULT 'full',
+				transport_status  TEXT    DEFAULT 'local',
+				transport_message TEXT    DEFAULT '',
+				created_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				FOREIGN KEY (site_id) REFERENCES websites(id) ON DELETE CASCADE
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_file_backups_site ON file_backups(site_id, created_at)`,
+		},
+	},
+	{
+		Version:     "1.0.25",
+		Description: "回填升级前已存在的网站文件备份到 file_backups 表",
+		Func:        backfillFileBackupsFromDisk,
+	},
+	{
+		Version:     "1.0.26",
+		Description: "清理旧版本遗留的重复活跃防火墙封禁记录",
+	},
+	{
+		Version:     "1.0.27",
+		Description: "新增 WordPress 安全探测事件持久化表及日志读取位点表（方案 D 阶段三）",
+		SQL: []string{
+			`CREATE TABLE IF NOT EXISTS wp_security_events (
+				id          INTEGER PRIMARY KEY AUTOINCREMENT,
+				site_id     INTEGER NOT NULL DEFAULT 0,
+				domain      TEXT    NOT NULL DEFAULT '',
+				ip_address  TEXT    NOT NULL DEFAULT '',
+				event_type  TEXT    NOT NULL DEFAULT '',
+				risk_level  TEXT    NOT NULL DEFAULT 'low',
+				method      TEXT    NOT NULL DEFAULT '',
+				path        TEXT    NOT NULL DEFAULT '',
+				user_agent  TEXT    NOT NULL DEFAULT '',
+				status      INTEGER NOT NULL DEFAULT 0,
+				message     TEXT    NOT NULL DEFAULT '',
+				occurred_at DATETIME NOT NULL,
+				created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				FOREIGN KEY (site_id) REFERENCES websites(id) ON DELETE CASCADE
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_wp_security_events_ip_type_time ON wp_security_events(ip_address, event_type, occurred_at)`,
+			`CREATE INDEX IF NOT EXISTS idx_wp_security_events_site_time ON wp_security_events(site_id, occurred_at)`,
+			`CREATE TABLE IF NOT EXISTS wp_security_log_positions (
+				site_id     INTEGER PRIMARY KEY,
+				byte_offset INTEGER NOT NULL DEFAULT 0,
+				first_line_hash TEXT NOT NULL DEFAULT '',
+				updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				FOREIGN KEY (site_id) REFERENCES websites(id) ON DELETE CASCADE
+			)`,
+		},
+	},
+	{
+		Version:     "1.0.28",
+		Description: "新增 WordPress 安全探测告警开关，默认关闭（方案 D 阶段四）",
+		SQL: []string{
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES
+				('alert_wp_sqli_probe', 'false', 'WordPress SQL 注入探测告警（默认关闭）'),
+				('alert_wp_fake_search_bot', 'false', '伪装搜索引擎爬虫告警（默认关闭）')`,
+		},
+	},
+	{
+		Version:     "1.0.29",
+		Description: "新增 WordPress 安全探测告警阈值与统计窗口可配置项",
+		SQL: []string{
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES
+				('alert_wp_security_threshold',   '10', 'WordPress 安全探测告警阈值（每 IP 触发次数，默认 10）'),
+				('alert_wp_security_window_hours','24', 'WordPress 安全探测告警统计窗口（小时，默认 24）')`,
+		},
+	},
+	{
+		Version:     "1.0.30",
+		Description: "新增 WordPress 文件锁定模式与权限应用状态",
+		Func:        ensureFileLockModeColumns,
+	},
+	{
+		Version:     "1.0.31",
+		Description: "新增 WordPress 组件库存与可恢复采集任务表",
+		SQL:         wpInventorySchemaStatements,
+	},
+	{
+		Version:     "1.0.32",
+		Description: "新增持久化 WordPress 更新任务、事件与专用备份表",
+		SQL:         wpUpdateSchemaStatements,
+	},
+	{
+		Version:     "1.0.33",
+		Description: "新增 WordPress 更新数据库备份复用策略",
+		Func:        ensureWPUpdateDatabaseBackupColumns,
+	},
+	{
+		Version:     "1.0.34",
+		Description: "新增 WordPress 站点密码找回保护模式字段",
+		Func:        ensurePasswordResetModeColumn,
+	},
+	{
+		Version:     "1.0.35",
+		Description: "新增 wp_update_tasks.finished_at 索引以加速更新日志清理",
+		SQL: []string{
+			`CREATE INDEX IF NOT EXISTS ix_wp_update_tasks_finished_at ON wp_update_tasks(finished_at)`,
+		},
+	},
+	{
+		Version:     "1.0.36",
+		Description: "新增 WordPress 插件批量更新（auto_rollback 字段与批量编排表）",
+		Func:        ensureWPUpdateBatchSchema,
+	},
+	{
+		Version:     "1.0.37",
+		Description: "新增批量插件更新派发前置检查失败重试字段",
+		Func:        ensureWPUpdateBatchRetrySchema,
+	},
+	{
+		Version:     "1.0.38",
+		Description: "为内存不超过 8GB 且无 Swap 的服务器一次性补齐 2GB Swap",
+	},
+	{
+		Version:     "1.0.39",
+		Description: "新增系统 OOM 事故记录与告警",
+		SQL: []string{
+			`CREATE TABLE IF NOT EXISTS system_oom_events (
+				id          INTEGER PRIMARY KEY AUTOINCREMENT,
+				event_key   TEXT     NOT NULL UNIQUE,
+				process     TEXT     NOT NULL,
+				pid         INTEGER  NOT NULL,
+				message     TEXT     NOT NULL,
+				occurred_at DATETIME NOT NULL,
+				created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_oom_events_occurred ON system_oom_events(occurred_at)`,
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description)
+			 VALUES ('alert_oom', 'true', '系统发生 OOM 强制终止进程时告警')`,
+		},
+	},
+	{
+		Version:     "1.0.40",
+		Description: "修正受管服务 systemd drop-in 的 StartLimitIntervalSec 段落位置",
+	},
+	{
+		Version:     "1.0.41",
+		Description: "新增 WordPress 清单任务优先级，避免批量检测阻塞即时任务",
+		SQL: []string{
+			`ALTER TABLE site_wp_inventory_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 20`,
+			`UPDATE site_wp_inventory_jobs SET priority = CASE trigger_type WHEN 'update_followup' THEN 0 WHEN 'site_created' THEN 10 WHEN 'manual' THEN 20 WHEN 'scheduled' THEN 30 ELSE 20 END`,
+			`DROP INDEX IF EXISTS ix_site_wp_inventory_jobs_claim`,
+			`CREATE INDEX IF NOT EXISTS ix_site_wp_inventory_jobs_claim ON site_wp_inventory_jobs(status, priority, not_before, requested_at)`,
+		},
+	},
+	{
+		Version:     "1.0.42",
+		Description: "远程备份新增自动安全配置与服务器隔离路径",
+		SQL: []string{
+			`ALTER TABLE remote_backup_settings ADD COLUMN connection_mode TEXT NOT NULL DEFAULT 'legacy'`,
+			`ALTER TABLE remote_backup_settings ADD COLUMN server_id TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE remote_backup_settings ADD COLUMN remote_base_path TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE remote_backup_settings ADD COLUMN s3_base_prefix TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE remote_backup_settings ADD COLUMN isolate_path INTEGER NOT NULL DEFAULT 0`,
+		},
+	},
+	{
+		Version:     "1.0.43",
+		Description: "新增远程备份自动核对、补传与文件基线重建状态",
+		SQL: []string{
+			`CREATE TABLE IF NOT EXISTS remote_backup_site_state (
+				site_id          INTEGER PRIMARY KEY,
+				status           TEXT NOT NULL DEFAULT 'unknown',
+				rebuild_required INTEGER NOT NULL DEFAULT 0,
+				message          TEXT NOT NULL DEFAULT '',
+				last_checked_at  DATETIME,
+				updated_at       DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				FOREIGN KEY (site_id) REFERENCES websites(id) ON DELETE CASCADE
+			)`,
+		},
+	},
+	{
+		Version:     "1.0.44",
+		Description: "新增网站日志分析任务与报告",
+		SQL: []string{
+			`CREATE TABLE IF NOT EXISTS log_analysis_jobs (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				site_id INTEGER NOT NULL,
+				status TEXT NOT NULL DEFAULT 'pending',
+				start_at DATETIME NOT NULL,
+				end_at DATETIME NOT NULL,
+				use_ai INTEGER NOT NULL DEFAULT 0,
+				local_report_json TEXT NOT NULL DEFAULT '',
+				ai_analysis TEXT NOT NULL DEFAULT '',
+				error_message TEXT NOT NULL DEFAULT '',
+				created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				FOREIGN KEY (site_id) REFERENCES websites(id) ON DELETE CASCADE
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_log_analysis_jobs_site ON log_analysis_jobs(site_id, created_at)`,
+			`CREATE INDEX IF NOT EXISTS idx_log_analysis_jobs_status ON log_analysis_jobs(status, updated_at)`,
+		},
+	},
+	{
+		Version:     "1.0.45",
+		Description: "新增 Googlebot IP 中转与手动导入状态",
+		SQL: []string{
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('googlebot_ips_source', '', 'Googlebot IP段当前来源')`,
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('googlebot_ips_last_success_at', '', 'Googlebot IP段最近成功更新时间')`,
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('googlebot_ips_last_error', '', 'Googlebot IP段最近刷新错误')`,
+		},
+	},
+	{
+		Version:     "1.0.46",
+		Description: "统一 AI 诊断会话与日志分析上下文",
+		SQL: []string{
+			`ALTER TABLE ai_sessions ADD COLUMN context_type TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE ai_sessions ADD COLUMN context_id INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE ai_sessions ADD COLUMN context_json TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE ai_sessions ADD COLUMN focus_kind TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE ai_sessions ADD COLUMN focus_value TEXT NOT NULL DEFAULT ''`,
+			`CREATE TABLE IF NOT EXISTS ai_tool_events (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id INTEGER NOT NULL, tool_name TEXT NOT NULL DEFAULT '', result_summary TEXT NOT NULL DEFAULT '', created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (session_id) REFERENCES ai_sessions(id) ON DELETE CASCADE)`,
+			`CREATE INDEX IF NOT EXISTS idx_ai_tool_events_session ON ai_tool_events(session_id, created_at)`,
+		},
+	},
+	{
+		Version:     "1.0.47",
+		Description: "AI 诊断使用动态超时并提高默认最长等待时间",
+		SQL: []string{
+			`UPDATE ai_settings SET timeout_seconds=180 WHERE timeout_seconds=60`,
+		},
+	},
+	{
+		Version:     "1.0.48",
+		Description: "AI 诊断使用会话级 IP 脱敏别名",
+		SQL: []string{
+			`CREATE TABLE IF NOT EXISTS ai_ip_aliases (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id INTEGER NOT NULL, alias TEXT NOT NULL, ip_address TEXT NOT NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (session_id) REFERENCES ai_sessions(id) ON DELETE CASCADE, UNIQUE (session_id, alias), UNIQUE (session_id, ip_address))`,
+			`CREATE INDEX IF NOT EXISTS idx_ai_ip_aliases_session ON ai_ip_aliases(session_id, alias)`,
+		},
+	},
+	{
+		Version:     "1.0.49",
+		Description: "新增历史图库批量优化的任务表和已处理文件表",
+		SQL:         imageOptimizerSchemaStatements,
+	},
+	{
+		Version:     "1.0.50",
+		Description: "图片优化任务表新增 skipped_files 列，展示幂等跳过的已处理文件数",
+		Func:        ensureImageOptimizationSkippedFilesColumn,
+	},
+	{
+		Version:     "1.0.51",
+		Description: "PHP max_input_vars 旧默认值 2000 升级为 10000（仅未手动修改过的用户）",
+	},
+	{
+		Version:     "1.0.52",
+		Description: "新增站点级 pm.max_children 持久化字段；老站点统一回填为原有固定值 10，不按新公式重算，避免升级后并发数意外变化",
+		SQL: []string{
+			`ALTER TABLE websites ADD COLUMN php_fpm_max_children INTEGER NOT NULL DEFAULT 10`,
+		},
+	},
+	{
+		Version:     "1.0.53",
+		Description: "统一告警运行状态并在面板重启后保留告警生命周期",
+		SQL: []string{
+			`CREATE TABLE IF NOT EXISTS alert_runtime_state (
+				alert_type      TEXT PRIMARY KEY,
+				status          TEXT NOT NULL DEFAULT 'normal',
+				pending_since   TEXT NOT NULL DEFAULT '',
+				last_fired_at   TEXT NOT NULL DEFAULT '',
+				last_message    TEXT NOT NULL DEFAULT '',
+				updated_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				CHECK (status IN ('normal', 'pending', 'firing'))
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_alert_runtime_status ON alert_runtime_state(status, updated_at)`,
+			`CREATE TABLE IF NOT EXISTS alert_event_markers (
+				alert_type TEXT NOT NULL,
+				event_key  TEXT NOT NULL,
+				created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				PRIMARY KEY (alert_type, event_key)
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_alert_event_markers_created ON alert_event_markers(created_at)`,
+		},
+	},
+	{
+		Version:     "1.0.54",
+		Description: "新增网站搬家 G1 持久化任务、资源、断点、事件和站点锁表",
+		SQL:         siteMigrationSchemaStatements,
+	},
+	{
+		Version:     "1.0.55",
+		Description: "新增网站搬家批次容量估算与目标空间预留字段",
+		SQL: []string{
+			`ALTER TABLE site_migration_sites ADD COLUMN estimated_file_bytes INTEGER NOT NULL DEFAULT 0 CHECK (estimated_file_bytes >= 0)`,
+			`ALTER TABLE site_migration_sites ADD COLUMN estimated_database_bytes INTEGER NOT NULL DEFAULT 0 CHECK (estimated_database_bytes >= 0)`,
+			`ALTER TABLE site_migration_sites ADD COLUMN reserved_bytes INTEGER NOT NULL DEFAULT 0 CHECK (reserved_bytes >= 0)`,
+		},
+	},
+	{
+		Version:     "1.0.56",
+		Description: "封禁历史与当前封禁状态分离，历史最多保留最新1000条",
+		SQL: []string{
+			`CREATE TABLE IF NOT EXISTS firewall_ban_history (
+				id               INTEGER PRIMARY KEY AUTOINCREMENT,
+				ip_address       TEXT    NOT NULL,
+				ban_level        INTEGER NOT NULL DEFAULT 2,
+				reason           TEXT    DEFAULT '',
+				source_jail      TEXT    DEFAULT 'panel',
+				banned_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				expires_at       DATETIME,
+				ban_count        INTEGER NOT NULL DEFAULT 1,
+				is_manual        INTEGER NOT NULL DEFAULT 0,
+				duration_seconds INTEGER
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_ban_history_time ON firewall_ban_history(banned_at DESC, id DESC)`,
+			`CREATE INDEX IF NOT EXISTS idx_ban_history_ip ON firewall_ban_history(ip_address)`,
+			`CREATE TRIGGER IF NOT EXISTS trim_firewall_ban_history
+				AFTER INSERT ON firewall_ban_history
+				WHEN (SELECT COUNT(*) FROM firewall_ban_history) > 1000
+				BEGIN
+					DELETE FROM firewall_ban_history
+					WHERE id NOT IN (
+						SELECT id FROM firewall_ban_history
+						ORDER BY banned_at DESC, id DESC LIMIT 1000
+					);
+				END`,
+		},
+	},
+	{
+		Version:     "1.0.57",
+		Description: "新增站点级 AI 开发 SSH 授权状态与恢复元数据",
+		SQL: []string{
+			`CREATE TABLE IF NOT EXISTS website_ai_development_access (
+				site_id          INTEGER PRIMARY KEY,
+				status           TEXT NOT NULL,
+				operation        TEXT NOT NULL DEFAULT '',
+				system_user      TEXT NOT NULL,
+				web_root         TEXT NOT NULL,
+				original_shell   TEXT NOT NULL,
+				original_home    TEXT NOT NULL,
+				public_key       TEXT NOT NULL DEFAULT '',
+				key_fingerprint  TEXT NOT NULL DEFAULT '',
+				requested_by     TEXT NOT NULL DEFAULT '',
+				last_error       TEXT NOT NULL DEFAULT '',
+				enabled_at       DATETIME,
+				created_at       DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				updated_at       DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				FOREIGN KEY (site_id) REFERENCES websites(id) ON DELETE CASCADE,
+				CHECK (status IN ('enabling','enabled','disabling','error')),
+				CHECK (operation IN ('','rotate'))
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_website_ai_development_access_status
+				ON website_ai_development_access(status, operation)`,
+		},
+	},
+	{
+		Version:     "1.0.58",
+		Description: "新增站点临时维护安全配置与可恢复窗口",
+		Func:        ensureMaintenanceSecurityColumn,
+	},
+	{
+		Version:     "1.0.59",
+		Description: "新增 WordPress 轻量异常监控状态",
+		SQL:         []string{wpAnomalySchema},
+	},
+	{
+		Version:     "1.0.60",
+		Description: "扩展 WordPress 内容与关键设置异常监控基线",
+		Func:        ensureWPAnomalyContentColumns,
+	},
+	{
+		Version:     "1.0.61",
+		Description: "新增 WordPress SQL 注入请求拦截与自动封禁设置",
+		SQL: []string{`INSERT OR IGNORE INTO security_settings (skey,svalue,description) VALUES
+			('wp_sqli_block_enabled','true','WordPress 高置信度 SQL 注入请求前置拒绝'),
+			('wp_sqli_autoban_enabled','true','WordPress SQL 注入重复来源自动临时封禁'),
+			('wp_sqli_ban_threshold','5','SQL 注入自动封禁阈值'),
+			('wp_sqli_ban_window_seconds','600','SQL 注入自动封禁统计窗口（秒）')`},
+	},
+	{
+		Version:     "1.0.62",
+		Description: "扩展 WordPress 应用程序密码异常监控基线",
+		Func:        ensureWPAnomalyApplicationPasswordColumn,
+	},
+	{
+		Version:     "1.0.63",
+		Description: "扩展 WordPress 数据库持久化对象异常监控基线",
+		Func:        ensureWPAnomalyDatabaseObjectsColumn,
+	},
+	{
+		Version:     "1.0.64",
+		Description: "新增 WordPress 应用程序密码禁用开关，存量站点保持允许",
+		SQL: []string{
+			`ALTER TABLE websites ADD COLUMN disable_application_passwords INTEGER NOT NULL DEFAULT 1`,
+			`UPDATE websites SET disable_application_passwords = 0`,
+		},
+	},
+	{
+		Version:     "1.0.65",
+		Description: "记录 SSL 证书来源并安全限制自动续期",
+		SQL: []string{
+			`ALTER TABLE websites ADD COLUMN ssl_cert_source TEXT NOT NULL DEFAULT ''`,
+		},
+		Func: backfillSSLCertificateSources,
+	},
+	{
+		Version:     "1.0.66",
+		Description: "移除不再维护的外部扩展推荐项",
+		Func:        removeDeprecatedExtensionRecommendation,
+	},
+}
+
+func removeDeprecatedExtensionRecommendation() error {
+	var exists int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'wp_extension_config'`).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 0 {
+		return nil
+	}
+	_, err := DB.Exec(`DELETE FROM wp_extension_config WHERE name = 'B2B Product Catalog'`)
+	return err
+}
+
+func ensureWPUpdateDatabaseBackupColumns() error {
+	var tableExists int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='wp_update_tasks'`).Scan(&tableExists); err != nil {
+		return err
+	}
+	if tableExists == 0 {
+		return nil
+	}
+	for _, column := range []struct {
+		name string
+		sql  string
+	}{
+		{"database_backup_mode", `ALTER TABLE wp_update_tasks ADD COLUMN database_backup_mode TEXT NOT NULL DEFAULT 'fresh' CHECK (database_backup_mode IN ('fresh','reuse'))`},
+		{"database_backup_source_id", `ALTER TABLE wp_update_tasks ADD COLUMN database_backup_source_id INTEGER`},
+	} {
+		var exists int
+		if err := DB.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('wp_update_tasks') WHERE name=?`, column.name).Scan(&exists); err != nil {
+			return err
+		}
+		if exists == 0 {
+			if _, err := DB.Exec(column.sql); err != nil {
+				return err
+			}
+		}
+	}
+	_, err := DB.Exec(`CREATE TRIGGER IF NOT EXISTS trg_wp_update_tasks_sealed_backup_mode_immutable
+		BEFORE UPDATE OF database_backup_mode ON wp_update_tasks
+		WHEN OLD.plan_sealed_at IS NOT NULL AND NEW.database_backup_mode != OLD.database_backup_mode
+		BEGIN SELECT RAISE(ABORT, 'sealed update backup mode is immutable'); END`)
+	return err
+}
+
+// ensureWPUpdateBatchSchema 为批量插件更新新增 auto_rollback/batch_id 字段与批量编排表。
+func ensureWPUpdateBatchSchema() error {
+	var tableExists int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='wp_update_tasks'`).Scan(&tableExists); err != nil {
+		return err
+	}
+	if tableExists == 0 {
+		return nil
+	}
+	for _, column := range []struct {
+		name string
+		sql  string
+	}{
+		{"auto_rollback", `ALTER TABLE wp_update_tasks ADD COLUMN auto_rollback INTEGER NOT NULL DEFAULT 1 CHECK (auto_rollback IN (0,1))`},
+		{"batch_id", `ALTER TABLE wp_update_tasks ADD COLUMN batch_id TEXT NOT NULL DEFAULT ''`},
+	} {
+		var exists int
+		if err := DB.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('wp_update_tasks') WHERE name=?`, column.name).Scan(&exists); err != nil {
+			return err
+		}
+		if exists == 0 {
+			if _, err := DB.Exec(column.sql); err != nil {
+				return err
+			}
+		}
+	}
+	statements := []string{
+		`CREATE INDEX IF NOT EXISTS ix_wp_update_tasks_batch ON wp_update_tasks(batch_id) WHERE batch_id != ''`,
+		`CREATE TRIGGER IF NOT EXISTS trg_wp_update_tasks_sealed_auto_rollback_immutable
+			BEFORE UPDATE OF auto_rollback ON wp_update_tasks
+			WHEN OLD.plan_sealed_at IS NOT NULL AND NEW.auto_rollback != OLD.auto_rollback
+			BEGIN SELECT RAISE(ABORT, 'sealed update auto rollback flag is immutable'); END`,
+		`CREATE TABLE IF NOT EXISTS wp_update_batches (
+			id          TEXT PRIMARY KEY,
+			site_id     INTEGER NOT NULL,
+			created_by  TEXT NOT NULL,
+			status      TEXT NOT NULL DEFAULT 'running',
+			total_count INTEGER NOT NULL DEFAULT 0,
+			database_backup_source_id INTEGER,
+			created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (site_id) REFERENCES websites(id) ON DELETE CASCADE,
+			CHECK (status IN ('running','completed'))
+		)`,
+		`CREATE INDEX IF NOT EXISTS ix_wp_update_batches_site ON wp_update_batches(site_id, created_at DESC)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS ux_wp_update_batches_active_site ON wp_update_batches(site_id) WHERE status = 'running'`,
+		`CREATE TABLE IF NOT EXISTS wp_update_batch_items (
+			id            INTEGER PRIMARY KEY AUTOINCREMENT,
+			batch_id      TEXT NOT NULL,
+			position      INTEGER NOT NULL,
+			component_key TEXT NOT NULL,
+			status        TEXT NOT NULL DEFAULT 'pending',
+			message       TEXT NOT NULL DEFAULT '',
+			task_id       TEXT,
+			created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (batch_id) REFERENCES wp_update_batches(id) ON DELETE CASCADE,
+			FOREIGN KEY (task_id) REFERENCES wp_update_tasks(id) ON DELETE SET NULL,
+			CHECK (status IN ('pending','dispatched','failed')),
+			UNIQUE (batch_id, position),
+			UNIQUE (batch_id, component_key)
+		)`,
+		`CREATE INDEX IF NOT EXISTS ix_wp_update_batch_items_batch ON wp_update_batch_items(batch_id, position)`,
+	}
+	for _, stmt := range statements {
+		if _, err := DB.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ensureWPUpdateBatchRetrySchema() error {
+	var tableExists int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='wp_update_batch_items'`).Scan(&tableExists); err != nil {
+		return err
+	}
+	if tableExists == 0 {
+		return nil
+	}
+	for _, column := range []struct {
+		name string
+		sql  string
+	}{
+		{"retry_count", `ALTER TABLE wp_update_batch_items ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`},
+		{"next_retry_at", `ALTER TABLE wp_update_batch_items ADD COLUMN next_retry_at DATETIME`},
+	} {
+		var exists int
+		if err := DB.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('wp_update_batch_items') WHERE name=?`, column.name).Scan(&exists); err != nil {
+			return err
+		}
+		if exists == 0 {
+			if _, err := DB.Exec(column.sql); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func ensureFileLockModeColumns() error {
+	var tableExists int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'websites'`).Scan(&tableExists); err != nil {
+		return err
+	}
+	if tableExists == 0 {
+		return nil
+	}
+
+	for _, column := range []struct {
+		name string
+		sql  string
+	}{
+		{"file_lock_mode", `ALTER TABLE websites ADD COLUMN file_lock_mode TEXT NOT NULL DEFAULT ''`},
+		{"file_lock_apply_status", `ALTER TABLE websites ADD COLUMN file_lock_apply_status TEXT NOT NULL DEFAULT ''`},
+	} {
+		var exists int
+		if err := DB.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('websites') WHERE name = ?`, column.name).Scan(&exists); err != nil {
+			return err
+		}
+		if exists == 0 {
+			if _, err := DB.Exec(column.sql); err != nil {
+				return err
+			}
+		}
+	}
+
+	if _, err := DB.Exec(`UPDATE websites SET file_lock_mode = 'legacy'
+		WHERE file_lock_enabled = 1 AND COALESCE(file_lock_mode, '') = ''`); err != nil {
+		return err
+	}
+	_, err := DB.Exec(`UPDATE websites SET file_lock_apply_status = 'ready'
+		WHERE file_lock_enabled = 1 AND COALESCE(file_lock_apply_status, '') = ''`)
+	return err
+}
+
+// ensurePasswordResetModeColumn 为 websites 表新增 password_reset_mode 列，
+// 旧站点默认 'allow'（允许找回密码），与新装迁移的默认值保持一致。
+func ensurePasswordResetModeColumn() error {
+	var tableExists int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'websites'`).Scan(&tableExists); err != nil {
+		return err
+	}
+	if tableExists == 0 {
+		return nil
+	}
+	var exists int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('websites') WHERE name = 'password_reset_mode'`).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 1 {
+		return nil
+	}
+	_, err := DB.Exec(`ALTER TABLE websites ADD COLUMN password_reset_mode TEXT NOT NULL DEFAULT 'allow'`)
+	return err
+}
+
+func ensureFileLockEnabledColumn() error {
+	var tableExists int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'websites'`).Scan(&tableExists); err != nil {
+		return err
+	}
+	if tableExists == 0 {
+		return nil
+	}
+	var exists int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('websites') WHERE name = 'file_lock_enabled'`).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 1 {
+		return nil
+	}
+	_, err := DB.Exec(`ALTER TABLE websites ADD COLUMN file_lock_enabled INTEGER NOT NULL DEFAULT 0`)
+	return err
+}
+
+func ensureFileLockEnabledAtColumn() error {
+	var tableExists int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'websites'`).Scan(&tableExists); err != nil {
+		return err
+	}
+	if tableExists == 0 {
+		return nil
+	}
+	var exists int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('websites') WHERE name = 'file_lock_enabled_at'`).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 1 {
+		return nil
+	}
+	_, err := DB.Exec(`ALTER TABLE websites ADD COLUMN file_lock_enabled_at TEXT NOT NULL DEFAULT ''`)
+	if err != nil {
+		return err
+	}
+	_, err = DB.Exec(`
+		UPDATE websites
+		SET file_lock_enabled_at = CURRENT_TIMESTAMP
+		WHERE file_lock_enabled = 1
+			AND COALESCE(file_lock_enabled_at, '') = ''
+	`)
+	return err
+}
+
+// backfillFileBackupsFromDisk 把升级前已经生成、但 file_backups 表还没有记录的
+// 网站文件备份（file_full_*.tar.gz / file_inc_*.tar.gz）补录进 file_backups 表。
+// 历史文件无法确认是否曾经同步到远程，统一记为 transport_status='local'。
+// 按 (site_id, filename) 查重，重复执行不会重复插入；目录不存在/不可读的网站直接跳过。
+func backfillFileBackupsFromDisk() error {
+	return backfillFileBackupsFromRoot(config.DefaultBackupDir)
+}
+
+// backfillFileBackupsFromRoot 是 backfillFileBackupsFromDisk 的可测试实现，backupsRoot 参数
+// 便于单元测试注入临时目录，生产代码固定传入真实的面板备份根目录。
+func backfillFileBackupsFromRoot(backupsRoot string) error {
+	var fileBackupsExists, websitesExists int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'file_backups'`).Scan(&fileBackupsExists); err != nil {
+		return err
+	}
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'websites'`).Scan(&websitesExists); err != nil {
+		return err
+	}
+	if fileBackupsExists == 0 || websitesExists == 0 {
+		return nil
+	}
+
+	rows, err := DB.Query(`SELECT id, domain FROM websites`)
+	if err != nil {
+		return err
+	}
+	type site struct {
+		id     int
+		domain string
+	}
+	var sites []site
+	for rows.Next() {
+		var s site
+		if rows.Scan(&s.id, &s.domain) == nil {
+			sites = append(sites, s)
+		}
+	}
+	rows.Close()
+
+	for _, s := range sites {
+		dir := filepath.Join(backupsRoot, s.domain, "files")
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			var mode string
+			switch {
+			case strings.HasPrefix(name, "file_full_") && strings.HasSuffix(name, ".tar.gz"):
+				mode = "full"
+			case strings.HasPrefix(name, "file_inc_") && strings.HasSuffix(name, ".tar.gz"):
+				mode = "incremental"
+			default:
+				continue
+			}
+
+			var exists int
+			if err := DB.QueryRow(`SELECT COUNT(*) FROM file_backups WHERE site_id = ? AND filename = ?`, s.id, name).Scan(&exists); err != nil || exists > 0 {
+				continue
+			}
+
+			info, err := e.Info()
+			var size int64
+			createdAt := time.Now()
+			if err == nil {
+				size = info.Size()
+				createdAt = info.ModTime()
+			}
+			if ts := parseFileBackupTimestamp(name); !ts.IsZero() {
+				createdAt = ts
+			}
+
+			if _, err := DB.Exec(`INSERT INTO file_backups (site_id, filename, file_size, mode, transport_status, created_at)
+				VALUES (?, ?, ?, ?, 'local', ?)`,
+				s.id, name, size, mode, createdAt.Format("2006-01-02 15:04:05")); err != nil {
+				log.Printf("回填文件备份记录失败 site=%d file=%s: %v", s.id, name, err)
+			}
+		}
+	}
+	return nil
+}
+
+// parseFileBackupTimestamp 从 file_full_<ts>.tar.gz / file_inc_<ts>.tar.gz 文件名中解析出
+// ExecuteFileBackup 生成时使用的时间戳（20060102_150405），解析失败返回零值。
+func parseFileBackupTimestamp(name string) time.Time {
+	base := strings.TrimSuffix(name, ".tar.gz")
+	base = strings.TrimPrefix(base, "file_full_")
+	base = strings.TrimPrefix(base, "file_inc_")
+	t, err := time.Parse("20060102_150405", base)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+func ensureDocumentRootSubdirColumn() error {
+	var tableExists int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'websites'`).Scan(&tableExists); err != nil {
+		return err
+	}
+	if tableExists == 0 {
+		return nil
+	}
+	var exists int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('websites') WHERE name = 'document_root_subdir'`).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 1 {
+		return nil
+	}
+	_, err := DB.Exec(`ALTER TABLE websites ADD COLUMN document_root_subdir TEXT NOT NULL DEFAULT ''`)
+	return err
+}
+
+func ensureSSLLastErrorColumn() error {
+	var tableExists int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'websites'`).Scan(&tableExists); err != nil {
+		return err
+	}
+	if tableExists == 0 {
+		return nil
+	}
+	var exists int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('websites') WHERE name = 'ssl_last_error'`).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 1 {
+		return nil
+	}
+	_, err := DB.Exec(`ALTER TABLE websites ADD COLUMN ssl_last_error TEXT NOT NULL DEFAULT ''`)
+	return err
+}
+
+func ensureCDNRealIPEnabledColumn() error {
+	var exists int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('websites') WHERE name = 'cdn_realip_enabled'`).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 1 {
+		return nil
+	}
+	_, err := DB.Exec(`ALTER TABLE websites ADD COLUMN cdn_realip_enabled INTEGER NOT NULL DEFAULT 0`)
+	return err
+}
+
+func ensureImageOptimizationSkippedFilesColumn() error {
+	var tableExists int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'site_image_optimization_jobs'`).Scan(&tableExists); err != nil {
+		return err
+	}
+	if tableExists == 0 {
+		return nil
+	}
+	var exists int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('site_image_optimization_jobs') WHERE name = 'skipped_files'`).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 1 {
+		return nil
+	}
+	_, err := DB.Exec(`ALTER TABLE site_image_optimization_jobs ADD COLUMN skipped_files INTEGER NOT NULL DEFAULT 0`)
+	return err
+}
+
+func ensureSSLExportEnabledColumn() error {
+	var tableExists int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'websites'`).Scan(&tableExists); err != nil {
+		return err
+	}
+	if tableExists == 0 {
+		return nil
+	}
+	var exists int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('websites') WHERE name = 'ssl_export_enabled'`).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 1 {
+		return nil
+	}
+	_, err := DB.Exec(`ALTER TABLE websites ADD COLUMN ssl_export_enabled INTEGER NOT NULL DEFAULT 0`)
+	return err
+}
+
+// LatestVersion 返回 upgrades 列表中的最新版本号。
+func LatestVersion() string {
+	if len(upgrades) == 0 {
+		return "1.0.0"
+	}
+	return upgrades[len(upgrades)-1].Version
+}
+
+// newInstallCanary 从 upgrades 列表中提取最后一条 ALTER TABLE ADD COLUMN 的表名和字段名，
+// 用于判断数据库是否已包含最新 schema（新装检测的 canary 列）。
+func newInstallCanary() (table, column string) {
+	for i := len(upgrades) - 1; i >= 0; i-- {
+		for _, sql := range upgrades[i].SQL {
+			upper := strings.ToUpper(strings.TrimSpace(sql))
+			if strings.HasPrefix(upper, "ALTER TABLE") && strings.Contains(upper, "ADD COLUMN") {
+				fields := strings.Fields(sql)
+				// ALTER TABLE <table> ADD COLUMN <column> ...
+				for j, f := range fields {
+					if strings.ToUpper(f) == "TABLE" && j+1 < len(fields) {
+						table = fields[j+1]
+					}
+					if strings.ToUpper(f) == "COLUMN" && j+1 < len(fields) {
+						column = fields[j+1]
+						if idx := strings.Index(column, "("); idx > 0 {
+							column = column[:idx]
+						}
+					}
+				}
+				if table != "" && column != "" {
+					return
+				}
+			}
+		}
+	}
+	return "", ""
+}
+
+func isBetaVersion(v string) bool {
+	return strings.Contains(strings.ToLower(v), "beta")
+}
+
+// RunUpgrades 执行所有尚未应用的版本升级。新装数据库已是最新版本，跳过所有升级。
+func RunUpgrades() error {
+	if DB == nil {
+		return fmt.Errorf("数据库未初始化")
+	}
+
+	// 确保版本追踪表存在
+	if _, err := DB.Exec(`CREATE TABLE IF NOT EXISTS schema_version (
+		version    TEXT NOT NULL,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	)`); err != nil {
+		return fmt.Errorf("创建 schema_version 表失败: %w", err)
+	}
+
+	// 查询当前版本
+	var currentVersion string
+	if err := DB.QueryRow("SELECT version FROM schema_version ORDER BY updated_at DESC, rowid DESC LIMIT 1").Scan(&currentVersion); err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("查询当前版本失败: %w", err)
+	}
+
+	// 新装检测：currentVersion 为空时，检查数据库是否已包含最新 schema。
+	// migrations.go 已全量建表，若最新升级中的字段已存在则说明是新装，无需执行任何升级。
+	if currentVersion == "" {
+		if table, col := newInstallCanary(); col != "" {
+			var exists int
+			if err := DB.QueryRow("SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?", table, col).Scan(&exists); err != nil {
+				return fmt.Errorf("检测数据库结构失败: %w", err)
+			}
+			if exists > 0 {
+				log.Printf("[升级] 新装数据库，跳过所有升级步骤")
+				if _, err := DB.Exec("INSERT INTO schema_version (version) VALUES (?)", LatestVersion()); err != nil {
+					return fmt.Errorf("记录新装版本失败: %w", err)
+				}
+				return nil
+			}
+		}
+	}
+
+	// Beta 版本归一化到 1.0.0 正式基线
+	if currentVersion != "" && isBetaVersion(currentVersion) {
+		log.Printf("[升级] beta 版本 %s 归一化到 1.0.0", currentVersion)
+		if _, err := DB.Exec("DELETE FROM schema_version"); err != nil {
+			log.Printf("[升级] 清理 beta 版本记录失败: %v", err)
+		} else if _, err := DB.Exec("INSERT INTO schema_version (version) VALUES ('1.0.0')"); err != nil {
+			log.Printf("[升级] 写入归一化版本失败: %v", err)
+		} else {
+			currentVersion = "1.0.0"
+		}
+	}
+
+	// 验证当前版本合法性：必须在 upgrades 列表中，或者是基线 1.0.0，或者是空（新装）
+	if currentVersion != "" && currentVersion != "1.0.0" && currentVersion != LatestVersion() {
+		found := false
+		for _, u := range upgrades {
+			if u.Version == currentVersion {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("未知数据库版本 %s，请先手动迁移到 1.0.0", currentVersion)
+		}
+	}
+
+	// 基线 1.0.0 视为已应用所有旧升级，从 upgrades 第一条开始执行
+	applied := currentVersion == "" || currentVersion == "1.0.0"
+
+	for _, u := range upgrades {
+		if !applied {
+			if u.Version == currentVersion {
+				applied = true
+			}
+			continue
+		}
+
+		log.Printf("[升级] 执行 %s: %s", u.Version, u.Description)
+
+		for _, sql := range u.SQL {
+			if _, err := DB.Exec(sql); err != nil {
+				if strings.Contains(err.Error(), "duplicate column name") {
+					log.Printf("[升级] %s: 字段已存在，跳过 (%s)", u.Version, strings.TrimSpace(sql))
+					continue
+				}
+				return fmt.Errorf("升级 %s 失败: %w\nSQL: %s", u.Version, err, sql)
+			}
+		}
+
+		fn := u.Func
+		if fn == nil {
+			fn = registeredFuncs[u.Version]
+		}
+		if fn != nil {
+			if err := fn(); err != nil {
+				return fmt.Errorf("升级 %s 函数迁移失败: %w", u.Version, err)
+			}
+		}
+
+		if _, err := DB.Exec("INSERT INTO schema_version (version) VALUES (?)", u.Version); err != nil {
+			return fmt.Errorf("记录升级版本 %s 失败: %w", u.Version, err)
+		}
+
+		log.Printf("[升级] %s 完成", u.Version)
+	}
+
+	// 新装数据库：无任何版本记录，直接写入最新版本号，下次启动跳过所有升级
+	var count int
+	if err := DB.QueryRow("SELECT COUNT(*) FROM schema_version").Scan(&count); err != nil {
+		log.Printf("[升级] 查询版本记录失败: %v", err)
+	}
+	if count == 0 {
+		if _, err := DB.Exec("INSERT INTO schema_version (version) VALUES (?)", LatestVersion()); err != nil {
+			return fmt.Errorf("记录新装版本失败: %w", err)
+		}
+	}
+
+	return nil
+}

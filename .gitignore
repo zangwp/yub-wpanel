@@ -1,0 +1,59 @@
+# 编译产物
+/yub-wpanel
+/yub-wpanel-*
+!/yub-wpanel-optimizer
+/bin/tailwindcss
+
+
+# Go
+.gocache/
+
+# 临时/备份
+*~
+*.bak
+*.tmp
+
+# 日志
+*.log
+
+# 环境变量
+.env
+.env.*
+
+# 测试覆盖率
+coverage.*
+*.coverprofile
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude
+.claude/
+CLAUDE.md
+AGENTS.md
+setup.sh
+
+# Wrangler
+stats-worker/.wrangler/
+stats-worker/wrangler.toml
+
+# Docs（本地参考，不提交）
+docs/
+
+# Scratch
+scratch/
+
+# 本地发布记录
+RELEASE_NOTES.md
+
+# 本地签名脚本（含本机私钥路径）
+sign-release.sh
+release-ed25519-private*
+.release-secrets/

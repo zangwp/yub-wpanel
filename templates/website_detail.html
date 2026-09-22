@@ -1,0 +1,1466 @@
+{{template "base" .}}
+{{define "websites_detail_content"}}
+<div x-data="websiteDetail()" x-init="init()">
+
+    <div class="flex items-center justify-between mb-6">
+        <h2 class="text-xl font-bold text-white">{{t .Lang "website.detail_title"}}</h2>
+        <a href="/{{.RandomSuffix}}/websites" class="btn-secondary">{{t .Lang "website.back_to_list"}}</a>
+    </div>
+
+    <div x-show="loading" class="text-center py-8">
+        <div class="text-sm text-gray-400">{{t .Lang "website.loading"}}</div>
+    </div>
+<template x-if="site">
+    <div>
+
+    <!-- Row 1: 基本信息 | 网站运行与配置 -->
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+        <div class="card" :class="aiAccess.status !== 'disabled' ? 'border border-purple-500 shadow-lg shadow-purple-950/30' : ''">
+            <h3 class="text-lg font-semibold text-white mb-4">{{t .Lang "website.basic_info"}}</h3>
+            <dl class="space-y-3">
+                <div><dt class="text-sm text-gray-400">{{t .Lang "website.domain"}}</dt><dd><a :href="(site.ssl_enabled ? 'https' : 'http') + '://' + site.domain" target="_blank" class="text-blue-400 hover:text-blue-300 hover:underline" x-text="site.domain"></a></dd></div>
+                <div><dt class="text-sm text-gray-400">{{t .Lang "website.aliases"}}</dt><dd class="text-white" x-text="site.aliases || t('common.none')"></dd></div>
+                <div class="pt-2">
+                    <button @click="openDomainModal()" class="text-sm py-1.5 px-3 rounded" style="background-color: #1e3a5f; color: #93c5fd;">{{t .Lang "website.edit_domain"}}</button>
+                    <a :href="(document.body.dataset.panelPrefix || '') + '/files?site_id=' + site.id" class="text-sm py-1.5 px-3 rounded ml-2 inline-block" style="background-color: #1e3a5f; color: #93c5fd;">{{t .Lang "nav.files"}}</a>
+                    <a :href="(document.body.dataset.panelPrefix || '') + '/databases/' + site.id" class="text-sm py-1.5 px-3 rounded ml-2 inline-block" style="background-color: #1e3a5f; color: #93c5fd;">{{t .Lang "nav.databases"}}</a>
+                    <a :href="(document.body.dataset.panelPrefix || '') + '/ai-diagnostics?site_id=' + site.id" class="text-sm py-1.5 px-3 rounded ml-2 inline-block" style="background-color: #14532d; color: #86efac;">{{t .Lang "nav.ai_diagnostics"}}</a>
+                    <button @click="aiDevelopmentModalOpen = true; fetchAIDevelopment()" class="text-sm py-1.5 px-3 rounded ml-2" style="background-color: #581c87; color: #e9d5ff;">{{t .Lang "ai_development.title"}}</button>
+                </div>
+                <div>
+                    <dt class="text-sm text-gray-400">{{t .Lang "website.status"}}</dt>
+                    <dd class="flex flex-wrap items-center gap-2">
+                        <span :class="site.status === 'active' ? 'badge-success' : 'badge-warning'" x-text="site.status === 'active' ? t('website.status_running') : (site.status === 'migrated' ? t('website.status_migrated') : (site.status === 'deleting' ? t('website.status_deleting') : t('website.status_paused')))"></span>
+                        <span x-show="aiAccess.status !== 'disabled'" class="text-xs px-2 py-1 rounded bg-purple-900/60 text-purple-200">{{t .Lang "ai_development.active_badge"}}</span>
+                        <button x-show="site.status === 'migrated'" @click="restoreMigrated()" class="text-sm text-blue-400 hover:text-blue-300" x-text="t('website.restore_migrated_detail')"></button>
+                    </dd>
+                </div>
+                <div><dt class="text-sm text-gray-400">{{t .Lang "website.type"}}</dt><dd class="text-white" x-text="site.site_type === 'php' ? t('website.generic_php_site') : 'WordPress'"></dd></div>
+                <div class="pt-2 border-t border-gray-700/50">
+                    <dt class="text-sm text-gray-400 mb-2">{{t .Lang "website.cdn_real_ip"}}</dt>
+                    <div class="rounded border border-blue-900/60 bg-blue-950/30 p-2 mb-2 text-xs text-blue-200">
+                        <p>{{t .Lang "website.cloudflare_realip_auto"}}</p>
+                        <p class="mt-1 text-blue-200/80">{{t .Lang "website.non_cloudflare_cdn_notice"}}</p>
+                    </div>
+                    <label class="flex items-center space-x-2 text-sm text-gray-300 mb-2">
+                        <input type="checkbox" x-model="cdnRealIPEnabled">
+                        <span>{{t .Lang "website.enable_other_cdn_realip"}}</span>
+                    </label>
+                    <div x-show="cdnRealIPEnabled" class="space-y-2">
+                        <template x-for="g in selectableCDNGroups()" :key="g.id">
+                            <label class="flex items-start space-x-2 text-sm text-gray-300">
+                                <input type="checkbox" class="mt-1" :value="g.id" x-model="cdnRealIPGroupIDs" @change="normalizeCDNRealIPCompatibility(g)" :disabled="!g.enabled">
+                                <span>
+                                    <span class="text-white" x-text="g.name"></span>
+                                    <span class="text-xs text-gray-500" x-text="' · ' + g.header_name"></span>
+                                </span>
+                            </label>
+                        </template>
+                        <p x-show="selectableCDNGroups().length === 0" class="text-xs text-gray-500">{{t .Lang "website.no_non_cloudflare_cdn_groups"}}</p>
+                        <p class="text-xs text-gray-500" x-text="cdnRealIPModeText()"></p>
+                    </div>
+                    <button @click="saveCDNRealIP()" :disabled="cdnRealIPSaving" class="btn-primary text-sm mt-2" x-text="cdnRealIPSaving ? t('common.saving') : t('website.save_other_cdn_settings')"></button>
+                </div>
+                <div><dt class="text-sm text-gray-400">{{t .Lang "website.system_user"}}</dt><dd class="text-white font-mono" x-text="site.system_user"></dd></div>
+                <div><dt class="text-sm text-gray-400">{{t .Lang "website.site_root"}}</dt><dd class="text-white font-mono text-sm" x-text="site.web_root"></dd></div>
+                <div x-show="site.site_type === 'php'">
+                    <dt class="text-sm text-gray-400">{{t .Lang "website.document_root"}}</dt>
+                    <dd class="flex items-center space-x-2 mt-1">
+                        <select x-model="documentRootSubdir" class="input-field text-sm py-1 w-56">
+                            <option value="">{{t .Lang "website.project_root"}}</option>
+                            <option value="public">{{t .Lang "website.public_root_option"}}</option>
+                        </select>
+                        <button @click="saveDocumentRoot()" :disabled="documentRootSaving" class="btn-primary text-xs py-1 px-2" x-text="documentRootSaving ? t('common.saving') : t('common.save')"></button>
+                    </dd>
+                    <p class="text-xs text-gray-500 mt-1">{{t .Lang "website.document_root_detail_help"}}</p>
+                </div>
+                <div><dt class="text-sm text-gray-400">{{t .Lang "website.log_dir"}}</dt><dd class="text-white font-mono text-sm" x-text="site.log_dir"></dd></div>
+                <div>
+                    <dt class="text-sm text-gray-400">{{t .Lang "website.expiry_time"}}</dt>
+                    <dd class="text-white" x-show="!editingExpiry" x-text="site.expires_at ? new Date(site.expires_at).toLocaleDateString('zh-CN') : t('common.none')"></dd>
+                    <div x-show="editingExpiry" class="flex items-center space-x-2">
+                        <input type="date" x-model="expiresAtInput" class="input-field text-sm py-1 w-44">
+                        <button @click="saveExpiry()" :disabled="expirySaving" class="btn-primary text-xs py-1 px-2" x-text="expirySaving ? t('common.saving') : t('common.save')"></button>
+                        <button @click="editingExpiry = false" class="text-gray-400 hover:text-white text-xs">{{t .Lang "website.cancel"}}</button>
+                    </div>
+                </div>
+                <div class="pt-1" x-show="!editingExpiry">
+                    <button @click="editingExpiry = true; expiresAtInput = site.expires_at ? site.expires_at.substring(0, 10) : ''" class="text-xs py-1 px-2 rounded" style="background-color: #1e3a5f; color: #93c5fd;">{{t .Lang "website.edit_expiry_time"}}</button>
+                </div>
+            </dl>
+        </div>
+
+        <div class="card">
+            <h3 class="text-lg font-semibold text-white mb-5">{{t .Lang "website.runtime_configuration"}}</h3>
+            <h4 class="text-base font-medium text-white mb-3">{{t .Lang "website.site_monitoring"}}</h4>
+            <label class="flex items-center space-x-2 text-sm text-gray-300 cursor-pointer mb-3">
+                <input type="checkbox" x-model="monitoringEnabled">
+                <span>{{t .Lang "website.enable_site_monitoring"}}</span>
+            </label>
+            <div x-show="monitoringEnabled" class="flex items-center space-x-2 mb-4">
+                <span class="text-xs text-gray-500">{{t .Lang "website.check_interval"}}</span>
+                <select x-model="monitoringInterval" class="input-field w-24 text-sm py-1">
+                    <option value="1">{{t .Lang "website.minute_1"}}</option>
+                    <option value="5">{{t .Lang "website.minute_5"}}</option>
+                    <option value="10">{{t .Lang "website.minute_10"}}</option>
+                    <option value="30">{{t .Lang "website.minute_30"}}</option>
+                </select>
+            </div>
+            <button @click="saveMonitoring()" :disabled="monitoringSaving" class="btn-primary text-sm" x-text="monitoringSaving ? t('common.saving') : t('website.save_settings')"></button>
+            <p x-show="monitoringEnabled" class="text-xs text-gray-500 mt-3">{{t .Lang "website.monitoring_enabled_help"}}</p>
+            <p x-show="!monitoringEnabled" class="text-xs text-gray-600 mt-3">{{t .Lang "website.monitoring_disabled_help"}}</p>
+
+            <hr class="my-5 border-gray-700">
+
+            <h4 class="text-base font-medium text-white mb-3">{{t .Lang "website.ssl_management"}}</h4>
+            <div class="mb-3">
+                <span :class="site.ssl_enabled ? 'badge-success' : site.ssl_last_error ? 'badge-warning' : 'badge-info'" class="text-sm" x-text="site.ssl_enabled ? t('website.ssl_enabled') : site.ssl_last_error ? t('website.ssl_pending') : t('website.ssl_not_enabled')"></span>
+            </div>
+            <div x-show="!site.ssl_enabled && site.ssl_last_error" class="mb-4 p-3 bg-yellow-900/40 border border-yellow-700 rounded-lg text-yellow-200 text-sm">
+                <p class="font-medium mb-1">{{t .Lang "website.last_ssl_failed"}}</p>
+                <p x-text="site.ssl_last_error"></p>
+            </div>
+            <div x-show="site.ssl_enabled">
+                <dl class="space-y-3 mb-4">
+                    <div><dt class="text-sm text-gray-400">{{t .Lang "website.cert_path"}}</dt><dd class="text-white font-mono text-sm break-all" x-text="site.ssl_cert_path"></dd></div>
+                    <div><dt class="text-sm text-gray-400">{{t .Lang "website.private_key_path"}}</dt><dd class="text-white font-mono text-sm break-all" x-text="site.ssl_key_path"></dd></div>
+                    <div><dt class="text-sm text-gray-400">{{t .Lang "website.expiry_time"}}</dt><dd class="text-white" x-text="site.ssl_expires_at ? new Date(site.ssl_expires_at).toLocaleDateString(currentLocale()) : t('website.unknown')"></dd></div>
+                </dl>
+                <div class="flex flex-wrap gap-3">
+                    <button @click="downloadSSLPackage()" class="text-sm py-1.5 px-3 rounded" style="background-color: #374151; color: #e5e7eb;">{{t .Lang "website.download_cert_package"}}</button>
+                    <button @click="sslMode='auto'; sslModalOpen=true" class="text-sm py-1.5 px-3 rounded" style="background-color: #166534; color: #bbf7d0;">{{t .Lang "website.reissue"}}</button>
+                    <button @click="sslMode='manual'; sslCert=''; sslKey=''; sslModalOpen=true" class="text-sm py-1.5 px-3 rounded" style="background-color: #1e3a5f; color: #93c5fd;">{{t .Lang "website.replace_cert"}}</button>
+                    <button @click="removeSSL()" class="text-sm py-1.5 px-3 rounded" style="background-color: #7f1d1d; color: #fca5a5;">{{t .Lang "website.delete_cert"}}</button>
+                </div>
+                <label class="mt-4 flex items-start space-x-2 cursor-pointer text-sm text-gray-300">
+                    <input type="checkbox" x-model="sslExportEnabled" @change="saveSSLExport()" :disabled="sslExportSaving" class="mt-0.5 w-4 h-4 rounded border-gray-600 bg-gray-700 text-blue-600 focus:ring-blue-500">
+                    <span>{{t .Lang "website.allow_plugin_read_ssl"}}</span>
+                </label>
+            </div>
+            <div x-show="!site.ssl_enabled">
+                <p class="text-gray-400 mb-4">{{t .Lang "website.ssl_not_enabled"}}</p>
+                <button @click="sslMode='auto'; sslModalOpen=true" class="btn-primary">{{t .Lang "website.enable_ssl"}}</button>
+            </div>
+
+            <hr class="my-5 border-gray-700">
+
+            <h4 class="text-base font-medium text-white mb-2">{{t .Lang "website.nginx_custom_config"}}</h4>
+            <details class="mb-4">
+                <summary class="cursor-pointer text-blue-400 hover:text-blue-300 text-xs">{{t .Lang "website.config_examples"}}</summary>
+                <div class="mt-2 ml-2 space-y-2 text-gray-500 text-xs">
+                    <p>{{t .Lang "website.nginx_pre_config_help"}}</p>
+                    <pre class="bg-gray-900 p-2 rounded leading-relaxed">client_max_body_size 128m;
+set $custom_var "value";</pre>
+                    <p>{{t .Lang "website.nginx_location_config_help"}}</p>
+                    <pre class="bg-gray-900 p-2 rounded leading-relaxed">if ($request_uri ~* "/ai-assistant") {
+    set $wp_skip_cache 1;
+}
+
+location ^~ /api/ {
+    proxy_pass http://127.0.0.1:3000;
+}</pre>
+                    <p class="text-yellow-500">{{t .Lang "website.nginx_config_scope_warning"}}</p>
+                </div>
+            </details>
+            <div class="mb-3">
+                <label class="block text-sm text-gray-300 mb-1">{{t .Lang "website.server_level_config"}}</label>
+                <textarea x-model="nginxPreContent" rows="3" class="w-full rounded p-2 text-xs font-mono" style="background-color: #0f172a; border: 1px solid #334155; color: #e2e8f0; resize: vertical;" placeholder="client_max_body_size 128m;"></textarea>
+            </div>
+            <div class="mb-4">
+                <label class="block text-sm text-gray-300 mb-1">{{t .Lang "website.location_level_config"}}</label>
+                <textarea x-model="nginxContent" rows="6" class="w-full rounded p-2 text-xs font-mono" style="background-color: #0f172a; border: 1px solid #334155; color: #e2e8f0; resize: vertical;" placeholder="if ($request_uri ~* &quot;/ai-assistant&quot;) { set $wp_skip_cache 1; }"></textarea>
+            </div>
+            <div class="flex space-x-3">
+                <button @click="saveNginxCustom()" :disabled="nginxSubmitting" class="btn-primary text-sm" x-text="nginxSubmitting ? t('common.saving') : t('website.save_apply')"></button>
+                <button @click="fetchNginxCustom()" class="text-sm py-1.5 px-3 rounded" style="background-color: #1e293b; border: 1px solid #334155; color: #e2e8f0;">{{t .Lang "website.refresh"}}</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Row 2: WordPress优化 | WordPress文件保护 -->
+    <!-- 这张卡片对 wordpress 和 php 两种 site_type 都会渲染（见上面的 :class 三元判断），
+         里面混了通用控件（FastCGI 缓存）和多个 WordPress 专属控件。新增/修改任何一个
+         "仅 WordPress 站点显示"的元素时，必须把本卡片内所有同类元素都加上
+         x-show="site.site_type === 'wordpress'"，不能只改自己新加的那一个——
+         之前"高级设置"折叠面板就漏加过，导致通用 PHP 站点也看到了停止更新检查等选项。 -->
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-8 mt-6">
+        <div class="card" :class="site.site_type === 'wordpress' ? '' : 'md:col-span-2'">
+            <h3 class="text-lg font-semibold text-white mb-4" x-text="site.site_type === 'wordpress' ? t('website.wp_optimization') : t('website.fastcgi_cache_title')"></h3>
+            <div class="flex items-center space-x-3 mb-3">
+                <label class="flex items-center space-x-2 text-sm text-gray-300 cursor-pointer">
+                    <input type="checkbox" x-model="fcacheEnabled">
+                    <span>{{t .Lang "website.enable_fastcgi_cache"}}</span>
+                </label>
+            </div>
+            <div x-show="fcacheEnabled" class="mb-3 ml-6">
+                <label class="text-sm text-gray-300 mb-1 block">{{t .Lang "website.cache_ttl_seconds"}}</label>
+                <input type="number" x-model="fcacheTTL" class="input-field w-32 text-sm py-1" min="10" max="86400">
+            </div>
+            <details class="mb-4 rounded border border-gray-700 bg-gray-900/30 px-3 py-2" x-show="site.site_type === 'wordpress'">
+                <summary class="cursor-pointer text-sm text-gray-300">{{t .Lang "website.wp_optimization_advanced"}}</summary>
+                <label class="mt-3 flex items-start space-x-2 text-sm text-gray-300 cursor-pointer">
+                    <input type="checkbox" x-model="disableWPUpdates" class="mt-0.5">
+                    <span>
+                        <span class="block">{{t .Lang "website.disable_wp_updates"}}</span>
+                        <span class="block text-xs text-yellow-300 mt-1">{{t .Lang "website.disable_wp_updates_help"}}</span>
+                    </span>
+                </label>
+            </details>
+            <div class="flex items-center space-x-3 mb-3" x-show="site.site_type === 'wordpress'">
+                <label class="flex items-center space-x-2 text-sm text-gray-300 cursor-pointer">
+                    <input type="checkbox" x-model="wpDebug">
+                    <span>{{t .Lang "website.enable_debug_mode"}}</span>
+                </label>
+            </div>
+            <div x-show="site.site_type === 'wordpress' && wpDebug" class="mb-3 ml-6">
+                <p class="text-xs text-gray-400">{{t .Lang "website.debug_mode_help"}}</p>
+                <label class="mt-2 flex items-start space-x-2 text-sm text-yellow-300 cursor-pointer">
+                    <input type="checkbox" x-model="wpDebugDisplay" class="mt-0.5">
+                    <span>
+                        <span class="block">{{t .Lang "website.debug_display"}}</span>
+                        <span class="block text-xs text-red-300 mt-1">{{t .Lang "website.debug_display_help"}}</span>
+                    </span>
+                </label>
+            </div>
+            <div class="flex items-center space-x-3 mb-3" x-show="site.site_type === 'wordpress'">
+                <label class="text-sm text-gray-300">
+                    <span>{{t .Lang "website.post_revisions"}}</span>
+                    <input type="number" :value="wpPostRevisions >= 0 ? wpPostRevisions : ''" @input="wpPostRevisions = $event.target.value === '' ? -1 : parseInt($event.target.value)" class="input-field w-24 text-sm py-1 ml-2" placeholder="{{t .Lang "website.default_placeholder"}}">
+                </label>
+                <span class="text-xs text-gray-500">{{t .Lang "website.post_revisions_help"}}</span>
+            </div>
+            <div class="flex items-center space-x-3 mb-3" x-show="site.site_type === 'wordpress'">
+                <label class="text-sm text-gray-300">
+                    <span>{{t .Lang "website.memory_limit"}}</span>
+                    <input type="text" x-model="wpMemoryLimit" class="input-field w-24 text-sm py-1 ml-2" placeholder="{{t .Lang "website.default_placeholder"}} 40M">
+                </label>
+                <span class="text-xs text-gray-500">{{t .Lang "website.memory_limit_help"}}</span>
+            </div>
+            <div class="flex items-center space-x-3 mb-4" x-show="site.site_type === 'wordpress'">
+                <label class="flex items-center space-x-2 text-sm text-gray-300 cursor-pointer">
+                    <input type="checkbox" x-model="xmlrpcEnabled">
+                    <span>{{t .Lang "website.allow_xmlrpc"}}</span>
+                </label>
+                <span class="text-xs text-gray-500">{{t .Lang "website.xmlrpc_help"}}</span>
+            </div>
+            <div class="flex items-center space-x-3 mb-4" x-show="site.site_type === 'wordpress'">
+                <label class="flex items-center space-x-2 text-sm text-gray-300 cursor-pointer">
+                    <input type="checkbox" x-model="disableApplicationPasswords">
+                    <span>{{t .Lang "website.disable_application_passwords"}}</span>
+                </label>
+                <span class="text-xs text-gray-500">{{t .Lang "website.disable_application_passwords_help"}}</span>
+            </div>
+            <div class="flex items-center space-x-3 mb-3">
+                <button @click="saveWPOptimizations()" :disabled="optimizationSaving || site.file_lock_enabled" class="btn-primary text-sm" x-text="optimizationSaving ? t('common.saving') : t('website.save_settings')"></button>
+                <button x-show="fcacheEnabled" @click="clearFCache()" class="text-sm py-1.5 px-3 rounded" style="background-color: #7f1d1d; color: #fca5a5;">{{t .Lang "website.clear_cache"}}</button>
+            </div>
+            <div x-show="site.site_type === 'wordpress'" id="companion-plugin-controls" class="flex flex-wrap items-center gap-3 mb-3">
+                <button x-show="pluginStatus === 'not_installed'" @click="installPlugin()" :disabled="pluginInstalling || site.file_lock_enabled" class="btn-primary text-sm py-1.5" x-text="pluginInstalling ? t('website.installing') : t('website.install_companion_plugin')"></button>
+                <button x-show="pluginStatus === 'update_available'" @click="installPlugin()" :disabled="pluginInstalling || !!maintenance.window_id || fileLockApplyIncomplete()" class="text-sm py-1.5 px-3 rounded" style="background-color: #166534; color: #bbf7d0;" x-text="pluginInstalling ? t('website.updating') : t('website.update_companion_plugin')"></button>
+                <button x-show="pluginStatus === 'config_missing'" @click="rebuildPluginConfig()" :disabled="pluginInstalling || site.file_lock_enabled" class="text-sm py-1.5 px-3 rounded" style="background-color: #92400e; color: #fef3c7;" x-text="pluginInstalling ? t('website.rebuilding_plugin_config') : t('website.rebuild_plugin_config')"></button>
+                <span x-show="pluginStatus === 'installed'" class="text-xs text-green-400">{{t .Lang "website.companion_active"}}</span>
+                <span x-show="pluginStatus === 'inactive'" class="text-xs text-yellow-300">{{t .Lang "website.companion_inactive"}}</span>
+                <span x-show="pluginStatus === 'unknown' && !pluginStatusLoading" class="text-xs text-gray-400">{{t .Lang "website.companion_unknown"}}</span>
+                <button @click="fetchPluginStatus()" :disabled="pluginStatusLoading || pluginInstalling" class="btn-secondary text-sm py-1.5">{{t .Lang "website.companion_refresh"}}</button>
+                <span x-show="pluginStatusLoading" class="text-xs text-gray-400">{{t .Lang "website.companion_checking"}}</span>
+                <span x-show="pluginStatus === 'not_installed' && site.file_lock_enabled" class="text-xs text-yellow-300">{{t .Lang "website.companion_unlock_install"}}</span>
+            </div>
+            <p x-show="site.file_lock_enabled" class="text-xs text-yellow-300 mb-3">{{t .Lang "website.file_lock_enabled_notice"}}</p>
+
+            <div class="mt-3 p-3 rounded text-xs" style="background-color: #0f172a;">
+                <p class="text-gray-300 font-medium mb-2">{{t .Lang "website.fastcgi_cache_how_it_works"}}</p>
+                <ul class="text-gray-400 space-y-1 list-disc list-inside">
+                    <li>{{t .Lang "website.fastcgi_cache_point_static"}}</li>
+                    <li>{{t .Lang "website.fastcgi_cache_point_key"}}</li>
+                    <li x-show="site.site_type === 'wordpress'">{{t .Lang "website.fastcgi_cache_point_wp_skip"}}</li>
+                    <li x-show="site.site_type === 'php'">{{t .Lang "website.fastcgi_cache_point_php_skip"}}</li>
+                </ul>
+                <p class="text-gray-500 mt-2" x-show="site.site_type === 'wordpress'">{{t .Lang "website.wp_optimizer_plugin_help"}}</p>
+            </div>
+            {{template "wp_anomaly_panel" .}}
+        </div>
+
+        <div x-show="site.site_type === 'wordpress'" class="card">
+            <div class="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
+                <div>
+                    <div class="flex items-center gap-2 mb-1">
+                        <h3 class="text-lg font-semibold text-white">{{t .Lang "website.file_lock"}}</h3>
+                        <span class="text-xs px-2 py-0.5 rounded" :class="fileLockApplyIncomplete() ? 'bg-red-900/50 text-red-200 border border-red-700' : (site.file_lock_enabled ? 'bg-yellow-900/50 text-yellow-200 border border-yellow-700' : 'bg-green-900/40 text-green-200 border border-green-800')" x-text="fileLockStatusText()"></span>
+                    </div>
+                    <p class="text-sm text-gray-400">{{t .Lang "website.file_lock_help"}}</p>
+                    <details class="mt-2 text-xs">
+                        <summary class="cursor-pointer text-yellow-300">{{t .Lang "website.file_lock_limits_toggle"}}</summary>
+                        <div class="mt-2 rounded border border-yellow-900/70 bg-yellow-950/30 px-3 py-2 text-yellow-100">
+                            <span class="font-medium">{{t .Lang "website.file_lock_limit_title"}}</span>
+                            <span class="text-yellow-200/80">{{t .Lang "website.file_lock_limit_help"}}</span>
+                        </div>
+                    </details>
+                    <p x-show="site.file_lock_mode === 'legacy'" class="text-xs text-yellow-300 mt-2">{{t .Lang "website.file_lock_legacy_notice"}}</p>
+                    <p x-show="fileLockApplyIncomplete()" class="text-xs text-red-300 mt-2">{{t .Lang "website.file_lock_apply_failed_notice"}}</p>
+                </div>
+            </div>
+
+            <div class="mt-4 grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_auto] gap-3 items-end">
+                <label class="block">
+                    <span class="text-xs text-gray-400 block mb-1">{{t .Lang "website.file_lock_mode"}}</span>
+                    <select x-model="fileLockMode" @change="fileLockPreview = null" :disabled="fileLockSaving" class="input-field w-full text-sm py-1.5">
+                        <option value="standard">{{t .Lang "website.file_lock_mode_standard"}}</option>
+                        <option value="strict">{{t .Lang "website.file_lock_mode_strict"}}</option>
+                    </select>
+                </label>
+                <div class="flex flex-wrap gap-2">
+                    <button @click="loadFileLockPreview()" :disabled="fileLockSaving || fileLockPreviewLoading" class="text-sm py-1.5 px-3 rounded bg-gray-700 text-gray-200" x-text="fileLockPreviewLoading ? t('website.file_lock_checking') : t('website.file_lock_check_impact')"></button>
+                    <button x-show="!site.file_lock_enabled || site.file_lock_mode === 'legacy' || site.file_lock_mode !== fileLockMode || fileLockApplyIncomplete()" @click="applyFileLock(true)" :disabled="fileLockSaving" class="text-sm py-1.5 px-3 rounded bg-red-900 text-red-200" x-text="fileLockSaving ? t('website.processing') : (site.file_lock_enabled ? t('website.file_lock_apply_mode') : t('website.enable_lock'))"></button>
+                    <button x-show="site.file_lock_enabled" @click="applyFileLock(false)" :disabled="fileLockSaving" class="text-sm py-1.5 px-3 rounded bg-blue-950 text-blue-300" x-text="t('website.unlock')"></button>
+                </div>
+            </div>
+            <p class="text-xs text-gray-500 mt-2" x-text="fileLockMode === 'strict' ? t('website.file_lock_strict_help') : t('website.file_lock_standard_help')"></p>
+
+            <div x-show="fileLockPreview" class="mt-3 rounded border border-gray-700 bg-gray-900/60 p-3 text-xs space-y-2">
+                <p class="text-sm font-medium text-white">{{t .Lang "website.file_lock_preview_title"}}</p>
+                <div>
+                    <span class="text-gray-400" x-text="t('website.file_lock_writable_dirs')"></span>
+                    <div class="mt-1 flex flex-wrap gap-1.5"><template x-for="path in (fileLockPreview?.writable_dirs || [])" :key="path"><span class="px-2 py-1 rounded bg-green-950/60 text-green-300 border border-green-900" x-text="fileLockDisplayPath(path)"></span></template></div>
+                </div>
+                <div>
+                    <span class="text-gray-400" x-text="t('website.file_lock_readonly_dirs')"></span>
+                    <div x-show="(fileLockPreview?.read_only_dirs || []).length" class="mt-1 flex flex-wrap gap-1.5"><template x-for="path in (fileLockPreview?.read_only_dirs || [])" :key="path"><span class="px-2 py-1 rounded bg-blue-950/60 text-blue-200 border border-blue-900" x-text="fileLockDisplayPath(path)"></span></template></div>
+                    <span x-show="!(fileLockPreview?.read_only_dirs || []).length" class="text-gray-300" x-text="t('common.none')"></span>
+                </div>
+                <div>
+                    <span class="text-gray-400" x-text="t('website.file_lock_sensitive_files')"></span>
+                    <div x-show="(fileLockPreview?.sensitive_files || []).length" class="mt-1 flex flex-wrap gap-1.5"><template x-for="path in (fileLockPreview?.sensitive_files || [])" :key="path"><span class="px-2 py-1 rounded bg-blue-950/60 text-blue-200 border border-blue-900" x-text="fileLockDisplayPath(path)"></span></template></div>
+                    <span x-show="!(fileLockPreview?.sensitive_files || []).length" class="text-gray-300" x-text="t('common.none')"></span>
+                </div>
+                <div x-show="(fileLockPreview?.executable_files || []).length > 0" class="text-yellow-300">
+                    <span x-text="t('website.file_lock_executable_warning', { count: fileLockPreview?.executable_files?.length || 0 })"></span>
+                    <ul class="mt-1 ml-4 list-disc text-gray-300"><template x-for="path in (fileLockPreview?.executable_files || []).slice(0, 20)" :key="path"><li x-text="path"></li></template></ul>
+                </div>
+                <div x-show="(fileLockPreview?.symlink_paths || []).length > 0" class="text-yellow-300">
+                    <span x-text="t('website.file_lock_symlink_warning', { count: fileLockPreview?.symlink_paths?.length || 0 })"></span>
+                    <ul class="mt-1 ml-4 list-disc text-gray-300"><template x-for="path in (fileLockPreview?.symlink_paths || []).slice(0, 20)" :key="path"><li x-text="path"></li></template></ul>
+                </div>
+                <p x-show="fileLockPreview?.truncated" class="text-yellow-300" x-text="t('website.file_lock_preview_truncated')"></p>
+                <p class="text-gray-500">{{t .Lang "website.file_lock_preview_disclaimer"}}</p>
+            </div>
+
+            <hr class="my-5 border-gray-700">
+            <section x-show="site.site_type === 'wordpress'" class="mb-5 space-y-3">
+                <h3 class="text-lg font-semibold">{{t .Lang "maintenance.title"}}</h3>
+                <p class="text-sm text-gray-400">{{t .Lang "maintenance.help"}}</p>
+                <p class="text-sm" :class="maintenance.state === 'unknown' || maintenance.state === 'relock_failed' ? 'text-red-300' : 'text-yellow-300'" x-text="maintenanceStateText()"></p>
+                <fieldset :disabled="maintenanceSaving || !!maintenance.window_id" class="space-y-3">
+                    <label class="flex items-center gap-2"><input type="checkbox" x-model="maintenanceEnabled">{{t .Lang "maintenance.enable"}}</label>
+                    <label class="block text-sm">{{t .Lang "maintenance.duration"}}
+                        <select x-model.number="maintenanceMinutes" class="input-field"><option value="3">3</option><option value="5">5</option><option value="10">10</option></select>
+                    </label>
+                    <label class="block text-sm">{{t .Lang "maintenance.password"}}
+                        <input type="text" x-model="maintenancePasswordInput" autocomplete="off" minlength="4" maxlength="72" class="input-field w-full">
+                    </label>
+                    <div class="flex flex-wrap gap-2 items-center">
+                        <button type="button" class="btn-secondary text-sm" @click="generateMaintenancePassword()">{{t .Lang "maintenance.generate_password"}}</button>
+                        <button type="button" class="btn-secondary text-sm" :disabled="!maintenancePasswordInput" @click="copyMaintenancePassword()">{{t .Lang "maintenance.copy_password"}}</button>
+                        <span class="text-xs text-gray-400" x-show="maintenanceSecretError">{{t .Lang "maintenance.secret_error"}}</span>
+                        <span class="text-xs text-gray-400" x-show="maintenance.password_set && !maintenancePasswordInput && !maintenanceSecretError">{{t .Lang "maintenance.legacy_password"}}</span>
+                    </div>
+                    <p class="text-xs text-gray-400">{{t .Lang "maintenance.password_help"}}</p>
+                    <button type="button" class="btn-primary text-sm" @click="saveMaintenance()" x-text="maintenanceSaving ? t('common.saving') : t('common.save')"></button>
+                </fieldset>
+                <button type="button" x-show="maintenance.window_id" :disabled="maintenanceSaving" class="btn-primary text-sm" @click="relockMaintenance()">{{t .Lang "maintenance.relock"}}</button>
+            </section>
+            <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                <label class="flex items-start space-x-2 text-sm text-gray-300" :class="site.file_lock_enabled ? 'cursor-not-allowed opacity-80' : 'cursor-pointer'">
+                    <input type="checkbox" :checked="site.file_lock_enabled || disableFileEditing" @change="disableFileEditing = $event.target.checked" :disabled="site.file_lock_enabled || fileEditingSaving" class="mt-0.5">
+                    <span>
+                        <span class="block">{{t .Lang "website.disable_file_editing"}}</span>
+                        <span class="block text-xs text-gray-500 mt-1">{{t .Lang "website.disable_file_editing_help"}}</span>
+                        <span x-show="site.file_lock_enabled" class="block text-xs text-green-400 mt-1">{{t .Lang "website.disable_file_editing_managed"}}</span>
+                    </span>
+                </label>
+                <button x-show="!site.file_lock_enabled" @click="saveFileEditingProtection()" :disabled="fileEditingSaving" class="btn-secondary text-sm whitespace-nowrap" x-text="fileEditingSaving ? t('common.saving') : t('website.save_file_editing')"></button>
+            </div>
+
+            <hr class="my-5 border-gray-700">
+            <div class="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
+                <div class="flex-1">
+                    <label class="block text-sm text-gray-300 font-medium mb-1">{{t .Lang "website.password_reset_mode"}}</label>
+                    <span class="block text-xs text-gray-500 mb-2">{{t .Lang "website.password_reset_help"}}</span>
+                    <select x-model="passwordResetMode" :disabled="passwordResetSaving" class="input-field w-full text-sm py-1.5 max-w-xs">
+                        <option value="allow">{{t .Lang "website.password_reset_allow"}}</option>
+                        <option value="all">{{t .Lang "website.password_reset_all"}}</option>
+                        <option value="admin">{{t .Lang "website.password_reset_admin"}}</option>
+                    </select>
+                    <p x-show="passwordResetMode === 'all'" class="text-xs text-yellow-300 mt-2">{{t .Lang "website.password_reset_all_hides_link"}}</p>
+                    <p x-show="passwordResetMode === 'admin'" class="text-xs text-gray-500 mt-2">{{t .Lang "website.password_reset_admin_help"}}</p>
+                </div>
+                <button @click="savePasswordReset()" :disabled="passwordResetSaving" class="btn-secondary text-sm whitespace-nowrap" x-text="passwordResetSaving ? t('common.saving') : t('website.save_password_reset')"></button>
+            </div>
+            <p x-show="pluginStatus === 'not_installed'" class="text-xs text-gray-500 mt-4">{{t .Lang "website.file_lock_plugin_optional"}}</p>
+        </div>
+    </div>
+
+    <!-- Row 3: 网站日志 -->
+    <div class="mt-6">
+        <div class="card">
+            <h3 class="text-lg font-semibold text-white mb-4">{{t .Lang "website.site_logs"}}</h3>
+            <div class="flex flex-wrap items-center gap-2 mb-3">
+                <button @click="selectLogType('access')" :class="logType === 'access' ? 'text-white border-b-2 border-blue-400' : 'text-gray-400 hover:text-white'" class="px-3 py-1 text-sm font-medium">{{t .Lang "website.access_log"}}</button>
+                <button @click="selectLogType('error')" :class="logType === 'error' ? 'text-white border-b-2 border-blue-400' : 'text-gray-400 hover:text-white'" class="px-3 py-1 text-sm font-medium">{{t .Lang "website.error_log"}}</button>
+                <button x-show="site.site_type === 'wordpress'" @click="selectLogType('security')" :class="logType === 'security' ? 'text-white border-b-2 border-blue-400' : 'text-gray-400 hover:text-white'" class="px-3 py-1 text-sm font-medium">{{t .Lang "website.security_log"}}</button>
+                <button @click="fetchLogs()" class="text-sm py-1 px-3 rounded text-gray-400 hover:text-white" style="background-color: #1e293b; border: 1px solid #334155;">{{t .Lang "website.refresh"}}</button>
+                <button @click="clearLogs()" class="text-sm py-1 px-3 rounded" style="background-color: #7f1d1d; color: #fca5a5;">{{t .Lang "website.clear"}}</button>
+                <button @click="logFullscreen = true" class="text-sm py-1 px-3 rounded text-gray-400 hover:text-white" style="background-color: #1e293b; border: 1px solid #334155;">{{t .Lang "website.fullscreen"}}</button>
+                <button @click="downloadLogFile(currentLogFilename())" class="text-sm py-1 px-3 rounded text-gray-400 hover:text-white" style="background-color: #1e293b; border: 1px solid #334155;">{{t .Lang "website.download_current_full_log"}}</button>
+				<a :href="(document.body.dataset.panelPrefix || '') + '/log-analysis?site_id=' + site.id" class="text-sm py-1 px-3 rounded inline-block" style="background-color: #14532d; color: #86efac;">{{t .Lang "website.analyze_logs"}}</a>
+                <select @change="setAccessLogMode($event.target.value)" x-model="accessLogMode" x-show="logType === 'access'" class="input-field w-28 text-sm py-1">
+                    <option value="off">{{t .Lang "website.access_log_off"}}</option>
+                    <option value="error_only">{{t .Lang "website.access_log_error_only"}}</option>
+                    <option value="full">{{t .Lang "website.access_log_full"}}</option>
+                </select>
+                <select x-model.number="logLineLimit" @change="fetchLogs()" class="input-field w-28 text-sm py-1">
+                    <option value="200">{{t .Lang "website.recent_200_lines"}}</option>
+                    <option value="1000">{{t .Lang "website.recent_1000_lines"}}</option>
+                    <option value="5000">{{t .Lang "website.recent_5000_lines"}}</option>
+                </select>
+                <div class="flex items-center gap-1 text-sm text-gray-400 whitespace-nowrap">
+                    <span>{{t .Lang "website.keep"}}</span>
+                    <input type="number" x-model.number="logRetentionDays" @change="saveLogRetention()" class="input-field w-16 text-sm py-1 text-center" min="0" max="365">
+                    <span>{{t .Lang "website.days"}}</span>
+                </div>
+            </div>
+            <p class="text-xs text-gray-500 mb-3">{{t .Lang "website.log_preview_help"}}</p>
+            <pre x-text="logContent" class="w-full rounded p-3 text-xs font-mono overflow-auto" style="background-color: #0f172a; border: 1px solid #334155; color: #94a3b8; max-height: 400px; white-space: pre-wrap; word-break: break-all;"></pre>
+            <div class="mt-4">
+                <div class="flex items-center justify-between mb-2">
+                    <h4 class="text-sm font-medium text-white">{{t .Lang "website.history_log_download"}}</h4>
+                    <button @click="fetchLogFiles()" class="text-xs py-1 px-2 rounded text-gray-400 hover:text-white" style="background-color: #1e293b; border: 1px solid #334155;">{{t .Lang "website.refresh_list"}}</button>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-sm">
+                        <thead>
+                            <tr>
+                                <th class="table-header">{{t .Lang "website.file"}}</th>
+                                <th class="table-header">{{t .Lang "website.size"}}</th>
+                                <th class="table-header">{{t .Lang "website.modified_at"}}</th>
+                                <th class="table-header">{{t .Lang "website.status"}}</th>
+                                <th class="table-header text-right">{{t .Lang "website.actions"}}</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <template x-for="file in logFiles" :key="file.name">
+                                <tr class="table-row">
+                                    <td class="table-cell font-mono text-xs" x-text="file.name"></td>
+                                    <td class="table-cell" x-text="formatBytes(file.size || 0)"></td>
+                                    <td class="table-cell" x-text="fmtTime(file.modified_at)"></td>
+                                    <td class="table-cell">
+                                        <span x-show="file.current" class="badge-success">{{t .Lang "website.current"}}</span>
+                                        <span x-show="!file.current && file.compressed" class="badge-info">{{t .Lang "website.compressed"}}</span>
+                                        <span x-show="!file.current && !file.compressed" class="badge-warning">{{t .Lang "website.rotated"}}</span>
+                                    </td>
+                                    <td class="table-cell text-right">
+                                        <button @click="downloadLogFile(file.name)" class="btn-primary text-xs py-1 px-2">{{t .Lang "website.download"}}</button>
+                                    </td>
+                                </tr>
+                            </template>
+                            <tr x-show="logFiles.length === 0">
+                                <td colspan="5" class="table-cell text-center text-gray-500 py-4">{{t .Lang "website.no_downloadable_logs"}}</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 日志全屏弹窗 -->
+    <div x-show="logFullscreen" class="fixed inset-0 bg-black bg-opacity-90 flex flex-col z-50" @keydown.escape.window="logFullscreen = false">
+        <div class="flex items-center justify-between px-6 py-3 border-b border-gray-700">
+            <div class="flex items-center space-x-4 text-sm">
+                <span class="text-white font-semibold" x-text="logType === 'access' ? t('website.log_type_access') : (logType === 'security' ? t('website.log_type_security') : t('website.log_type_error'))"></span>
+                <button @click="selectLogType('access')" :class="logType === 'access' ? 'text-white border-b-2 border-blue-400' : 'text-gray-400 hover:text-white'" class="px-3 py-1 text-sm font-medium">{{t .Lang "website.log_type_access"}}</button>
+                <button @click="selectLogType('error')" :class="logType === 'error' ? 'text-white border-b-2 border-blue-400' : 'text-gray-400 hover:text-white'" class="px-3 py-1 text-sm font-medium">{{t .Lang "website.log_type_error"}}</button>
+                <button x-show="site.site_type === 'wordpress'" @click="selectLogType('security')" :class="logType === 'security' ? 'text-white border-b-2 border-blue-400' : 'text-gray-400 hover:text-white'" class="px-3 py-1 text-sm font-medium">{{t .Lang "website.log_type_security"}}</button>
+                <button @click="fetchLogs()" class="text-sm py-1 px-3 rounded text-gray-400 hover:text-white" style="background-color: #1e293b; border: 1px solid #334155;">{{t .Lang "website.refresh"}}</button>
+                <select x-model.number="logLineLimit" @change="fetchLogs()" class="input-field w-28 text-sm py-1">
+                    <option value="200">{{t .Lang "website.log_last_200"}}</option>
+                    <option value="1000">{{t .Lang "website.log_last_1000"}}</option>
+                    <option value="5000">{{t .Lang "website.log_last_5000"}}</option>
+                </select>
+                <button @click="downloadLogFile(currentLogFilename())" class="text-sm py-1 px-3 rounded text-gray-400 hover:text-white" style="background-color: #1e293b; border: 1px solid #334155;">{{t .Lang "website.download_current_log"}}</button>
+            </div>
+            <button @click="logFullscreen = false" class="text-gray-400 hover:text-white text-2xl leading-none">&times;</button>
+        </div>
+        <pre x-text="logContent" class="flex-1 w-full p-6 text-xs font-mono overflow-auto" style="background-color: #0a0e14; color: #94a3b8; white-space: pre-wrap; word-break: break-all;"></pre>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- Modals -->
+    <!-- ============================================================ -->
+
+    <!-- AI 开发访问 -->
+    <div x-show="aiDevelopmentModalOpen" x-cloak class="fixed inset-0 z-50 flex items-center justify-center bg-black/60" @click.self="if (!aiAccess.busy) aiDevelopmentModalOpen = false">
+        <div class="bg-gray-800 rounded-lg p-6 max-w-4xl w-full mx-4 shadow-xl max-h-[80vh] overflow-y-auto" style="border: 1px solid #581c87;">
+            <div class="flex flex-wrap items-start justify-between gap-3 mb-5">
+                <div>
+                    <h3 class="text-lg font-semibold text-white">{{t .Lang "ai_development.title"}}</h3>
+                    <p class="text-sm text-gray-400 mt-1">{{t .Lang "ai_development.description"}}</p>
+                </div>
+                <div class="flex items-center gap-3">
+                    <span class="text-xs px-2 py-1 rounded" :class="aiAccess.enabled ? 'bg-red-900/50 text-red-200' : 'bg-gray-800 text-gray-400'" x-text="aiAccess.enabled ? t('ai_development.enabled') : t('ai_development.disabled_status')"></span>
+                    <button @click="aiDevelopmentModalOpen = false" :disabled="aiAccess.busy" class="text-gray-400 hover:text-white disabled:opacity-40 text-xl leading-none">&times;</button>
+                </div>
+            </div>
+            <div x-show="aiAccess.loading" class="text-sm text-gray-500 py-6 text-center">{{t .Lang "common.loading"}}</div>
+            <div x-show="!aiAccess.loading && aiAccess.busy" class="rounded border border-purple-700 bg-purple-950/40 px-5 py-10 text-center">
+                <p class="text-base font-semibold text-purple-100" x-text="aiAccess.stage || t('ai_development.processing')"></p>
+                <p class="mt-2 text-xs text-gray-400">{{t .Lang "ai_development.processing_help"}}</p>
+            </div>
+            <div x-show="!aiAccess.loading && !aiAccess.busy && !aiAccess.enabled && aiAccess.status === 'disabled'" class="space-y-4">
+                <div class="rounded border border-red-800 bg-red-950/40 p-4 text-sm text-red-100">
+                    <p class="font-semibold mb-2">{{t .Lang "ai_development.risk_title"}}</p>
+                    <p>{{t .Lang "ai_development.risk_body"}}</p>
+                </div>
+                <div>
+                    <p class="text-sm font-medium text-white mb-2">{{t .Lang "ai_development.component_check"}}</p>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        <div class="rounded border border-gray-700 p-3">
+                            <div class="flex items-center justify-between gap-3">
+                                <span class="text-white">WP-CLI</span>
+                                <span x-show="developmentToolInstalled('wp-cli')" class="text-xs px-2 py-1 rounded bg-green-900/50 text-green-200">{{t .Lang "software.installed"}}</span>
+                            </div>
+                            <label x-show="!developmentToolInstalled('wp-cli')" class="flex items-start gap-2 mt-2 cursor-pointer">
+                                <input type="checkbox" x-model="aiAccess.installWPCLI" class="mt-1">
+                                <span class="text-sm text-gray-300">{{t .Lang "ai_development.install_when_enabling"}}</span>
+                            </label>
+                            <p class="text-xs text-gray-500 mt-2">{{t .Lang "ai_development.wp_cli_help"}}</p>
+                        </div>
+                        <div class="rounded border border-gray-700 p-3">
+                            <div class="flex items-center justify-between gap-3">
+                                <span class="text-white">Node.js + npm</span>
+                                <span x-show="developmentToolInstalled('nodejs')" class="text-xs px-2 py-1 rounded bg-green-900/50 text-green-200">{{t .Lang "software.installed"}}</span>
+                            </div>
+                            <label x-show="!developmentToolInstalled('nodejs')" class="flex items-start gap-2 mt-2 cursor-pointer">
+                                <input type="checkbox" x-model="aiAccess.installNodeJS" class="mt-1">
+                                <span class="text-sm text-gray-300">{{t .Lang "ai_development.install_when_enabling"}}</span>
+                            </label>
+                            <p class="text-xs text-gray-500 mt-2">{{t .Lang "ai_development.node_help"}}</p>
+                        </div>
+                    </div>
+                </div>
+                <label class="block text-sm text-gray-300">
+                    <span>{{t .Lang "ai_development.confirm_domain_label"}}</span>
+                    <input type="text" x-model="aiAccess.confirmDomain" :placeholder="site.domain" class="input-field mt-1 max-w-md">
+                </label>
+                <div class="flex justify-end gap-3 pt-2">
+                    <button @click="aiDevelopmentModalOpen = false" :disabled="aiAccess.busy" class="btn-secondary">{{t .Lang "common.cancel"}}</button>
+                    <button @click="enableAIDevelopment()" :disabled="aiAccess.busy || aiAccess.confirmDomain !== site.domain" class="btn-danger text-sm" x-text="aiAccess.busy ? (aiAccess.stage || t('ai_development.processing')) : t('ai_development.enable_button')"></button>
+                </div>
+            </div>
+            <div x-show="!aiAccess.loading && !aiAccess.busy && aiAccess.status !== 'disabled'" class="space-y-4">
+                <dl class="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+                    <div><dt class="text-gray-500">{{t .Lang "website.system_user"}}</dt><dd class="text-white font-mono" x-text="aiAccess.system_user"></dd></div>
+                    <div><dt class="text-gray-500">{{t .Lang "website.site_root"}}</dt><dd class="text-white font-mono break-all" x-text="aiAccess.web_root"></dd></div>
+                    <div><dt class="text-gray-500">{{t .Lang "ai_development.key_fingerprint"}}</dt><dd class="text-white font-mono break-all" x-text="aiAccess.key_fingerprint || '-'"></dd></div>
+                    <div><dt class="text-gray-500">{{t .Lang "software.status"}}</dt><dd class="text-white" x-text="aiAccess.status"></dd></div>
+                </dl>
+                <p x-show="aiAccess.last_error" class="rounded bg-red-950/40 border border-red-800 p-3 text-sm text-red-200" x-text="aiAccess.last_error"></p>
+                <div x-show="aiAccess.enabled" class="rounded border border-blue-800 bg-blue-950/30 p-4">
+                    <h4 class="text-sm font-semibold text-white mb-3">{{t .Lang "ai_development.usage_title"}}</h4>
+                    <ol class="list-decimal list-inside space-y-2 text-sm text-gray-300">
+                        <li>{{t .Lang "ai_development.usage_step_download"}}</li>
+                        <li>{{t .Lang "ai_development.usage_step_extract"}}</li>
+                        <li>{{t .Lang "ai_development.usage_step_open"}}</li>
+                    </ol>
+                    <label class="block text-xs text-gray-400 mt-4 mb-1">{{t .Lang "ai_development.first_prompt_label"}}</label>
+                    <textarea readonly :value="t('ai_development.first_prompt')" rows="5" class="w-full rounded p-3 text-xs font-mono" style="background-color: #0f172a; border: 1px solid #334155; color: #e2e8f0; resize: vertical;"></textarea>
+                    <div class="flex flex-wrap items-center justify-between gap-3 mt-3">
+                        <p class="text-xs text-yellow-300">{{t .Lang "ai_development.credential_once_warning"}}</p>
+                        <div class="flex flex-wrap gap-2">
+                            <button @click="copyAIDevelopmentFirstPrompt()" class="btn-primary text-sm">{{t .Lang "ai_development.copy_first_prompt"}}</button>
+                            <button @click="downloadAIDevelopmentCredential()" :disabled="aiAccess.busy" class="btn-success text-sm" x-text="aiAccess.busy ? (aiAccess.stage || t('ai_development.processing')) : (aiCredentialPackage && !aiCredentialDownloaded ? t('ai_development.download_package') : t('ai_development.regenerate_package'))"></button>
+                        </div>
+                    </div>
+                </div>
+                <div class="flex flex-wrap justify-end gap-2">
+                    <a :href="(document.body.dataset.panelPrefix || '') + '/software'" class="btn-secondary text-sm">{{t .Lang "ai_development.manage_tools"}}</a>
+                    <button @click="disableAIDevelopment()" :disabled="aiAccess.busy" class="btn-danger text-sm">{{t .Lang "ai_development.disable_button"}}</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 编辑域名 -->
+    <div x-show="domainModalOpen" class="fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center z-50" @click.self="domainModalOpen = false">
+        <div class="rounded-lg shadow-xl w-full max-w-md p-6" style="background-color: #1e293b; border: 1px solid #334155;">
+            <div class="flex items-center justify-between mb-4">
+                <h3 class="text-lg font-semibold text-white">{{t .Lang "website.edit_domain"}}</h3>
+                <button @click="domainModalOpen = false" class="text-gray-400 hover:text-white text-xl">&times;</button>
+            </div>
+            <div class="mb-3">
+                <label class="block text-sm text-gray-300 mb-1">{{t .Lang "website.main_domain"}}</label>
+                <input type="text" x-model="editDomain" class="w-full rounded p-2 text-sm font-mono" style="background-color: #0f172a; border: 1px solid #334155; color: #e2e8f0;">
+            </div>
+            <div class="mb-3">
+                <label class="block text-sm text-gray-300 mb-1">{{t .Lang "website.aliases_one_per_line"}}</label>
+                <textarea x-model="editAliasesStr" rows="4" class="w-full rounded p-2 text-sm font-mono" style="background-color: #0f172a; border: 1px solid #334155; color: #e2e8f0; resize: vertical;" placeholder="www.aaa.com&#10;blog.aaa.com"></textarea>
+            </div>
+            <div x-show="editDomain !== site.domain" class="mb-3 p-3 rounded text-sm" style="background-color: #422006; border: 1px solid #78350f; color: #fbbf24;">
+                <span x-text="t('website.domain_change_resources_warning', { user: site.system_user })"></span>
+            </div>
+            <div x-show="site.site_type === 'wordpress'" class="mb-3 p-3 rounded" style="background-color: #0f172a; border: 1px solid #334155;">
+                <label class="flex items-start gap-2 text-sm text-gray-200">
+                    <input type="checkbox" x-model="syncWPSiteURLs" :disabled="wpURLsLoading || !editDomain.trim() || editDomain.trim().toLowerCase() === site.domain.toLowerCase() || !canSyncWPSiteURLs()" class="mt-1">
+                    <span>{{t .Lang "website.sync_wp_site_urls"}}</span>
+                </label>
+                <p class="text-xs text-gray-400 mt-2">{{t .Lang "website.sync_wp_site_urls_help"}}</p>
+                <p x-show="wpURLsLoading" class="text-xs text-gray-400 mt-2">{{t .Lang "website.reading"}}</p>
+                <p x-show="!wpURLsLoading && (!editDomain.trim() || editDomain.trim().toLowerCase() === site.domain.toLowerCase())" class="text-xs text-amber-300 mt-2">{{t .Lang "website.sync_wp_site_urls_enter_domain"}}</p>
+                <div x-show="!wpURLsLoading && editDomain.trim() && editDomain.trim().toLowerCase() !== site.domain.toLowerCase() && canSyncWPSiteURLs()" class="mt-2 space-y-2 text-xs font-mono break-all">
+                    <div><span class="text-gray-400">home:</span> <span class="text-gray-300" x-text="wpHomeURL"></span> <span class="text-gray-500">→</span> <span class="text-green-300" x-text="previewWPURL(wpHomeURL)"></span></div>
+                    <div><span class="text-gray-400">siteurl:</span> <span class="text-gray-300" x-text="wpSiteURL"></span> <span class="text-gray-500">→</span> <span class="text-green-300" x-text="previewWPURL(wpSiteURL)"></span></div>
+                </div>
+                <p x-show="!wpURLsLoading && wpURLsError" class="text-xs text-yellow-300 mt-2" x-text="wpURLsError"></p>
+            </div>
+            <p x-show="site.ssl_enabled" class="text-yellow-400 text-xs mb-3">{{t .Lang "website.domain_change_ssl_warning"}}</p>
+            <div class="flex justify-end space-x-3">
+                <button @click="domainModalOpen = false" class="btn-secondary">{{t .Lang "common.cancel"}}</button>
+                <button @click="updateDomains()" :disabled="domainSubmitting" class="btn-primary" x-text="domainSubmitting ? t('website.processing') : t('common.save')"></button>
+            </div>
+        </div>
+    </div>
+
+    <!-- SSL 证书 -->
+    <div x-show="sslModalOpen" class="fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center z-50" @click.self="sslModalOpen = false">
+        <div class="rounded-lg shadow-xl w-full max-w-2xl p-6" style="background-color: #1e293b; border: 1px solid #334155;">
+            <div class="flex items-center justify-between mb-4">
+                <h3 class="text-lg font-semibold text-white">
+                    <span x-show="!site.ssl_enabled">{{t .Lang "website.enable_ssl_for"}} <span x-text="site.domain"></span></span>
+                    <span x-show="site.ssl_enabled && sslMode === 'auto'">{{t .Lang "website.reissue_ssl_for"}} <span x-text="site.domain"></span></span>
+                    <span x-show="site.ssl_enabled && sslMode === 'manual'">{{t .Lang "website.replace_ssl_for"}} <span x-text="site.domain"></span></span>
+                </h3>
+                <button @click="sslModalOpen = false" class="text-gray-400 hover:text-white text-xl">&times;</button>
+            </div>
+
+            <div class="flex border-b border-gray-600 mb-4">
+                <button @click="sslMode = 'auto'" :class="sslMode === 'auto' ? 'text-blue-400 border-b-2 border-blue-400' : 'text-gray-400 hover:text-white'" class="px-4 py-2 text-sm font-medium">{{t .Lang "website.auto_ssl"}}</button>
+                <button @click="sslMode = 'manual'" :class="sslMode === 'manual' ? 'text-blue-400 border-b-2 border-blue-400' : 'text-gray-400 hover:text-white'" class="px-4 py-2 text-sm font-medium">{{t .Lang "website.manual_ssl"}}</button>
+            </div>
+
+            <div x-show="sslMode === 'auto'">
+                <p class="text-gray-400 text-sm mb-4">{{t .Lang "website.auto_ssl_help"}}</p>
+            </div>
+
+            <div x-show="sslMode === 'manual'">
+                <div class="mb-4">
+                    <label class="block text-sm text-gray-300 mb-1">{{t .Lang "website.ssl_cert_content"}}</label>
+                    <textarea x-model="sslCert" rows="6" class="w-full rounded p-3 text-sm font-mono" style="background-color: #0f172a; border: 1px solid #334155; color: #e2e8f0; resize: vertical;" placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"></textarea>
+                </div>
+                <div class="mb-4">
+                    <label class="block text-sm text-gray-300 mb-1">{{t .Lang "website.ssl_key_content"}}</label>
+                    <textarea x-model="sslKey" rows="6" class="w-full rounded p-3 text-sm font-mono" style="background-color: #0f172a; border: 1px solid #334155; color: #e2e8f0; resize: vertical;" placeholder="-----BEGIN PRIVATE KEY-----&#10;...&#10;-----END PRIVATE KEY-----"></textarea>
+                </div>
+            </div>
+
+            <div class="flex justify-end space-x-3 mt-4">
+                <button @click="sslModalOpen = false" class="btn-secondary">{{t .Lang "common.cancel"}}</button>
+                <button @click="enableSSL()" :disabled="sslSubmitting" class="btn-primary" x-text="sslSubmitting ? t('website.processing') : t('common.confirm')"></button>
+            </div>
+        </div>
+    </div>
+    </div>
+</template>
+
+</div>
+
+{{template "wp_anomaly_script" .}}
+<script>
+function websiteDetail() {
+    return {
+        site: null,
+		maintenance: { state: 'unknown', window_id: '' },
+		maintenanceEnabled: false,
+		maintenanceMinutes: 5,
+		maintenanceSaving: false,
+		maintenancePasswordInput: '',
+		maintenanceSecretError: false,
+		async loadMaintenancePassword() {
+			this.maintenancePasswordInput = ''; this.maintenanceSecretError = false;
+			try {
+				const r = await api('/websites/' + this.site.id + '/maintenance/password', {method:'POST', body:{}});
+				this.maintenancePasswordInput = r.data.password;
+			} catch (_) { this.maintenanceSecretError = true; }
+		},
+		async copyMaintenancePassword() {
+			try { await navigator.clipboard.writeText(this.maintenancePasswordInput); showToast(t('maintenance.copied'), 'success'); }
+			catch (_) { showToast(t('common.operation_failed'), 'error'); }
+		},
+		generateMaintenancePassword() {
+			const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+			this.maintenancePasswordInput = Array.from(crypto.getRandomValues(new Uint8Array(16)), n => alphabet[n & 31]).join('');
+		},
+		maintenanceTimer: null,
+		maintenanceStateText() {
+			return ({ locked:t('maintenance.locked'), unlocked:t('maintenance.unlocked'), unlocked_permanent:t('maintenance.unlocked_permanent'), unlocking:t('maintenance.unlocking'), relocking:t('maintenance.relocking'), relock_failed:t('maintenance.relock_failed'), unknown:t('maintenance.unknown') })[this.maintenance.state] || t('maintenance.unknown');
+		},
+		async loadMaintenance(initial = false) {
+			if (!this.site || this.site.site_type !== 'wordpress') return;
+			try {
+				const r = await api('/websites/' + this.site.id + '/maintenance');
+				this.maintenance = r.data;
+				if (r.data.state === 'locked') { this.site.file_lock_enabled = true; this.site.file_lock_apply_status = 'ready'; }
+				else if (r.data.state === 'unlocked' || r.data.state === 'unlocked_permanent') { this.site.file_lock_enabled = false; this.site.file_lock_apply_status = ''; }
+				else { this.site.file_lock_apply_status = r.data.state === 'relock_failed' ? 'failed' : 'applying'; }
+				if (initial) { this.maintenanceEnabled = r.data.enabled; this.maintenanceMinutes = r.data.minutes; await this.loadMaintenancePassword(); }
+			} catch (_) { this.maintenance.state = 'unknown'; }
+		},
+		async saveMaintenance() {
+			if (this.maintenanceSaving) return;
+			this.maintenanceSaving = true;
+			const body = { enabled: this.maintenanceEnabled, minutes: this.maintenanceMinutes, password: this.maintenancePasswordInput };
+			try {
+				const r = await api('/websites/' + this.site.id + '/maintenance', {method:'PUT', body: JSON.stringify(body)});
+				this.maintenance = r.data; showToast(t('common.saved'), 'success');
+				await this.loadMaintenancePassword();
+			} catch (error) { showToast(t(error.message === 'lock_mode_required' ? 'maintenance.lock_mode_required' : error.message === 'verification_failed' ? 'maintenance.invalid_configuration' : error.message === 'operation_unavailable' ? 'maintenance.operation_unavailable' : 'maintenance.state_unknown'), 'error'); }
+			finally { delete body.password; this.maintenanceSaving = false; }
+		},
+		async relockMaintenance() {
+			this.maintenanceSaving = true;
+			try {
+				await api('/websites/' + this.site.id + '/maintenance/relock', {method:'POST',body:JSON.stringify({window_id:this.maintenance.window_id})});
+				await this.loadMaintenance(); await this.fetchDetail();
+			} catch (_) { showToast(t('maintenance.state_unknown'), 'error'); await this.loadMaintenance(); }
+			finally { this.maintenanceSaving = false; }
+		},
+		destroy() { if (this.maintenanceTimer) clearInterval(this.maintenanceTimer); },
+        loading: true,
+        sslModalOpen: false,
+        sslMode: 'auto',
+        sslCert: '',
+        sslKey: '',
+        sslSubmitting: false,
+        sslExportEnabled: false,
+        sslExportSaving: false,
+        logType: 'access',
+        logContent: '',
+        logLineLimit: 200,
+        logFiles: [],
+        logFullscreen: false,
+        nginxPreContent: '',
+        nginxContent: '',
+        nginxSubmitting: false,
+        fcacheEnabled: false,
+        fcacheTTL: 300,
+        disableWPUpdates: false,
+        savedDisableWPUpdates: false,
+        disableFileEditing: false,
+        savedDisableFileEditing: false,
+        fileEditingSaving: false,
+        passwordResetMode: 'allow',
+        passwordResetSaving: false,
+        xmlrpcEnabled: false,
+        disableApplicationPasswords: false,
+        wpDebug: false,
+        wpDebugDisplay: false,
+        wpPostRevisions: -1,
+        wpMemoryLimit: '',
+        logRetentionDays: 7,
+        optimizationSaving: false,
+        fileLockSaving: false,
+        fileLockMode: 'standard',
+        fileLockPreview: null,
+        fileLockPreviewLoading: false,
+        pluginStatus: 'unknown',
+        pluginStatusLoading: false,
+        pluginInstalling: false,
+        monitoringEnabled: false,
+        monitoringInterval: 5,
+        monitoringSaving: false,
+        documentRootSubdir: '',
+        documentRootSaving: false,
+        cdnGroups: [],
+        cdnRealIPEnabled: false,
+        cdnRealIPGroupIDs: [],
+        cdnRealIPSaving: false,
+        accessLogMode: 'off',
+        expiresAtInput: '',
+        editingExpiry: false,
+        expirySaving: false,
+        domainModalOpen: false,
+        editDomain: '',
+        editAliasesStr: '',
+        domainSubmitting: false,
+        syncWPSiteURLs: false,
+        wpURLsLoading: false,
+        wpSiteURL: '',
+        wpHomeURL: '',
+        wpURLsError: '',
+        aiDevelopmentModalOpen: false,
+        aiCredentialPackage: null,
+        aiCredentialDownloaded: false,
+        aiAccess: { loading: true, enabled: false, status: 'disabled', busy: false, stage: '', installWPCLI: true, installNodeJS: false, confirmDomain: '', tools: [] },
+        init() {
+            this.fetchDetail();
+        },
+        async fetchDetail() {
+            const id = window.location.pathname.split('/').pop();
+            try {
+                const r = await api('/websites/' + id);
+                if (r.success) {
+                    this.site = r.data;
+					if (!this.maintenanceTimer && r.data.site_type === 'wordpress') {
+						this.loadMaintenance(true);
+						this.maintenanceTimer = setInterval(() => this.loadMaintenance(), 10000);
+					}
+                    this.fcacheEnabled = r.data.fastcgi_cache_enabled;
+                    this.fcacheTTL = r.data.fastcgi_cache_ttl || 300;
+                    this.disableWPUpdates = r.data.disable_wp_updates || false;
+                    this.savedDisableWPUpdates = this.disableWPUpdates;
+                    this.disableFileEditing = r.data.disable_file_editing || false;
+                    this.savedDisableFileEditing = this.disableFileEditing;
+                    this.passwordResetMode = r.data.password_reset_mode || 'allow';
+                    this.xmlrpcEnabled = r.data.xmlrpc_enabled || false;
+                    this.disableApplicationPasswords = r.data.disable_application_passwords || false;
+                    this.wpDebug = r.data.wp_debug_enabled || false;
+                    this.wpDebugDisplay = r.data.wp_debug_display || false;
+                    this.wpPostRevisions = r.data.wp_post_revisions != null ? r.data.wp_post_revisions : -1;
+                    this.wpMemoryLimit = r.data.wp_memory_limit || '';
+                    this.logRetentionDays = r.data.log_retention_days ?? 14;
+                    this.monitoringEnabled = r.data.monitoring_enabled || false;
+                    this.monitoringInterval = r.data.monitoring_interval || 5;
+                    this.documentRootSubdir = r.data.document_root_subdir || '';
+                    this.cdnRealIPEnabled = r.data.cdn_realip_enabled || false;
+                    this.cdnRealIPGroupIDs = (r.data.cdn_realip_groups || []).map(g => g.id);
+                    this.sslExportEnabled = r.data.ssl_export_enabled || false;
+                    this.fileLockMode = r.data.file_lock_mode === 'strict' ? 'strict' : 'standard';
+                    this.fileLockPreview = null;
+                }
+            } catch(e) { showToast(t('website.load_failed_with_error', { error: e.message }), 'error'); }
+            this.loading = false;
+            Promise.allSettled([
+                this.fetchNginxCustom(),
+                this.fetchPluginStatus(),
+                this.fetchCDNGroups(),
+                this.fetchAIDevelopment()
+            ]);
+            deferTask(() => {
+                this.fetchLogs();
+                this.fetchLogFiles();
+            }, 400);
+        },
+        async fetchAIDevelopment() {
+            if (!this.site) return;
+            this.aiAccess.loading = true;
+            try {
+                const r = await api('/websites/' + this.site.id + '/ai-development-access');
+                if (r.success) {
+                    const tools = Array.isArray(r.data.tools) ? r.data.tools : [];
+                    const wpCLIInstalled = tools.some(tool => tool.id === 'wp-cli' && tool.installed);
+                    this.aiAccess = {
+                        ...this.aiAccess,
+                        ...r.data,
+                        tools,
+                        loading: false,
+                        busy: false,
+                        installWPCLI: r.data.status === 'disabled' ? !wpCLIInstalled : false,
+                        installNodeJS: false
+                    };
+                }
+            } catch(e) { this.aiAccess.loading = false; }
+        },
+        developmentToolInstalled(id) {
+            return Array.isArray(this.aiAccess.tools) && this.aiAccess.tools.some(tool => tool.id === id && tool.installed);
+        },
+        async requestAIDevelopmentPackage(path, body) {
+            const prefix = document.body.dataset.panelPrefix || '';
+            const response = await fetch(prefix + '/api' + path, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRF-Token': document.querySelector('meta[name="csrf-token"]')?.content || ''
+                },
+                body: JSON.stringify(body || {})
+            });
+            if (!response.ok) {
+                let message = t('common.operation_failed');
+                let code = null;
+                try { const data = await response.json(); message = data.message || message; code = data.data?.code || null; } catch(e) {}
+                const err = new Error(message);
+                err.code = code;
+                throw err;
+            }
+            return await response.blob();
+        },
+        saveAIDevelopmentPackage(blob) {
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = this.site.domain + '-yub-wpanel-ai.zip';
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            URL.revokeObjectURL(url);
+        },
+        async enableAIDevelopment(force) {
+            if (this.aiAccess.confirmDomain !== this.site.domain) return;
+            if (!force && !await confirmModal(t('ai_development.enable_confirm', { domain: this.site.domain }))) return;
+            this.aiAccess.busy = true;
+            let retryForce = false;
+            try {
+                if (this.aiAccess.installWPCLI && !this.developmentToolInstalled('wp-cli')) {
+                    this.aiAccess.stage = t('ai_development.stage_installing_wp_cli');
+                    await api('/software/development-tools/install', { method: 'POST', body: { id: 'wp-cli' }, timeout: 600000 });
+                }
+                if (this.aiAccess.installNodeJS && !this.developmentToolInstalled('nodejs')) {
+                    this.aiAccess.stage = t('ai_development.stage_installing_nodejs');
+                    await api('/software/development-tools/install', { method: 'POST', body: { id: 'nodejs' }, timeout: 600000 });
+                }
+                this.aiAccess.stage = t('ai_development.stage_configuring_access');
+                this.aiCredentialPackage = await this.requestAIDevelopmentPackage('/websites/' + this.site.id + '/ai-development-access', {
+                    confirm_domain: this.aiAccess.confirmDomain,
+                    install_wp_cli: false,
+                    install_nodejs: false,
+                    force: !!force
+                });
+                this.aiCredentialDownloaded = false;
+                showToast(t('ai_development.enabled_ready_download'), 'success');
+                await this.fetchAIDevelopment();
+            } catch(e) {
+                if (!force && e.code === 'ai_development_site_busy') {
+                    this.aiAccess.busy = false;
+                    this.aiAccess.stage = '';
+                    retryForce = await confirmModal(t('ai_development.enable_busy_force_confirm'));
+                } else {
+                    showToast(e.message, 'error');
+                    await this.fetchAIDevelopment();
+                }
+            } finally {
+                this.aiAccess.busy = false;
+                this.aiAccess.stage = '';
+            }
+            if (retryForce) return this.enableAIDevelopment(true);
+        },
+        async downloadAIDevelopmentCredential() {
+            if (this.aiCredentialPackage && !this.aiCredentialDownloaded) {
+                this.saveAIDevelopmentPackage(this.aiCredentialPackage);
+                this.aiCredentialPackage = null;
+                this.aiCredentialDownloaded = true;
+                showToast(t('ai_development.package_downloaded'), 'success');
+                return;
+            }
+            if (!await confirmModal(t('ai_development.redownload_rotates_confirm'))) return;
+            this.aiAccess.busy = true;
+            this.aiAccess.stage = t('ai_development.stage_rotating_package');
+            try {
+                this.aiCredentialPackage = await this.requestAIDevelopmentPackage('/websites/' + this.site.id + '/ai-development-access/rotate', {});
+                this.saveAIDevelopmentPackage(this.aiCredentialPackage);
+                this.aiCredentialPackage = null;
+                this.aiCredentialDownloaded = true;
+                showToast(t('ai_development.rotated_downloaded'), 'success');
+                await this.fetchAIDevelopment();
+            } catch(e) { showToast(e.message, 'error'); }
+            finally {
+                this.aiAccess.busy = false;
+                this.aiAccess.stage = '';
+            }
+        },
+        async copyAIDevelopmentFirstPrompt() {
+            try {
+                await navigator.clipboard.writeText(t('ai_development.first_prompt'));
+                showToast(t('ai_development.first_prompt_copied'), 'success');
+            } catch(e) {
+                showToast(t('common.operation_failed'), 'error');
+            }
+        },
+        async disableAIDevelopment() {
+            if (!await confirmModal(t('ai_development.disable_confirm'))) return;
+            this.aiAccess.busy = true;
+            try {
+                await api('/websites/' + this.site.id + '/ai-development-access', { method: 'DELETE' });
+                showToast(t('ai_development.disabled'), 'success');
+                this.aiCredentialPackage = null;
+                this.aiCredentialDownloaded = false;
+                this.aiAccess = { loading: false, enabled: false, status: 'disabled', busy: false, stage: '', installWPCLI: true, installNodeJS: false, confirmDomain: '', tools: [] };
+            } catch(e) { showToast(e.message, 'error'); }
+            finally { this.aiAccess.busy = false; }
+        },
+        async restoreMigrated() {
+            if (!this.site || this.site.status !== 'migrated') return;
+            if (!await confirmModal(t('website.restore_migrated_confirm', { domain: this.site.domain }))) return;
+            try {
+                const r = await api('/websites/' + this.site.id + '/status', { method: 'PATCH', body: { action: 'restore_migrated' } });
+                if (r.success) {
+                    this.site.status = 'active';
+                    showToast(r.data?.message || t('website.restore_migrated_success'), 'success');
+                }
+            } catch(e) { showToast(e.message, 'error'); }
+        },
+        async fetchCDNGroups() {
+            try {
+                const r = await api('/security/cdn-realip-groups');
+                if (r.success) {
+                    this.cdnGroups = r.data || [];
+                    this.normalizeCDNRealIPSelection();
+                }
+            } catch(e) {}
+        },
+        selectableCDNGroups() {
+            return this.cdnGroups.filter(g => g.provider !== 'cloudflare');
+        },
+        normalizeCDNRealIPSelection() {
+            const currentIDs = this.cdnRealIPGroupIDs.map(id => parseInt(id));
+            const selected = this.cdnGroups.filter(g => currentIDs.includes(g.id));
+            const selectedNonCloudflareIDs = selected.filter(g => g.provider !== 'cloudflare').map(g => g.id);
+            if (this.cdnRealIPEnabled && selected.length > 0 && selectedNonCloudflareIDs.length === 0) {
+                this.cdnRealIPEnabled = false;
+            }
+            this.cdnRealIPGroupIDs = selectedNonCloudflareIDs;
+        },
+        normalizeCDNRealIPCompatibility(changedGroup) {
+            if (!this.cdnRealIPGroupIDs.map(Number).includes(changedGroup.id)) return;
+            const changedCompatible = !(changedGroup.ip_ranges || '').trim();
+            this.cdnRealIPGroupIDs = this.cdnRealIPGroupIDs.filter(id => {
+                const group = this.cdnGroups.find(g => g.id === Number(id));
+                if (!group) return false;
+                return changedCompatible ? group.id === changedGroup.id : (group.ip_ranges || '').trim();
+            });
+        },
+        cdnRealIPModeText() {
+            if (!this.cdnRealIPEnabled) return '';
+            const currentIDs = this.cdnRealIPGroupIDs.map(id => parseInt(id));
+            const selected = this.selectableCDNGroups().filter(g => currentIDs.includes(g.id));
+            if (selected.length === 0) return t('website.cdn_select_non_cloudflare_help');
+            const headers = [...new Set(selected.map(g => (g.header_name || '').toLowerCase()))];
+            if (headers.length > 1) return t('website.cdn_header_mismatch');
+            if (selected.some(g => !(g.ip_ranges || '').trim())) {
+                return t('website.cdn_compatible_no_origin_ips');
+            }
+            return t('website.cdn_strict_origin_ips');
+        },
+        async saveCDNRealIP() {
+            this.cdnRealIPSaving = true;
+            try {
+                const groupIDs = this.cdnRealIPGroupIDs.map(id => parseInt(id)).filter(id => this.selectableCDNGroups().some(g => g.id === id));
+                if (this.cdnRealIPEnabled && groupIDs.length === 0) {
+                    showToast(t('website.cdn_select_non_cloudflare_required'), 'error');
+                    return;
+                }
+                const r = await api('/websites/' + this.site.id + '/cdn-realip', {
+                    method: 'PUT',
+                    body: { enabled: this.cdnRealIPEnabled, group_ids: groupIDs }
+                });
+                showToast(r.data?.message || t('website.cdn_realip_saved'), 'success');
+                await this.fetchDetail();
+            } catch(e) { showToast(e.message, 'error'); }
+            finally { this.cdnRealIPSaving = false; }
+        },
+        async enableSSL() {
+            if (this.sslMode === 'manual' && (!this.sslCert || !this.sslKey)) {
+                showToast(t('website.ssl_manual_required'), 'error');
+                return;
+            }
+            this.sslSubmitting = true;
+            try {
+                const body = { mode: this.sslMode };
+                if (this.sslMode === 'manual') {
+                    body.certificate = this.sslCert;
+                    body.private_key = this.sslKey;
+                }
+                const r = await api('/websites/' + this.site.id + '/ssl', { method: 'POST', body });
+                if (r.success) {
+                    showToast(r.data?.message || t('common.operation_success'), 'success');
+                    this.sslModalOpen = false;
+                    await this.fetchDetail();
+                } else {
+                    showToast(r.data?.message || t('common.operation_failed'), 'error');
+                }
+            } catch(e) { showToast(t('website.operation_failed_with_error', { error: e.message }), 'error'); }
+            this.sslSubmitting = false;
+        },
+        downloadSSLPackage() {
+            if (!this.site || !this.site.ssl_enabled) return;
+            const prefix = '/' + document.body.dataset.panelPrefix.replace('/', '');
+            window.open(prefix + '/api/websites/' + this.site.id + '/ssl/download');
+        },
+        async saveSSLExport() {
+            if (!this.site) return;
+            this.sslExportSaving = true;
+            try {
+                const r = await api('/websites/' + this.site.id + '/ssl/export', {
+                    method: 'PUT',
+                    body: { enabled: this.sslExportEnabled }
+                });
+                showToast(r.data?.message || t('website.ssl_export_saved'), 'success');
+                await this.fetchDetail();
+            } catch(e) {
+                this.sslExportEnabled = !this.sslExportEnabled;
+                showToast(e.message, 'error');
+            } finally {
+                this.sslExportSaving = false;
+            }
+        },
+        async updateDomains() {
+            this.domainSubmitting = true;
+            try {
+                const newDomain = this.editDomain.trim();
+                if (!newDomain) { showToast(t('website.domain_required'), 'error'); this.domainSubmitting = false; return; }
+                const aliases = this.editAliasesStr.split('\n').map(a => a.trim()).filter(a => a);
+                const domainChanged = newDomain.toLowerCase() !== this.site.domain.toLowerCase();
+                const body = { new_domain: newDomain, aliases, sync_wp_site_urls: this.syncWPSiteURLs && domainChanged };
+                const r = await api('/websites/' + this.site.id + '/domains', { method: 'PUT', body });
+                if (r.success) {
+                    showToast(r.data?.message || t('website.updated'), 'success');
+                    this.domainModalOpen = false;
+                    await this.fetchDetail();
+                } else {
+                    showToast(r.data?.message || t('common.operation_failed'), 'error');
+                }
+            } catch(e) { showToast(t('website.operation_failed_with_error', { error: e.message }), 'error'); }
+            this.domainSubmitting = false;
+        },
+        async openDomainModal() {
+            this.editDomain = this.site.domain;
+            this.editAliasesStr = this.site.aliases || '';
+            this.syncWPSiteURLs = false;
+            this.wpSiteURL = '';
+            this.wpHomeURL = '';
+            this.wpURLsError = '';
+            this.domainModalOpen = true;
+            if (this.site.site_type !== 'wordpress') return;
+            this.wpURLsLoading = true;
+            try {
+                const r = await api('/websites/' + this.site.id + '/wp-site-urls');
+                this.wpSiteURL = r.data?.siteurl || '';
+                this.wpHomeURL = r.data?.home || '';
+                if (!this.canSyncWPSiteURLs()) this.wpURLsError = t('website.wp_site_urls_domain_mismatch');
+            } catch (e) {
+                this.wpURLsError = t('website.wp_site_urls_read_failed', { error: e.message });
+            } finally {
+                this.wpURLsLoading = false;
+            }
+        },
+        previewWPURL(value) {
+            try {
+                const parsed = new URL(value);
+                if (parsed.hostname.toLowerCase() !== this.site.domain.toLowerCase()) return '';
+                const replacement = this.editDomain.trim().toLowerCase() + (parsed.port ? ':' + parsed.port : '');
+                return value.replace(parsed.host, replacement);
+            } catch (e) {
+                return '';
+            }
+        },
+        canSyncWPSiteURLs() {
+            return !!this.previewWPURL(this.wpSiteURL) && !!this.previewWPURL(this.wpHomeURL);
+        },
+        async removeSSL() {
+            if (!await confirmModal(t('website.confirm_delete_ssl', { domain: this.site.domain }))) return;
+            try {
+                const r = await api('/websites/' + this.site.id + '/ssl', { method: 'DELETE' });
+                if (r.success) {
+                    showToast(r.data?.message || t('website.ssl_deleted'), 'success');
+                    await this.fetchDetail();
+                } else {
+                    showToast(r.data?.message || t('common.operation_failed'), 'error');
+                }
+            } catch(e) { showToast(t('website.operation_failed_with_error', { error: e.message }), 'error'); }
+        },
+        async fetchNginxCustom() {
+            try {
+                const r = await api('/websites/' + this.site.id + '/nginx-custom');
+                if (r.success) {
+                    this.nginxPreContent = r.data.pre_content || '';
+                    this.nginxContent = r.data.content || '';
+                    this.accessLogMode = r.data.access_log_mode || 'off';
+                }
+            } catch(e) { /* 静默失败 */ }
+        },
+        async saveDocumentRoot() {
+            if (!this.site || this.site.site_type !== 'php') return;
+            this.documentRootSaving = true;
+            try {
+                const r = await api('/websites/' + this.site.id + '/document-root', {
+                    method: 'PUT',
+                    body: { document_root_subdir: this.documentRootSubdir }
+                });
+                if (r.success) {
+                    showToast(r.data?.message || t('website.document_root_saved'), 'success');
+                    await this.fetchDetail();
+                } else {
+                    showToast(r.data?.message || t('website.save_failed'), 'error');
+                }
+            } catch(e) { showToast(t('website.operation_failed_with_error', { error: e.message }), 'error'); }
+            this.documentRootSaving = false;
+        },
+        async saveNginxCustom() {
+            this.nginxSubmitting = true;
+            try {
+                const r = await api('/websites/' + this.site.id + '/nginx-custom', {
+                    method: 'PUT',
+                    body: { pre_content: this.nginxPreContent, content: this.nginxContent }
+                });
+                if (r.success) {
+                    showToast(r.data?.message || t('common.saved'), 'success');
+                } else {
+                    showToast(r.data?.message || t('website.save_failed'), 'error');
+                }
+            } catch(e) { showToast(t('website.operation_failed_with_error', { error: e.message }), 'error'); }
+            this.nginxSubmitting = false;
+        },
+        async fetchLogs() {
+            if (!this.site) return;
+            try {
+                let url = '/websites/' + this.site.id + '/logs?type=' + this.logType + '&lines=' + encodeURIComponent(this.logLineLimit || 200);
+                const r = await api(url);
+                if (r.success) {
+                    this.logContent = r.data.content;
+                }
+            } catch(e) { showToast(t('website.load_logs_failed', { error: e.message }), 'error'); }
+        },
+        async fetchLogFiles() {
+            if (!this.site) return;
+            try {
+                const r = await api('/websites/' + this.site.id + '/log-files?type=' + this.logType);
+                if (r.success) {
+                    this.logFiles = r.data.files || [];
+                }
+            } catch(e) { showToast(t('website.load_log_files_failed', { error: e.message }), 'error'); }
+        },
+        selectLogType(type) {
+            this.logType = type;
+            this.fetchLogs();
+            this.fetchLogFiles();
+        },
+        currentLogFilename() {
+            if (this.logType === 'error') return 'error.log';
+            if (this.logType === 'security') return 'wp-security.log';
+            return 'access.log';
+        },
+        downloadLogFile(filename) {
+            if (!this.site || !filename) return;
+            const prefix = document.body.dataset.panelPrefix || '';
+            window.open(prefix + '/api/websites/' + this.site.id + '/logs/download?type=' + encodeURIComponent(this.logType) + '&file=' + encodeURIComponent(filename));
+        },
+        async setAccessLogMode(mode) {
+            try {
+                const r = await api('/websites/' + this.site.id + '/access-log', { method: 'PUT', body: { mode } });
+                if (r.success) {
+                    this.accessLogMode = mode;
+                    if (mode === 'off') {
+                        this.logContent = '';
+                    }
+                    showToast(r.data?.message, 'success');
+                } else {
+                    showToast(r.data?.message || t('common.operation_failed'), 'error');
+                }
+            } catch(e) { showToast(t('website.operation_failed_with_error', { error: e.message }), 'error'); }
+        },
+        async clearLogs() {
+            const label = this.logType === 'error' ? t('website.log_type_error') : (this.logType === 'security' ? t('website.log_type_security') : t('website.log_type_access'));
+            if (!await confirmModal(t('website.confirm_clear_logs', { label }))) return;
+            try {
+                const r = await api('/websites/' + this.site.id + '/logs?type=' + this.logType, { method: 'DELETE' });
+                if (r.success) {
+                    showToast(t('website.logs_cleared'), 'success');
+                    this.logContent = t('website.log_empty_or_missing');
+                    this.fetchLogFiles();
+                }
+            } catch(e) { showToast(t('website.operation_failed_with_error', { error: e.message }), 'error'); }
+        },
+        async fetchPluginStatus() {
+            if (!this.site || this.site.site_type !== 'wordpress' || this.pluginStatusLoading) return;
+            this.pluginStatusLoading = true;
+            this.pluginStatus = 'unknown';
+            try {
+                const r = await api('/websites/' + this.site.id + '/install-plugin/status');
+                const statuses = ['not_installed', 'inactive', 'installed', 'update_available', 'config_missing', 'unknown'];
+                if (r.success && statuses.includes(r.data?.status)) this.pluginStatus = r.data.status;
+            } catch(e) {
+                this.pluginStatus = 'unknown';
+            } finally {
+                this.pluginStatusLoading = false;
+            }
+        },
+        async installPlugin() {
+            this.pluginInstalling = true;
+            try {
+                const r = await api('/websites/' + this.site.id + '/install-plugin', { method: 'POST' });
+                showToast(r.data?.message || t('website.installed'), 'success');
+                await this.fetchPluginStatus();
+            } catch(e) { showToast(e.message, 'error'); }
+            this.pluginInstalling = false;
+        },
+        async rebuildPluginConfig() {
+            if (!await confirmModal(t('website.rebuild_plugin_config_confirm'))) return;
+            await this.installPlugin();
+        },
+        fileLockStatusText() {
+            if (this.site.file_lock_apply_status === 'applying') return t('website.processing');
+            if (this.fileLockApplyIncomplete()) return t('website.file_lock_apply_failed');
+            if (!this.site.file_lock_enabled) return t('website.file_unlocked');
+            if (this.site.file_lock_mode === 'legacy') return t('website.file_lock_legacy');
+            return this.site.file_lock_mode === 'strict' ? t('website.file_lock_strict') : t('website.file_lock_standard');
+        },
+        fileLockApplyIncomplete() {
+            return this.site.file_lock_apply_status === 'failed';
+        },
+        fileLockDisplayPath(path) {
+            const labels = {
+                'wp-content/uploads': t('website.file_lock_path_uploads'),
+                'wp-content/cache': t('website.file_lock_path_cache'),
+                'wp-content/wflogs': t('website.file_lock_path_wflogs'),
+                'wp-content/languages': t('website.file_lock_path_languages'),
+                'wp-content/plugins': t('website.file_lock_path_plugins'),
+                'wp-content/themes': t('website.file_lock_path_themes'),
+                'wp-content/mu-plugins': t('website.file_lock_path_mu_plugins'),
+                'wp-config.php': t('website.file_lock_path_wp_config'),
+                '.user.ini': t('website.file_lock_path_user_ini'),
+                'php.ini': t('website.file_lock_path_php_ini'),
+                'wordfence-waf.php': t('website.file_lock_path_wordfence_waf'),
+                'wp-content/advanced-cache.php': t('website.file_lock_path_advanced_cache'),
+                'wp-content/object-cache.php': t('website.file_lock_path_object_cache'),
+                'wp-content/db.php': t('website.file_lock_path_db_dropin'),
+                'wp-content/sunrise.php': t('website.file_lock_path_sunrise')
+            };
+            return labels[path] || path;
+        },
+        async loadFileLockPreview() {
+            if (!this.site?.id) return null;
+            this.fileLockPreviewLoading = true;
+            try {
+                const r = await api('/websites/' + this.site.id + '/file-lock/preview?mode=' + encodeURIComponent(this.fileLockMode));
+                this.fileLockPreview = r.data || null;
+                return this.fileLockPreview;
+            } catch(e) {
+                showToast(e.message, 'error');
+                return null;
+            } finally {
+                this.fileLockPreviewLoading = false;
+            }
+        },
+        async applyFileLock(enabled) {
+            let prompt = t('website.file_lock_disable_confirm');
+            if (enabled) {
+                const preview = await this.loadFileLockPreview();
+                if (!preview) return;
+                prompt = t('website.file_lock_apply_confirm', {
+                    mode: this.fileLockMode === 'strict' ? t('website.file_lock_mode_strict') : t('website.file_lock_mode_standard'),
+                    readonly: (preview.read_only_dirs || []).length,
+                    executable: (preview.executable_files || []).length,
+                    symlink: (preview.symlink_paths || []).length
+                });
+            }
+            if (!await confirmModal(prompt)) return;
+            this.fileLockSaving = true;
+            try {
+                const r = await api('/websites/' + this.site.id + '/file-lock', {
+                    method: 'PUT',
+                    body: { enabled, mode: enabled ? this.fileLockMode : '' }
+                });
+                this.site.file_lock_enabled = r.data?.file_lock_enabled ?? enabled;
+                this.site.file_lock_mode = r.data?.file_lock_mode || '';
+                this.site.file_lock_apply_status = r.data?.file_lock_apply_status || '';
+                showToast(r.data?.message || (enabled ? t('website.file_lock_enabled') : t('website.file_lock_disabled')), 'success');
+            } catch(e) {
+                const selectedMode = this.fileLockMode;
+                showToast(e.message, 'error');
+                await this.fetchDetail();
+                this.fileLockMode = selectedMode;
+            }
+            this.fileLockSaving = false;
+        },
+        async saveMonitoring() {
+            this.monitoringSaving = true;
+            try {
+                await api('/websites/' + this.site.id + '/monitoring', {
+                    method: 'PUT',
+                    body: { enabled: this.monitoringEnabled, interval: parseInt(this.monitoringInterval) || 5 }
+                });
+                showToast(t('website.monitoring_saved'), 'success');
+            } catch(e) { showToast(t('website.save_failed_with_error', { error: e.message }), 'error'); }
+            this.monitoringSaving = false;
+        },
+        async saveExpiry() {
+            this.expirySaving = true;
+            try {
+                await api('/websites/' + this.site.id + '/expiry', {
+                    method: 'PUT',
+                    body: { expires_at: this.expiresAtInput }
+                });
+                this.site.expires_at = this.expiresAtInput || null;
+                this.editingExpiry = false;
+                showToast(t('website.expiry_saved'), 'success');
+            } catch(e) { showToast(t('website.save_failed_with_error', { error: e.message }), 'error'); }
+            this.expirySaving = false;
+        },
+        async saveWPOptimizations() {
+            this.optimizationSaving = true;
+            try {
+                await api('/websites/' + this.site.id + '/wp-optimizations', {
+                    method: 'PUT',
+                    body: {
+                        fcache_enabled: this.fcacheEnabled,
+                        fcache_ttl: parseInt(this.fcacheTTL) || 300,
+                        disable_wp_updates: this.disableWPUpdates,
+                        expected_disable_wp_updates: this.savedDisableWPUpdates,
+                        disable_file_editing: this.disableFileEditing,
+                        xmlrpc_enabled: this.xmlrpcEnabled,
+                        disable_application_passwords: this.disableApplicationPasswords,
+                        wp_debug_enabled: this.wpDebug,
+                        wp_debug_display: this.wpDebug && this.wpDebugDisplay,
+                        wp_post_revisions: this.wpPostRevisions,
+                        wp_memory_limit: this.wpMemoryLimit
+                    }
+                });
+                this.savedDisableWPUpdates = this.disableWPUpdates;
+                showToast(t('website.optimization_saved'), 'success');
+            } catch(e) { showToast(t('website.save_failed_with_error', { error: e.message }), 'error'); }
+            this.optimizationSaving = false;
+        },
+        async saveFileEditingProtection() {
+            if (this.site.file_lock_enabled) return;
+            this.fileEditingSaving = true;
+            try {
+                const r = await api('/websites/' + this.site.id + '/file-editor', {
+                    method: 'PUT',
+                    body: { enabled: this.disableFileEditing }
+                });
+                this.disableFileEditing = r.data?.disable_file_editing ?? this.disableFileEditing;
+                this.savedDisableFileEditing = this.disableFileEditing;
+                showToast(r.data?.message || t('website.file_editing_saved'), 'success');
+            } catch(e) {
+                this.disableFileEditing = this.savedDisableFileEditing;
+                showToast(e.message, 'error');
+            }
+            this.fileEditingSaving = false;
+        },
+        async savePasswordReset() {
+            this.passwordResetSaving = true;
+            try {
+                const r = await api('/websites/' + this.site.id + '/password-reset', {
+                    method: 'PUT',
+                    body: { mode: this.passwordResetMode }
+                });
+                this.passwordResetMode = r.data?.password_reset_mode ?? this.passwordResetMode;
+                showToast(r.data?.message || t('website.password_reset_saved'), 'success');
+            } catch(e) { showToast(e.message, 'error'); }
+            this.passwordResetSaving = false;
+        },
+        async saveLogRetention() {
+            try {
+                await api('/websites/' + this.site.id + '/log-retention', {
+                    method: 'PUT',
+                    body: { retention_days: parseInt(this.logRetentionDays) || 0 }
+                });
+            } catch(e) {}
+        },
+        async clearFCache() {
+            if (!await confirmModal(t('website.confirm_clear_cache'))) return;
+            try {
+                await api('/websites/' + this.site.id + '/cache', { method: 'DELETE' });
+                showToast(t('website.cache_cleared'), 'success');
+            } catch(e) { showToast(e.message, 'error'); }
+        },
+    }
+}
+</script>
+{{end}}

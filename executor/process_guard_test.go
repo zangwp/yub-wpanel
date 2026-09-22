@@ -1,0 +1,268 @@
+package executor
+
+import (
+	"errors"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestSetServiceStateRejectsUnknownService(t *testing.T) {
+	err := SetServiceState("not-managed", "restart")
+	if !errors.Is(err, ErrUnknownGuardService) {
+		t.Fatalf("error=%v, want ErrUnknownGuardService", err)
+	}
+}
+
+func TestSetServiceStateRejectsCommandSuccessWithoutActiveState(t *testing.T) {
+	oldCommand := guardCommand
+	oldTimeout, oldPoll := guardStateWaitTimeout, guardStatePollInterval
+	guardCommand = func(_ string, args ...string) ([]byte, error) {
+		if len(args) > 0 && args[0] == "show" {
+			return []byte("ActiveState=failed\nNRestarts=0\n"), nil
+		}
+		return nil, nil
+	}
+	guardStateWaitTimeout, guardStatePollInterval = 5*time.Millisecond, time.Millisecond
+	t.Cleanup(func() {
+		guardCommand = oldCommand
+		guardStateWaitTimeout, guardStatePollInterval = oldTimeout, oldPoll
+	})
+
+	err := SetServiceState("nginx", "start")
+	if err == nil || !strings.Contains(err.Error(), "目标状态") {
+		t.Fatalf("error=%v, want final-state failure", err)
+	}
+}
+
+func TestSetServiceStateRestoresServiceWhenPauseFileCannotBeSaved(t *testing.T) {
+	oldCommand := guardCommand
+	oldPath := guard.pausedFile
+	service := guard.services[0]
+	oldPaused, oldRunning := service.Paused, service.Running
+	service.Paused, service.Running = false, true
+	guard.pausedFile = filepath.Join(t.TempDir(), "missing", "guard.json")
+	active := true
+	guardCommand = func(_ string, args ...string) ([]byte, error) {
+		if len(args) > 0 && args[0] == "stop" {
+			active = false
+		}
+		if len(args) > 0 && args[0] == "start" {
+			active = true
+		}
+		if len(args) > 0 && args[0] == "show" {
+			state := "inactive"
+			if active {
+				state = "active"
+			}
+			return []byte("ActiveState=" + state + "\nNRestarts=0\n"), nil
+		}
+		return nil, nil
+	}
+	t.Cleanup(func() {
+		guardCommand = oldCommand
+		guard.pausedFile = oldPath
+		service.Paused, service.Running = oldPaused, oldRunning
+	})
+
+	err := SetServiceState("nginx", "stop")
+	if err == nil || !active || service.Paused || !service.Running {
+		t.Fatalf("error=%v active=%v paused=%v running=%v", err, active, service.Paused, service.Running)
+	}
+}
+
+func TestClassifyServiceFailure(t *testing.T) {
+	tests := []struct {
+		name    string
+		journal string
+		state   guardServiceState
+		want    string
+	}{
+		{name: "oom", journal: "kernel: Out of memory: Killed process 10 (mariadbd)", want: "系统内存耗尽（OOM）"},
+		{name: "segfault", journal: "php-fpm[10]: segfault at 0", want: "进程发生崩溃（段错误）"},
+		{name: "port", journal: "listen() failed: Address already in use", want: "端口被占用"},
+		{name: "permission", journal: "open() failed (13: Permission denied)", want: "权限不足"},
+		{name: "config", journal: "nginx: configuration file /etc/nginx/nginx.conf test failed", want: "配置检查失败"},
+		{name: "signal", state: guardServiceState{exitCode: "killed"}, want: "进程被信号强制终止"},
+		{name: "exit status", state: guardServiceState{exitStatus: "1"}, want: "进程异常退出（状态码 1）"},
+		{name: "unknown", want: "服务意外停止，系统日志未提供明确原因"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyServiceFailure(tt.journal, tt.state); got != tt.want {
+				t.Fatalf("classifyServiceFailure() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCoreGuardServices(t *testing.T) {
+	for _, service := range []string{"nginx", "php8.3-fpm", "mariadb", "redis-server"} {
+		if !isCoreGuardService(service) {
+			t.Fatalf("%s should be a core service", service)
+		}
+	}
+	for _, service := range []string{"nftables", "fail2ban"} {
+		if isCoreGuardService(service) {
+			t.Fatalf("%s should not send core service alerts", service)
+		}
+	}
+}
+
+func TestLogIncidentWritesCoreServiceAlert(t *testing.T) {
+	db := openAlertTestDB(t)
+	mustExec(t, db, `CREATE TABLE process_guard_incidents (
+		id INTEGER PRIMARY KEY, service TEXT, event TEXT, message TEXT,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	)`)
+	mustExec(t, db, `CREATE TABLE alert_log (
+		id INTEGER PRIMARY KEY, alert_type TEXT, level TEXT, message TEXT,
+		resolved INTEGER DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	)`)
+	mustExec(t, db, `CREATE TABLE security_settings (skey TEXT PRIMARY KEY, svalue TEXT)`)
+	mustExec(t, db, `INSERT INTO security_settings (skey, svalue) VALUES ('alert_service', 'true')`)
+
+	service := &GuardService{Name: "MariaDB", ServiceName: "mariadb"}
+	logIncident(service, "auto_restart", "MariaDB 进程异常退出，自动恢复成功", true)
+
+	var incidents, alerts, resolved int
+	_ = db.QueryRow("SELECT COUNT(*) FROM process_guard_incidents").Scan(&incidents)
+	_ = db.QueryRow("SELECT COUNT(*) FROM alert_log WHERE alert_type = 'alert_service'").Scan(&alerts)
+	_ = db.QueryRow("SELECT COALESCE(MAX(resolved), 0) FROM alert_log WHERE alert_type = 'alert_service'").Scan(&resolved)
+	if incidents != 1 || alerts != 1 {
+		t.Fatalf("incidents=%d alerts=%d, want 1 and 1", incidents, alerts)
+	}
+	if resolved != 1 {
+		t.Fatalf("fast recovered service event resolved=%d, want 1", resolved)
+	}
+}
+
+func TestUnexpectedActiveDoesNotCreateAbnormalAlert(t *testing.T) {
+	db := openAlertTestDB(t)
+	mustExec(t, db, `CREATE TABLE process_guard_incidents (
+		id INTEGER PRIMARY KEY, service TEXT, event TEXT, message TEXT,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	)`)
+	mustExec(t, db, `CREATE TABLE alert_log (
+		id INTEGER PRIMARY KEY, alert_type TEXT, level TEXT, message TEXT,
+		resolved INTEGER DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	)`)
+	mustExec(t, db, `CREATE TABLE security_settings (skey TEXT PRIMARY KEY, svalue TEXT)`)
+	mustExec(t, db, `INSERT INTO security_settings (skey, svalue) VALUES ('alert_service', 'true')`)
+
+	service := &GuardService{Name: "Nginx", ServiceName: "nginx"}
+	logIncident(service, "unexpected_active", "Nginx 在暂停守护期间被外部启动", false)
+
+	var alerts int
+	_ = db.QueryRow("SELECT COUNT(*) FROM alert_log").Scan(&alerts)
+	if alerts != 0 {
+		t.Fatalf("alerts=%d, want 0", alerts)
+	}
+}
+
+func TestProcessGuardReadsStateAfterAcquiringLock(t *testing.T) {
+	oldCommand := guardCommand
+	called := make(chan struct{}, 1)
+	guardCommand = func(_ string, _ ...string) ([]byte, error) {
+		called <- struct{}{}
+		return []byte("ActiveState=active\nNRestarts=0\nResult=success\n"), nil
+	}
+	t.Cleanup(func() { guardCommand = oldCommand })
+
+	pg := &ProcessGuard{firstRun: true}
+	service := &GuardService{Name: "MariaDB", ServiceName: "mariadb"}
+	pg.mu.Lock()
+	done := make(chan struct{})
+	go func() {
+		pg.check(service)
+		close(done)
+	}()
+
+	select {
+	case <-called:
+		pg.mu.Unlock()
+		t.Fatal("service state was read before acquiring the process guard lock")
+	case <-time.After(30 * time.Millisecond):
+	}
+	pg.mu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("process guard check did not finish")
+	}
+}
+
+func TestRunGuardCommandTimesOut(t *testing.T) {
+	start := time.Now()
+	_, err := runGuardCommandWithTimeout(20*time.Millisecond, "sleep", "1")
+	if err == nil {
+		t.Fatal("slow command should time out")
+	}
+	if time.Since(start) > 500*time.Millisecond {
+		t.Fatalf("command timeout took too long: %v", time.Since(start))
+	}
+}
+
+func TestLogIncidentLeavesUnrecoveredFailureToStateMonitor(t *testing.T) {
+	db := openAlertTestDB(t)
+	mustExec(t, db, `CREATE TABLE process_guard_incidents (
+		id INTEGER PRIMARY KEY, service TEXT, event TEXT, message TEXT,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	)`)
+	mustExec(t, db, `CREATE TABLE alert_log (
+		id INTEGER PRIMARY KEY, alert_type TEXT, level TEXT, message TEXT,
+		resolved INTEGER DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	)`)
+	mustExec(t, db, `CREATE TABLE security_settings (skey TEXT PRIMARY KEY, svalue TEXT)`)
+	mustExec(t, db, `INSERT INTO security_settings (skey, svalue) VALUES ('alert_service', 'true')`)
+
+	oldNotifier := serviceIncidentNotifier
+	notifications := 0
+	serviceIncidentNotifier = func(_, _ string) { notifications++ }
+	t.Cleanup(func() { serviceIncidentNotifier = oldNotifier })
+
+	service := &GuardService{Name: "MariaDB", ServiceName: "mariadb"}
+	logIncident(service, "restart", "MariaDB 进程异常退出，自动恢复失败", false)
+	if notifications != 0 {
+		t.Fatalf("notifications=%d, want 0", notifications)
+	}
+
+	var alerts int
+	if err := db.QueryRow("SELECT COUNT(*) FROM alert_log").Scan(&alerts); err != nil {
+		t.Fatal(err)
+	}
+	if alerts != 0 {
+		t.Fatalf("unrecovered failure alerts=%d, want 0 before central state monitor confirms it", alerts)
+	}
+}
+
+func TestLogIncidentSuppressesRecoveredEventWhenStateAlertIsFiring(t *testing.T) {
+	db := openAlertTestDB(t)
+	mustExec(t, db, `CREATE TABLE process_guard_incidents (
+		id INTEGER PRIMARY KEY, service TEXT, event TEXT, message TEXT,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `CREATE TABLE alert_log (
+		id INTEGER PRIMARY KEY, alert_type TEXT, level TEXT, message TEXT,
+		resolved INTEGER DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`)
+	mustExec(t, db, `CREATE TABLE security_settings (skey TEXT PRIMARY KEY, svalue TEXT)`)
+	mustExec(t, db, `INSERT INTO security_settings VALUES ('alert_service', 'true')`)
+	mustExec(t, db, `CREATE TABLE alert_runtime_state (alert_type TEXT PRIMARY KEY, status TEXT)`)
+	mustExec(t, db, `INSERT INTO alert_runtime_state VALUES ('alert_service', 'firing')`)
+
+	oldNotifier := serviceIncidentNotifier
+	notifications := 0
+	serviceIncidentNotifier = func(_, _ string) { notifications++ }
+	t.Cleanup(func() { serviceIncidentNotifier = oldNotifier })
+	service := &GuardService{Name: "MariaDB", ServiceName: "mariadb"}
+	logIncident(service, "auto_restart", "MariaDB 自动恢复成功", true)
+	if notifications != 0 {
+		t.Fatalf("notifications=%d, want 0 while central alert is firing", notifications)
+	}
+	var alerts int
+	_ = db.QueryRow("SELECT COUNT(*) FROM alert_log").Scan(&alerts)
+	if alerts != 0 {
+		t.Fatalf("alerts=%d, want 0; central monitor owns the recovery transition", alerts)
+	}
+}

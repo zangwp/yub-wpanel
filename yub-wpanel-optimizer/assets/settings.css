@@ -1,0 +1,1349 @@
+/*
+ * YUB WPanel Optimizer — 设置页样式
+ *
+ * 设计取向：直角、细线、克制配色。层次依靠栅格对齐、字号对比与留白建立，
+ * 不使用圆角、渐变色块或外部资源。图标仅用 WordPress 自带 Dashicons。
+ */
+
+.yubw-settings *,
+.yubw-settings *::before,
+.yubw-settings *::after {
+    border-radius: 0 !important;
+    box-sizing: border-box;
+}
+
+.yubw-settings {
+    --yubw-ink: #0d1622;
+    --yubw-ink-soft: #1b2634;
+    --yubw-text: #1f2933;
+    --yubw-muted: #4b5560;
+    --yubw-line: #d5dae1;
+    --yubw-line-soft: #e7eaee;
+    --yubw-surface: #fff;
+    --yubw-surface-alt: #f7f8f9;
+    --yubw-accent: #1d4ed8;
+    --yubw-accent-deep: #14368f;
+    --yubw-accent-wash: #eef3ff;
+    --yubw-ok: #0b6b4f;
+    --yubw-warn: #8a5a00;
+    --yubw-risk: #a4231c;
+    --yubw-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+
+    color: var(--yubw-text);
+    font-variant-numeric: tabular-nums;
+    margin: 0;
+    max-width: 1180px;
+    padding-top: 4px;
+}
+
+/* ---------- 页头 ---------- */
+
+.yubw-settings .yubw-masthead {
+    align-items: stretch;
+    background: var(--yubw-ink);
+    border-top: 2px solid var(--yubw-accent);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0;
+    justify-content: space-between;
+    margin: 16px 0 0;
+}
+
+.yubw-settings .yubw-masthead__brand {
+    align-items: center;
+    display: flex;
+    gap: 14px;
+    min-width: 0;
+    padding: 20px 22px;
+}
+
+.yubw-settings .yubw-masthead__mark {
+    align-items: center;
+    border: 1px solid rgba(255, 255, 255, .28);
+    color: #fff;
+    display: flex;
+    flex: 0 0 auto;
+    height: 42px;
+    justify-content: center;
+    width: 42px;
+}
+
+.yubw-settings .yubw-masthead__mark img {
+    display: block;
+    height: 32px;
+    object-fit: contain;
+    width: 32px;
+}
+
+.yubw-settings .yubw-masthead__eyebrow {
+    color: #8fa3bd;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: .16em;
+    margin: 0 0 4px;
+}
+
+.yubw-settings .yubw-masthead h1 {
+    color: #fff;
+    font-size: 20px;
+    font-weight: 600;
+    letter-spacing: -.01em;
+    line-height: 1.25;
+    margin: 0;
+    padding: 0;
+}
+
+.yubw-settings .yubw-masthead__lead {
+    color: #b7c4d6;
+    font-size: 13.5px;
+    margin: 6px 0 0;
+}
+
+.yubw-settings .yubw-masthead__meta {
+    align-items: center;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0;
+}
+
+.yubw-settings .yubw-masthead__item {
+    border-left: 1px solid rgba(255, 255, 255, .14);
+    padding: 16px 20px;
+}
+
+.yubw-settings .yubw-masthead__label {
+    color: #8fa3bd;
+    display: block;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: .12em;
+    margin-bottom: 4px;
+}
+
+.yubw-settings .yubw-masthead__value {
+    color: #fff;
+    display: block;
+    font-family: var(--yubw-mono);
+    font-size: 13px;
+    overflow-wrap: anywhere;
+}
+
+.yubw-settings .yubw-masthead__action {
+    margin: 0 18px 0 0;
+}
+
+/* ---------- 状态读数条 ---------- */
+
+.yubw-settings .yubw-readout {
+    background: var(--yubw-surface);
+    border: 1px solid var(--yubw-line);
+    border-top: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    margin: 0;
+}
+
+.yubw-settings .yubw-readout__item {
+    border-left: 1px solid var(--yubw-line-soft);
+    min-width: 0;
+    padding: 12px 16px;
+}
+
+.yubw-settings .yubw-readout__item:first-child {
+    border-left: 0;
+}
+
+.yubw-settings .yubw-readout__label {
+    color: var(--yubw-muted);
+    display: block;
+    font-size: 12px;
+    margin-bottom: 6px;
+}
+
+.yubw-settings .yubw-readout__value {
+    align-items: center;
+    display: flex;
+    font-size: 15px;
+    font-weight: 600;
+    gap: 8px;
+}
+
+.yubw-settings .yubw-readout__value code {
+    font-family: var(--yubw-mono);
+    font-size: 12px;
+    overflow-wrap: anywhere;
+}
+
+/* 状态方块：直角实心小块，替代圆点与胶囊徽章 */
+
+.yubw-settings .yubw-flag {
+    flex: 0 0 auto;
+    height: 8px;
+    width: 8px;
+}
+
+.yubw-settings .yubw-flag--ok { background: var(--yubw-ok); }
+.yubw-settings .yubw-flag--warn { background: var(--yubw-warn); }
+.yubw-settings .yubw-flag--risk { background: var(--yubw-risk); }
+.yubw-settings .yubw-flag--idle { background: #9aa5b1; }
+.yubw-settings .yubw-flag--info { background: var(--yubw-accent); }
+
+.yubw-settings .is-ok { color: var(--yubw-ok); }
+.yubw-settings .is-warn { color: var(--yubw-warn); }
+.yubw-settings .is-risk { color: var(--yubw-risk); }
+.yubw-settings .is-idle { color: var(--yubw-muted); }
+
+.yubw-settings .yubw-component-update {
+    align-items: center;
+    background: #fff8e8;
+    border: 1px solid #d6a94b;
+    display: flex;
+    gap: 18px;
+    justify-content: space-between;
+    margin: 16px 0 0;
+    padding: 14px 16px;
+}
+
+.yubw-settings .yubw-component-update p { margin: 4px 0 0; }
+.yubw-settings #yubw-component-update-msg { min-width: 180px; }
+
+/* ---------- 标签导航 ---------- */
+
+.yubw-settings .yubw-tabs {
+    border-bottom: 1px solid var(--yubw-line);
+    display: flex;
+    flex-wrap: wrap;
+    margin: 22px 0 0;
+    padding: 0;
+}
+
+.yubw-settings .yubw-tabs .nav-tab {
+    align-items: center;
+    background: transparent;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    color: #8b949e;
+    display: inline-flex;
+    font-size: 14px;
+    font-weight: 500;
+    gap: 8px;
+    margin: 0;
+    padding: 12px 18px;
+}
+
+.yubw-settings .yubw-tabs .nav-tab:hover {
+    background: var(--yubw-surface-alt);
+    color: var(--yubw-text);
+}
+
+.yubw-settings .yubw-tabs .nav-tab:focus-visible {
+    outline: 2px solid var(--yubw-accent);
+    outline-offset: -2px;
+}
+
+.yubw-settings .yubw-tabs .nav-tab-active,
+.yubw-settings .yubw-tabs .nav-tab-active:hover {
+    background: var(--yubw-accent);
+    border-bottom-color: var(--yubw-accent);
+    color: #fff;
+    font-weight: 600;
+}
+
+.yubw-settings .yubw-tabs .nav-tab-active .dashicons {
+    color: #fff;
+}
+
+.yubw-settings .yubw-tabs .nav-tab .dashicons {
+    font-size: 16px;
+    height: 16px;
+    width: 16px;
+}
+
+/* ---------- 面板与分区 ---------- */
+
+.yubw-settings .yubw-tab-panel {
+    background: #eceff2;
+    border: 1px solid var(--yubw-line);
+    border-top: 0;
+    margin: 0;
+    padding: 18px;
+}
+
+.yubw-settings .yubw-section {
+    background: var(--yubw-surface);
+    border: 1px solid var(--yubw-line);
+    margin: 0 0 16px;
+}
+
+.yubw-settings .yubw-section:last-child {
+    margin-bottom: 0;
+}
+
+.yubw-settings .yubw-section__head {
+    background: var(--yubw-surface-alt);
+    border-bottom: 1px solid var(--yubw-line-soft);
+    padding: 12px 22px;
+}
+
+.yubw-settings .yubw-section__title {
+    align-items: center;
+    color: var(--yubw-ink);
+    display: flex;
+    font-size: 15px;
+    font-weight: 600;
+    gap: 9px;
+    margin: 0;
+}
+
+.yubw-settings .yubw-section__title .dashicons {
+    color: var(--yubw-accent);
+    font-size: 16px;
+    height: 16px;
+    width: 16px;
+}
+
+.yubw-settings .yubw-section__desc {
+    color: var(--yubw-muted);
+    font-size: 13.5px;
+    line-height: 1.65;
+    margin: 6px 0 0;
+}
+
+.yubw-settings .yubw-section__body {
+    padding: 4px 22px 20px;
+}
+
+/* ---------- 字段行 ---------- */
+
+.yubw-settings .yubw-field {
+    border-bottom: 1px solid var(--yubw-line-soft);
+    display: grid;
+    gap: 6px 32px;
+    grid-template-columns: 250px minmax(0, 1fr);
+    padding: 20px 0;
+}
+
+.yubw-settings .yubw-field:last-child {
+    border-bottom: 0;
+}
+
+.yubw-settings .yubw-field__title {
+    color: var(--yubw-ink);
+    display: block;
+    font-size: 15px;
+    font-weight: 600;
+    line-height: 1.5;
+}
+
+.yubw-settings .yubw-field__body {
+    max-width: 800px;
+    min-width: 0;
+}
+
+.yubw-settings .yubw-field__note {
+    color: var(--yubw-muted);
+    font-size: 13.5px;
+    line-height: 1.7;
+    margin: 9px 0 0;
+}
+
+.yubw-settings .yubw-field__note strong {
+    color: var(--yubw-text);
+}
+
+.yubw-settings .yubw-field__note code {
+    background: var(--yubw-surface-alt);
+    border: 1px solid var(--yubw-line-soft);
+    font-family: var(--yubw-mono);
+    font-size: 12.5px;
+    padding: 1px 5px;
+}
+
+/* 只读状态行：用于由面板托管、插件内不可编辑的项 */
+
+.yubw-settings .yubw-locked {
+    align-items: baseline;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.yubw-settings .yubw-locked__value {
+    font-size: 14.5px;
+    font-weight: 600;
+}
+
+.yubw-settings .yubw-locked__hint {
+    color: var(--yubw-muted);
+    font-size: 13px;
+}
+
+/* ---------- 输入框 ---------- */
+
+.yubw-settings .yubw-input {
+    background: #fff;
+    border: 1px solid #c3ccd5;
+    color: var(--yubw-text);
+    font-size: 14px;
+    min-height: 40px;
+    padding: 5px 11px;
+    width: 100%;
+}
+
+.yubw-settings .yubw-input--num {
+    font-family: var(--yubw-mono);
+    max-width: 180px;
+}
+
+.yubw-settings .yubw-input--short {
+    max-width: 120px;
+}
+
+.yubw-settings .yubw-input:focus {
+    border-color: var(--yubw-accent);
+    box-shadow: 0 0 0 1px var(--yubw-accent);
+    outline: 0;
+}
+
+.yubw-settings .yubw-input:disabled {
+    background: var(--yubw-surface-alt);
+    color: var(--yubw-muted);
+}
+
+.yubw-settings .yubw-input-group {
+    align-items: center;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 16px;
+}
+
+.yubw-settings .yubw-input-group__item {
+    align-items: center;
+    display: flex;
+    gap: 7px;
+}
+
+.yubw-settings .yubw-input-group__item label {
+    color: var(--yubw-muted);
+    font-size: 13.5px;
+    white-space: nowrap;
+}
+
+/* ---------- 开关（直角） ---------- */
+
+.yubw-settings .yubw-switch {
+    align-items: center;
+    cursor: pointer;
+    display: inline-flex;
+    gap: 10px;
+    min-height: 24px;
+    position: relative;
+}
+
+.yubw-settings .yubw-switch input[type="checkbox"] {
+    height: 26px;
+    left: 0;
+    margin: 0;
+    opacity: 0;
+    position: absolute;
+    top: 0;
+    width: 48px;
+}
+
+.yubw-settings .yubw-switch__track {
+    background: #c0c9d3;
+    display: block;
+    flex: 0 0 auto;
+    height: 26px;
+    position: relative;
+    transition: background .15s ease;
+    width: 48px;
+}
+
+.yubw-settings .yubw-switch__thumb {
+    background: #fff;
+    display: block;
+    height: 20px;
+    left: 3px;
+    position: absolute;
+    top: 3px;
+    transition: transform .15s ease;
+    width: 20px;
+}
+
+.yubw-settings .yubw-switch input:checked + .yubw-switch__track {
+    background: var(--yubw-accent);
+}
+
+.yubw-settings .yubw-switch input:checked + .yubw-switch__track .yubw-switch__thumb {
+    transform: translateX(22px);
+}
+
+.yubw-settings .yubw-switch input:focus-visible + .yubw-switch__track {
+    box-shadow: 0 0 0 2px #fff, 0 0 0 4px var(--yubw-accent);
+}
+
+.yubw-settings .yubw-switch input:disabled + .yubw-switch__track {
+    background: #dde2e7;
+}
+
+.yubw-settings .yubw-switch__text {
+    font-size: 14.5px;
+    font-weight: 500;
+}
+
+/* ---------- 单选块（直角） ---------- */
+
+.yubw-settings .yubw-choice {
+    display: grid;
+    gap: 10px;
+    max-width: 800px;
+}
+
+.yubw-settings .yubw-choice__item {
+    align-items: flex-start;
+    background: #fff;
+    border: 1px solid var(--yubw-line);
+    cursor: pointer;
+    display: flex;
+    gap: 12px;
+    padding: 13px 16px;
+    transition: background .15s ease, border-color .15s ease;
+}
+
+.yubw-settings .yubw-choice__item:hover {
+    border-color: #b3bdc8;
+}
+
+.yubw-settings .yubw-choice__item:has(input:checked) {
+    background: var(--yubw-accent-wash);
+    border-color: var(--yubw-accent);
+    box-shadow: inset 3px 0 0 var(--yubw-accent);
+}
+
+.yubw-settings .yubw-choice__item:has(input:disabled) {
+    cursor: not-allowed;
+    opacity: .6;
+}
+
+.yubw-settings .yubw-choice__item input[type="radio"] {
+    accent-color: var(--yubw-accent);
+    flex: 0 0 auto;
+    height: 16px;
+    margin: 3px 0 0;
+    width: 16px;
+}
+
+.yubw-settings .yubw-choice__text {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.yubw-settings .yubw-choice + .yubw-input-group {
+    margin-top: 12px;
+}
+
+/* ---------- 任务状态 ---------- */
+
+.yubw-settings .yubw-task-status {
+    align-items: center;
+    display: inline-flex;
+    font-size: 15px;
+    font-weight: 600;
+    gap: 8px;
+    min-height: 22px;
+}
+
+.yubw-settings .yubw-choice__label {
+    display: block;
+    font-size: 14.5px;
+    font-weight: 600;
+    line-height: 1.5;
+}
+
+.yubw-settings .yubw-choice__desc {
+    color: var(--yubw-muted);
+    display: block;
+    font-size: 13.5px;
+    line-height: 1.65;
+    margin-top: 4px;
+}
+
+/* ---------- 指标读数 ---------- */
+
+.yubw-settings .yubw-stats {
+    border: 1px solid var(--yubw-line-soft);
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    margin: 14px 0 0;
+}
+
+.yubw-settings .yubw-stats__item {
+    border-left: 1px solid var(--yubw-line-soft);
+    min-width: 0;
+    padding: 11px 14px;
+}
+
+.yubw-settings .yubw-stats__item:first-child {
+    border-left: 0;
+}
+
+.yubw-settings .yubw-stats__label {
+    color: var(--yubw-muted);
+    display: block;
+    font-size: 12px;
+    margin-bottom: 5px;
+}
+
+.yubw-settings .yubw-stats__value {
+    color: var(--yubw-ink);
+    display: block;
+    font-family: var(--yubw-mono);
+    font-size: 21px;
+    font-weight: 600;
+    line-height: 1.2;
+    overflow-wrap: anywhere;
+}
+
+/* ---------- 进度条（直角） ---------- */
+
+.yubw-settings .yubw-meter {
+    background: var(--yubw-line-soft);
+    height: 6px;
+    margin: 12px 0 0;
+    overflow: hidden;
+    width: 100%;
+}
+
+.yubw-settings .yubw-meter__fill {
+    background: var(--yubw-accent);
+    height: 100%;
+    width: 0;
+}
+
+/* ---------- 操作区 ---------- */
+
+.yubw-settings .yubw-ops {
+    align-items: center;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin: 18px 0 0;
+}
+
+.yubw-settings .yubw-ops form {
+    margin: 0;
+}
+
+.yubw-settings .yubw-ops__note {
+    color: var(--yubw-muted);
+    flex: 1 1 240px;
+    font-size: 13.5px;
+    line-height: 1.65;
+    margin: 0;
+    min-width: 0;
+}
+
+.yubw-settings .yubw-actions {
+    align-items: center;
+    background: var(--yubw-surface-alt);
+    border: 1px solid var(--yubw-line);
+    border-top: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    padding: 14px 22px;
+}
+
+.yubw-settings .yubw-actions__hint {
+    color: var(--yubw-muted);
+    font-size: 13.5px;
+    margin: 0;
+}
+
+/* ---------- 按钮 ---------- */
+
+.yubw-settings .button {
+    align-items: center;
+    background: #fff;
+    border: 1px solid var(--yubw-line);
+    border-radius: 0;
+    box-shadow: none;
+    color: var(--yubw-text);
+    display: inline-flex;
+    font-size: 14px;
+    font-weight: 500;
+    gap: 7px;
+    height: 40px;
+    line-height: 1;
+    padding: 0 18px;
+}
+
+.yubw-settings .button:hover:not(:disabled) {
+    background: #e8eef3;
+    border-color: var(--yubw-ink);
+    color: var(--yubw-ink);
+}
+
+.yubw-settings .button:focus-visible {
+    box-shadow: 0 0 0 2px #fff, 0 0 0 4px var(--yubw-accent);
+    outline: 0;
+}
+
+.yubw-settings .button .dashicons {
+    align-items: center;
+    display: inline-flex;
+    flex: 0 0 auto;
+    font-size: 16px;
+    height: 16px;
+    justify-content: center;
+    line-height: 1;
+    width: 16px;
+}
+
+.yubw-settings .button-primary,
+.yubw-settings .button-primary:focus:not(:disabled) {
+    background: var(--yubw-ink);
+    border-color: var(--yubw-ink);
+    color: #fff;
+}
+
+.yubw-settings .button-primary:hover:not(:disabled) {
+    background: var(--yubw-accent-deep);
+    border-color: var(--yubw-accent-deep);
+    color: #fff;
+}
+
+.yubw-settings .button:disabled {
+    cursor: not-allowed;
+    opacity: .45;
+}
+
+.yubw-settings .yubw-managed-action {
+    margin-top: 12px;
+}
+
+/* ---------- 提示条 ---------- */
+
+.yubw-settings .yubw-page-feedback:empty {
+    display: none;
+}
+
+.yubw-settings .yubw-page-notice {
+    background: #fff;
+    border: 1px solid var(--yubw-line);
+    border-left-width: 3px;
+    border-radius: 0;
+    box-shadow: none;
+    margin: 14px 0 0;
+    padding: 1px 14px;
+}
+
+.yubw-settings .yubw-page-notice p {
+    font-size: 13.5px;
+    line-height: 1.7;
+    margin: 11px 0;
+}
+
+.yubw-settings .yubw-page-notice--success { border-left-color: var(--yubw-ok); }
+.yubw-settings .yubw-page-notice--warning { border-left-color: var(--yubw-warn); }
+.yubw-settings .yubw-page-notice--error { border-left-color: var(--yubw-risk); }
+.yubw-settings .yubw-page-notice--info { border-left-color: var(--yubw-accent); }
+
+/* ---------- 关于页 ---------- */
+
+.yubw-settings .yubw-about-lead {
+    color: var(--yubw-muted);
+    font-size: 14px;
+    line-height: 1.75;
+    margin: 0 0 6px;
+}
+
+.yubw-settings .yubw-grid {
+    display: grid;
+    gap: 18px;
+    grid-template-columns: minmax(0, 1fr);
+}
+
+/* ---------- 缓存操作 ---------- */
+
+.yubw-settings .yubw-cache-actions {
+    display: grid;
+    gap: 12px;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    margin-top: 18px;
+}
+
+.yubw-settings .yubw-cache-action {
+    background: var(--yubw-surface-alt);
+    border: 1px solid var(--yubw-line-soft);
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    padding: 14px;
+}
+
+.yubw-settings .yubw-cache-action form {
+    margin: 0;
+}
+
+.yubw-settings .yubw-cache-action .button {
+    justify-content: center;
+    width: 100%;
+}
+
+.yubw-settings .yubw-cache-action p {
+    color: var(--yubw-muted);
+    font-size: 13px;
+    line-height: 1.6;
+    margin: 10px 0 0;
+}
+
+.yubw-settings .yubw-cache-action p.is-warn {
+    color: #8a5a00;
+}
+
+.yubw-settings .yubw-panel-card {
+    border: 1px solid var(--yubw-line);
+    min-width: 0;
+}
+
+.yubw-settings .yubw-panel-card__head {
+    align-items: center;
+    background: var(--yubw-surface-alt);
+    border-bottom: 1px solid var(--yubw-line-soft);
+    display: flex;
+    gap: 8px;
+    padding: 11px 16px;
+}
+
+.yubw-settings .yubw-panel-card__head h3 {
+    color: var(--yubw-ink);
+    font-size: 14.5px;
+    font-weight: 600;
+    margin: 0;
+}
+
+.yubw-settings .yubw-panel-card__head .dashicons {
+    color: var(--yubw-accent);
+    font-size: 16px;
+    height: 16px;
+    width: 16px;
+}
+
+.yubw-settings .yubw-panel-card__body {
+    padding: 14px 16px 16px;
+}
+
+.yubw-settings .yubw-panel-card p {
+    color: var(--yubw-muted);
+    font-size: 13.5px;
+    line-height: 1.75;
+    margin: 0 0 10px;
+}
+
+.yubw-settings .yubw-panel-card p:last-child {
+    margin-bottom: 0;
+}
+
+.yubw-settings .yubw-dl {
+    margin: 0 0 14px;
+}
+
+.yubw-settings .yubw-dl__row {
+    border-bottom: 1px solid var(--yubw-line-soft);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 16px;
+    justify-content: space-between;
+    padding: 8px 0;
+}
+
+.yubw-settings .yubw-dl__row:last-child {
+    border-bottom: 0;
+}
+
+.yubw-settings .yubw-dl dt {
+    color: var(--yubw-muted);
+    font-size: 13.5px;
+}
+
+.yubw-settings .yubw-dl dd {
+    font-family: var(--yubw-mono);
+    font-size: 13.5px;
+    margin: 0;
+    overflow-wrap: anywhere;
+    text-align: right;
+}
+
+.yubw-settings .yubw-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+/* 面板内部回环地址属于运维信息，用小号等宽字呈现，不与主信息争视觉权重 */
+
+.yubw-settings .yubw-endpoint {
+    color: var(--yubw-muted);
+    font-family: var(--yubw-mono);
+    font-size: 11.5px;
+    margin: 10px 0 0;
+    overflow-wrap: anywhere;
+}
+
+/* ---------- 缓存操作面板 ---------- */
+
+.yubw-settings .yubw-cache-status {
+    border-top: 1px solid var(--yubw-line);
+    margin-top: 16px;
+}
+
+.yubw-settings .yubw-cache-status .yubw-section {
+    margin-bottom: 0;
+}
+
+/* ---------- 最近清除记录 ---------- */
+
+.yubw-settings .yubw-log {
+    border: 1px solid var(--yubw-line-soft);
+    margin: 16px 0 0;
+    max-width: 100%;
+}
+
+.yubw-settings .yubw-log table {
+    border: 0;
+    border-collapse: collapse;
+    margin: 0;
+    width: 100%;
+}
+
+.yubw-settings .yubw-log th {
+    background: var(--yubw-surface-alt);
+    border-bottom: 1px solid var(--yubw-line-soft);
+    color: var(--yubw-muted);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .04em;
+    padding: 8px 12px;
+    text-align: left;
+}
+
+.yubw-settings .yubw-log td {
+    border-bottom: 1px solid var(--yubw-line-soft);
+    font-size: 12.5px;
+    padding: 8px 12px;
+}
+
+.yubw-settings .yubw-log tr:last-child td {
+    border-bottom: 0;
+}
+
+.yubw-settings .yubw-log td:first-child {
+    font-family: var(--yubw-mono);
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+/* ---------- 字段头与一句话摘要 ---------- */
+
+.yubw-settings .yubw-field__head {
+    min-width: 0;
+}
+
+.yubw-settings .yubw-field__summary {
+    color: var(--yubw-muted);
+    display: block;
+    font-size: 13px;
+    line-height: 1.6;
+    margin-top: 5px;
+}
+
+/* ---------- 要点列表：把长段落拆成可扫读的短句 ---------- */
+
+.yubw-settings .yubw-points {
+    list-style: none;
+    margin: 11px 0 0;
+    padding: 0;
+}
+
+.yubw-settings .yubw-points li {
+    color: var(--yubw-muted);
+    font-size: 13.5px;
+    line-height: 1.7;
+    padding: 5px 0 5px 13px;
+    position: relative;
+}
+
+.yubw-settings .yubw-points li::before {
+    background: #c2cbd4;
+    bottom: 9px;
+    content: "";
+    left: 0;
+    position: absolute;
+    top: 9px;
+    width: 3px;
+}
+
+.yubw-settings .yubw-points li.is-warn::before { background: var(--yubw-warn); }
+.yubw-settings .yubw-points li.is-risk::before { background: var(--yubw-risk); }
+.yubw-settings .yubw-points li.is-ok::before { background: var(--yubw-ok); }
+
+.yubw-settings .yubw-points li strong {
+    color: var(--yubw-ink);
+}
+
+.yubw-settings .yubw-points__label {
+    color: var(--yubw-ink);
+    font-weight: 600;
+    margin-right: 8px;
+}
+
+.yubw-settings .yubw-points code {
+    background: var(--yubw-surface-alt);
+    border: 1px solid var(--yubw-line-soft);
+    font-family: var(--yubw-mono);
+    font-size: 12.5px;
+    padding: 1px 5px;
+}
+
+/* ---------- 前置提示：说明"为什么不能/不会生效" ---------- */
+
+.yubw-settings .yubw-hint {
+    align-items: flex-start;
+    background: var(--yubw-accent-wash);
+    border: 1px solid #cddcfb;
+    border-left: 3px solid var(--yubw-accent);
+    color: #2b3f5c;
+    display: flex;
+    font-size: 13.5px;
+    gap: 8px;
+    line-height: 1.65;
+    margin: 12px 0 0;
+    padding: 10px 13px;
+}
+
+.yubw-settings .yubw-hint .dashicons {
+    color: var(--yubw-accent);
+    flex: 0 0 auto;
+    font-size: 16px;
+    height: 16px;
+    margin-top: 2px;
+    width: 16px;
+}
+
+.yubw-settings .yubw-hint strong {
+    color: var(--yubw-ink);
+}
+
+/* ---------- 边界与风险提示 ---------- */
+
+.yubw-settings .yubw-callout {
+    align-items: flex-start;
+    background: #fdf8ed;
+    border: 1px solid #ecdcb8;
+    border-left: 3px solid var(--yubw-warn);
+    color: #5c4415;
+    display: flex;
+    font-size: 13.5px;
+    gap: 9px;
+    line-height: 1.7;
+    margin: 12px 0 0;
+    padding: 11px 14px;
+}
+
+.yubw-settings .yubw-callout .dashicons {
+    color: var(--yubw-warn);
+    flex: 0 0 auto;
+    font-size: 17px;
+    height: 17px;
+    margin-top: 2px;
+    width: 17px;
+}
+
+.yubw-settings .yubw-callout strong {
+    color: #3f2f0d;
+}
+
+/* ---------- 更多说明：原生 details 折叠，不依赖 JS ---------- */
+
+.yubw-settings .yubw-more {
+    border-top: 1px solid var(--yubw-line-soft);
+    margin: 12px 0 0;
+    padding-top: 8px;
+}
+
+.yubw-settings .yubw-more summary {
+    align-items: center;
+    color: var(--yubw-accent);
+    cursor: pointer;
+    display: inline-flex;
+    font-size: 13px;
+    gap: 6px;
+    list-style: none;
+    padding: 3px 0;
+}
+
+.yubw-settings .yubw-more summary::-webkit-details-marker {
+    display: none;
+}
+
+.yubw-settings .yubw-more summary::after {
+    content: "+";
+    font-family: var(--yubw-mono);
+    font-size: 14px;
+}
+
+.yubw-settings .yubw-more[open] summary::after {
+    content: "\2212";
+}
+
+.yubw-settings .yubw-more summary:focus-visible {
+    outline: 2px solid var(--yubw-accent);
+    outline-offset: 2px;
+}
+
+.yubw-settings .yubw-more__body {
+    padding: 6px 0 2px;
+}
+
+.yubw-settings .yubw-more__body p {
+    color: var(--yubw-muted);
+    font-size: 13.5px;
+    line-height: 1.7;
+    margin: 0 0 7px;
+}
+
+.yubw-settings .yubw-more__body p:last-child {
+    margin-bottom: 0;
+}
+
+.yubw-settings .yubw-more__body code {
+    background: var(--yubw-surface-alt);
+    border: 1px solid var(--yubw-line-soft);
+    font-family: var(--yubw-mono);
+    font-size: 12.5px;
+    padding: 1px 5px;
+}
+
+/* ---------- 小节标题 ---------- */
+
+.yubw-settings .yubw-subhead {
+    color: var(--yubw-ink);
+    font-size: 14.5px;
+    font-weight: 600;
+    margin: 22px 0 0;
+}
+
+/* ---------- 首屏重点模块 ---------- */
+
+.yubw-settings .yubw-section--featured {
+    border-color: #b9cdf7;
+    box-shadow: inset 3px 0 0 var(--yubw-accent);
+}
+
+.yubw-settings .yubw-section--featured > .yubw-section__head {
+    background: var(--yubw-accent-wash);
+    border-bottom-color: #d3e0fb;
+}
+
+.yubw-settings .yubw-section__titlerow {
+    align-items: center;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.yubw-settings .yubw-section__badge {
+    background: var(--yubw-accent);
+    color: #fff;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .04em;
+    padding: 3px 8px;
+    white-space: nowrap;
+}
+
+/* ---------- 推荐值高亮 ---------- */
+
+.yubw-settings .yubw-key {
+    color: var(--yubw-accent);
+    font-family: var(--yubw-mono);
+    font-weight: 700;
+}
+
+/* ---------- 按钮与原因绑定 ---------- */
+
+.yubw-settings .yubw-ops__group {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.yubw-settings .yubw-ops__reason {
+    color: var(--yubw-muted);
+    font-size: 12.5px;
+    line-height: 1.55;
+    margin: 0;
+    max-width: 260px;
+}
+
+.yubw-settings .yubw-ops__reason.is-warn {
+    color: var(--yubw-warn);
+    font-weight: 500;
+}
+
+/* ---------- 结果化状态面板 ---------- */
+
+.yubw-settings .yubw-stats__item.is-ok .yubw-stats__value { color: var(--yubw-ok); }
+.yubw-settings .yubw-stats__item.is-risk .yubw-stats__value { color: var(--yubw-risk); }
+.yubw-settings .yubw-stats__item.is-info .yubw-stats__value { color: var(--yubw-accent); }
+.yubw-settings .yubw-stats__item.is-idle .yubw-stats__value { color: var(--yubw-muted); }
+
+.yubw-settings .yubw-statusline {
+    align-items: center;
+    background: var(--yubw-surface-alt);
+    border: 1px solid var(--yubw-line-soft);
+    border-left: 3px solid #aab3bd;
+    color: var(--yubw-text);
+    display: flex;
+    font-size: 13.5px;
+    gap: 9px;
+    margin: 0;
+    padding: 10px 13px;
+}
+
+.yubw-settings .yubw-statusline.is-active {
+    background: var(--yubw-accent-wash);
+    border-left-color: var(--yubw-accent);
+}
+
+.yubw-settings .yubw-statusline.is-warning {
+    background: #fff8e5;
+    border-color: #f0d58c;
+    border-left-color: var(--yubw-warn);
+}
+
+.yubw-settings .yubw-statusline .dashicons {
+    color: var(--yubw-muted);
+    flex: 0 0 auto;
+    font-size: 17px;
+    height: 17px;
+    width: 17px;
+}
+
+.yubw-settings .yubw-statusline.is-active .dashicons {
+    color: var(--yubw-accent);
+}
+
+.yubw-settings .yubw-statusline.is-warning .dashicons {
+    color: var(--yubw-warn);
+}
+
+/* ---------- 移动端 ---------- */
+
+@media screen and (max-width: 782px) {
+    .yubw-settings {
+        padding-top: 0;
+    }
+
+    .yubw-settings .yubw-tab-panel {
+        padding: 12px;
+    }
+
+    .yubw-settings .yubw-section {
+        margin-bottom: 12px;
+    }
+
+    .yubw-settings .yubw-masthead {
+        flex-direction: column;
+    }
+
+    .yubw-settings .yubw-masthead__brand {
+        padding: 16px;
+    }
+
+    .yubw-settings .yubw-masthead__meta {
+        border-top: 1px solid rgba(255, 255, 255, .14);
+    }
+
+    .yubw-settings .yubw-masthead__item {
+        flex: 1 1 50%;
+        padding: 12px 16px;
+    }
+
+    .yubw-settings .yubw-masthead__item:first-child {
+        border-left: 0;
+    }
+
+    .yubw-settings .yubw-masthead__action {
+        justify-content: center;
+        margin: 12px 16px 16px;
+        width: calc(100% - 32px);
+    }
+
+    .yubw-settings .yubw-readout {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .yubw-settings .yubw-readout__item {
+        border-top: 1px solid var(--yubw-line-soft);
+    }
+
+    .yubw-settings .yubw-readout__item:nth-child(-n+2) {
+        border-top: 0;
+    }
+
+    .yubw-settings .yubw-readout__item:nth-child(odd) {
+        border-left: 0;
+    }
+
+    .yubw-settings .yubw-tabs {
+        gap: 0;
+    }
+
+    .yubw-settings .yubw-tabs .nav-tab {
+        flex: 1 1 50%;
+        justify-content: center;
+        padding: 10px 8px;
+    }
+
+    .yubw-settings .yubw-field {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    /* 单列化，避免 minmax 下限在窄屏撑破容器造成横向溢出 */
+    .yubw-settings .yubw-grid {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .yubw-settings .yubw-cache-actions {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .yubw-settings .yubw-stats {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .yubw-settings .yubw-stats__item:nth-child(odd) {
+        border-left: 0;
+    }
+
+    .yubw-settings .yubw-section__head,
+    .yubw-settings .yubw-section__body {
+        padding-left: 14px;
+        padding-right: 14px;
+    }
+
+    .yubw-settings .yubw-actions {
+        padding: 14px;
+    }
+
+    .yubw-settings .yubw-dl dd {
+        text-align: left;
+    }
+
+    .yubw-settings .yubw-log td:first-child {
+        white-space: normal;
+    }
+}

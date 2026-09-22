@@ -1,0 +1,1439 @@
+package executor
+
+import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"net/url"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"time"
+)
+
+const (
+	wpUpdatePreparing   = "preparing"
+	wpUpdateQueued      = "queued"
+	wpUpdateRunning     = "running"
+	wpUpdateSuccess     = "success"
+	wpUpdateFailed      = "failed"
+	wpUpdateInterrupted = "interrupted_unknown"
+	wpUpdateLease       = 10 * time.Minute
+)
+
+var wpUpdateSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+type WPUpdateTask struct {
+	ID                     string
+	SiteID                 int
+	ComponentType          string
+	ComponentKey           string
+	TaskKind               string
+	ParentTaskID           string
+	TriggerType            string
+	Status                 string
+	Stage                  string
+	FailureStage           string
+	RollbackStatus         string
+	RequiresAttention      bool
+	ManualDisposition      string
+	CurrentVersion         string
+	TargetVersion          string
+	PackageSource          string
+	DownloadURL            string
+	DownloadedSHA256       string
+	VerificationLevel      string
+	PackageSnapshotPath    string
+	BackupReady            bool
+	DatabaseBackupMode     string
+	DatabaseBackupSourceID int64
+	AutoRollback           bool
+	BatchID                string
+	PlanSealedAt           string
+	LeaseOwner             string
+	LeaseExpiresAt         string
+	RequestedAt            string
+	StartedAt              string
+	FinishedAt             string
+}
+
+type WPUpdatePlan struct {
+	SiteID                 int
+	ComponentKey           string
+	CurrentVersion         string
+	TargetVersion          string
+	PackageSource          string
+	DownloadURL            string
+	DatabaseBackupMode     string
+	DatabaseBackupSourceID int64
+	// SkipAutoRollback 为 true 时，健康检查/更新失败不会自动回滚，任务终止在
+	// requires_attention=1、rollback_status='pending'，等待人工选择回滚或忽略。
+	// 零值 false 与现有所有调用方保持一致：始终自动回滚。
+	SkipAutoRollback bool
+	// BatchID 非空时标记该任务属于哪个批量更新分组，供批量汇总查询使用。
+	BatchID string
+}
+
+func validWPUpdateBackupPlan(plan WPUpdatePlan) bool {
+	return plan.DatabaseBackupMode == "fresh" && plan.DatabaseBackupSourceID == 0 ||
+		plan.DatabaseBackupMode == "reuse" && plan.DatabaseBackupSourceID > 0
+}
+
+func normalizeWPUpdateBackupPlan(plan *WPUpdatePlan) {
+	if plan != nil && plan.DatabaseBackupMode == "" && plan.DatabaseBackupSourceID == 0 {
+		plan.DatabaseBackupMode = "fresh"
+	}
+}
+
+func (s *wpUpdateStore) createPluginManualPlan(ctx context.Context, plan WPUpdatePlan, now time.Time) (WPUpdateTask, error) {
+	normalizeWPUpdateBackupPlan(&plan)
+	if s == nil || s.db == nil || plan.SiteID <= 0 || !validWPPluginComponentKey(plan.ComponentKey) ||
+		!wpComponentVersionPattern.MatchString(plan.CurrentVersion) || !wpComponentVersionPattern.MatchString(plan.TargetVersion) ||
+		plan.CurrentVersion == plan.TargetVersion || plan.PackageSource != "wordpress.org" ||
+		!validWPPluginDownloadURL(plan.DownloadURL, strings.Split(plan.ComponentKey, "/")[0], plan.TargetVersion) || !validWPUpdateBackupPlan(plan) {
+		return WPUpdateTask{}, errors.New("invalid plugin update plan")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return WPUpdateTask{}, err
+	}
+	defer tx.Rollback()
+	var siteType, siteStatus, inventoryStatus, collectionID, componentVersion string
+	var multisite int
+	err = tx.QueryRowContext(ctx, `SELECT w.site_type,w.status,COALESCE(i.status,''),COALESCE(i.collection_id,''),
+		COALESCE(i.is_multisite,0),COALESCE(c.version,'') FROM websites w
+		LEFT JOIN site_wp_inventory_state i ON i.site_id=w.id
+		LEFT JOIN site_wp_components c ON c.site_id=w.id AND c.component_type='plugin'
+			AND c.component_key=? AND c.collection_id=i.collection_id WHERE w.id=?`, plan.ComponentKey, plan.SiteID).
+		Scan(&siteType, &siteStatus, &inventoryStatus, &collectionID, &multisite, &componentVersion)
+	if err != nil {
+		return WPUpdateTask{}, err
+	}
+	if siteType != "wordpress" || siteStatus != "active" || inventoryStatus != "complete" ||
+		multisite != 0 || collectionID == "" || componentVersion != plan.CurrentVersion {
+		return WPUpdateTask{}, errors.New("site is not eligible for plugin update")
+	}
+	var candidate int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM site_wp_component_updates
+		WHERE site_id=? AND component_type='plugin' AND component_key=? AND target_version=? AND collection_id=?`,
+		plan.SiteID, plan.ComponentKey, plan.TargetVersion, collectionID).Scan(&candidate); err != nil {
+		return WPUpdateTask{}, err
+	}
+	if candidate == 0 {
+		return WPUpdateTask{}, errors.New("plugin update candidate is not current")
+	}
+	var blocked int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM wp_update_tasks WHERE site_id=? AND (
+		status IN ('preparing','queued','running') OR
+		(status='interrupted_unknown' AND manual_disposition=''))`, plan.SiteID).Scan(&blocked); err != nil {
+		return WPUpdateTask{}, err
+	}
+	if blocked != 0 {
+		return WPUpdateTask{}, errors.New("site has blocking update task")
+	}
+	id, err := newWPUpdateTaskID()
+	if err != nil {
+		return WPUpdateTask{}, err
+	}
+	stamp := wpUpdateDBTime(now)
+	_, err = tx.ExecContext(ctx, `INSERT INTO wp_update_tasks
+		(id,site_id,component_type,component_key,task_kind,trigger_type,status,stage,
+		 current_version,target_version,package_source,download_url,database_backup_mode,database_backup_source_id,
+		 auto_rollback,batch_id,requested_at,created_at,updated_at)
+		VALUES (?,?,'plugin',?,'update','manual','preparing','plan',?,?,?,?,?,?,?,?,?,?,?)`,
+		id, plan.SiteID, plan.ComponentKey, plan.CurrentVersion, plan.TargetVersion, plan.PackageSource, plan.DownloadURL,
+		plan.DatabaseBackupMode, nullableBackupSource(plan.DatabaseBackupSourceID), boolInt(!plan.SkipAutoRollback), plan.BatchID, stamp, stamp, stamp)
+	if err != nil {
+		return WPUpdateTask{}, err
+	}
+	if err := insertWPUpdateEvent(ctx, tx, id, "plan", "info", "", stamp); err != nil {
+		return WPUpdateTask{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return WPUpdateTask{}, err
+	}
+	return s.getTask(ctx, id)
+}
+
+func (s *wpUpdateStore) createThemeManualPlan(ctx context.Context, plan WPUpdatePlan, now time.Time) (WPUpdateTask, error) {
+	normalizeWPUpdateBackupPlan(&plan)
+	if s == nil || s.db == nil || plan.SiteID <= 0 || !validWPThemeComponentKey(plan.ComponentKey) ||
+		!wpComponentVersionPattern.MatchString(plan.CurrentVersion) || !wpComponentVersionPattern.MatchString(plan.TargetVersion) ||
+		plan.CurrentVersion == plan.TargetVersion || plan.PackageSource != "wordpress.org" ||
+		!validWPThemeDownloadURL(plan.DownloadURL, plan.ComponentKey, plan.TargetVersion) || !validWPUpdateBackupPlan(plan) {
+		return WPUpdateTask{}, errors.New("invalid theme update plan")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return WPUpdateTask{}, err
+	}
+	defer tx.Rollback()
+	var siteType, siteStatus, inventoryStatus, collectionID, componentVersion string
+	var multisite int
+	err = tx.QueryRowContext(ctx, `SELECT w.site_type,w.status,COALESCE(i.status,''),COALESCE(i.collection_id,''),
+		COALESCE(i.is_multisite,0),COALESCE(c.version,'') FROM websites w
+		LEFT JOIN site_wp_inventory_state i ON i.site_id=w.id
+		LEFT JOIN site_wp_components c ON c.site_id=w.id AND c.component_type='theme'
+			AND c.component_key=? AND c.collection_id=i.collection_id WHERE w.id=?`, plan.ComponentKey, plan.SiteID).
+		Scan(&siteType, &siteStatus, &inventoryStatus, &collectionID, &multisite, &componentVersion)
+	if err != nil {
+		return WPUpdateTask{}, err
+	}
+	if siteType != "wordpress" || siteStatus != "active" || inventoryStatus != "complete" ||
+		multisite != 0 || collectionID == "" || componentVersion != plan.CurrentVersion {
+		return WPUpdateTask{}, errors.New("site is not eligible for theme update")
+	}
+	var candidate int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM site_wp_component_updates
+		WHERE site_id=? AND component_type='theme' AND component_key=? AND target_version=? AND collection_id=?`,
+		plan.SiteID, plan.ComponentKey, plan.TargetVersion, collectionID).Scan(&candidate); err != nil {
+		return WPUpdateTask{}, err
+	}
+	if candidate == 0 {
+		return WPUpdateTask{}, errors.New("theme update candidate is not current")
+	}
+	var blocked int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM wp_update_tasks WHERE site_id=? AND (
+		status IN ('preparing','queued','running') OR
+		(status='interrupted_unknown' AND manual_disposition=''))`, plan.SiteID).Scan(&blocked); err != nil {
+		return WPUpdateTask{}, err
+	}
+	if blocked != 0 {
+		return WPUpdateTask{}, errors.New("site has blocking update task")
+	}
+	id, err := newWPUpdateTaskID()
+	if err != nil {
+		return WPUpdateTask{}, err
+	}
+	stamp := wpUpdateDBTime(now)
+	_, err = tx.ExecContext(ctx, `INSERT INTO wp_update_tasks
+		(id,site_id,component_type,component_key,task_kind,trigger_type,status,stage,
+		 current_version,target_version,package_source,download_url,database_backup_mode,database_backup_source_id,
+		 auto_rollback,batch_id,requested_at,created_at,updated_at)
+		VALUES (?,?,'theme',?,'update','manual','preparing','plan',?,?,?,?,?,?,?,?,?,?,?)`,
+		id, plan.SiteID, plan.ComponentKey, plan.CurrentVersion, plan.TargetVersion, plan.PackageSource, plan.DownloadURL,
+		plan.DatabaseBackupMode, nullableBackupSource(plan.DatabaseBackupSourceID), boolInt(!plan.SkipAutoRollback), plan.BatchID, stamp, stamp, stamp)
+	if err != nil {
+		return WPUpdateTask{}, err
+	}
+	if err := insertWPUpdateEvent(ctx, tx, id, "plan", "info", "", stamp); err != nil {
+		return WPUpdateTask{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return WPUpdateTask{}, err
+	}
+	return s.getTask(ctx, id)
+}
+
+type wpUpdateStore struct{ db *sql.DB }
+
+func newWPUpdateStore(db *sql.DB) *wpUpdateStore { return &wpUpdateStore{db: db} }
+
+func (s *wpUpdateStore) createCoreManualPlan(ctx context.Context, plan WPUpdatePlan, now time.Time) (WPUpdateTask, error) {
+	normalizeWPUpdateBackupPlan(&plan)
+	if s == nil || s.db == nil || plan.SiteID <= 0 || strings.TrimSpace(plan.CurrentVersion) == "" ||
+		strings.TrimSpace(plan.TargetVersion) == "" || plan.CurrentVersion == plan.TargetVersion ||
+		plan.PackageSource != "wordpress.org" || !validWPUpdateDownloadURL(plan.DownloadURL) || !validWPUpdateBackupPlan(plan) {
+		return WPUpdateTask{}, errors.New("invalid update plan")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return WPUpdateTask{}, err
+	}
+	defer tx.Rollback()
+	var siteType, siteStatus, inventoryStatus, inventoryVersion string
+	var multisite int
+	err = tx.QueryRowContext(ctx, `SELECT w.site_type, w.status,
+		COALESCE(i.status,''), COALESCE(i.wordpress_version,''), COALESCE(i.is_multisite,0)
+		FROM websites w LEFT JOIN site_wp_inventory_state i ON i.site_id=w.id WHERE w.id=?`, plan.SiteID).
+		Scan(&siteType, &siteStatus, &inventoryStatus, &inventoryVersion, &multisite)
+	if err != nil {
+		return WPUpdateTask{}, err
+	}
+	if siteType != "wordpress" || siteStatus != "active" || inventoryStatus != "complete" || multisite != 0 || inventoryVersion != plan.CurrentVersion {
+		return WPUpdateTask{}, errors.New("site is not eligible for core update")
+	}
+	var blocked int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM wp_update_tasks WHERE site_id=? AND (
+		status IN ('preparing','queued','running') OR
+		(status='interrupted_unknown' AND manual_disposition=''))`, plan.SiteID).Scan(&blocked); err != nil {
+		return WPUpdateTask{}, err
+	}
+	if blocked != 0 {
+		return WPUpdateTask{}, errors.New("site has blocking update task")
+	}
+	id, err := newWPUpdateTaskID()
+	if err != nil {
+		return WPUpdateTask{}, err
+	}
+	stamp := wpUpdateDBTime(now)
+	_, err = tx.ExecContext(ctx, `INSERT INTO wp_update_tasks
+		(id,site_id,component_type,component_key,task_kind,trigger_type,status,stage,
+		 current_version,target_version,package_source,download_url,database_backup_mode,database_backup_source_id,
+		 auto_rollback,batch_id,requested_at,created_at,updated_at)
+		VALUES (?,?,'core','core','update','manual','preparing','plan',?,?,?,?,?,?,?,?,?,?,?)`,
+		id, plan.SiteID, plan.CurrentVersion, plan.TargetVersion, plan.PackageSource, plan.DownloadURL,
+		plan.DatabaseBackupMode, nullableBackupSource(plan.DatabaseBackupSourceID), boolInt(!plan.SkipAutoRollback), plan.BatchID, stamp, stamp, stamp)
+	if err != nil {
+		return WPUpdateTask{}, err
+	}
+	if err := insertWPUpdateEvent(ctx, tx, id, "plan", "info", "", stamp); err != nil {
+		return WPUpdateTask{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return WPUpdateTask{}, err
+	}
+	return s.getTask(ctx, id)
+}
+
+func (s *wpUpdateStore) sealPlan(ctx context.Context, id, sha256, verification, snapshotPath string, now time.Time) (WPUpdateTask, error) {
+	if !wpUpdateSHA256Pattern.MatchString(sha256) || (verification != "structure_only" && verification != "official_verified") || !filepath.IsAbs(snapshotPath) {
+		return WPUpdateTask{}, errors.New("invalid sealed plan")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return WPUpdateTask{}, err
+	}
+	defer tx.Rollback()
+	stamp := wpUpdateDBTime(now)
+	result, err := tx.ExecContext(ctx, `UPDATE wp_update_tasks SET downloaded_sha256=?, verification_level=?,
+		package_snapshot_path=?, plan_sealed_at=?, status='queued', stage='queued', updated_at=?
+		WHERE id=? AND task_kind='update' AND status='preparing' AND plan_sealed_at IS NULL`,
+		sha256, verification, filepath.Clean(snapshotPath), stamp, stamp, id)
+	if err != nil {
+		return WPUpdateTask{}, err
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return WPUpdateTask{}, errors.New("update plan is not sealable")
+	}
+	if err := insertWPUpdateEvent(ctx, tx, id, "queued", "success", "", stamp); err != nil {
+		return WPUpdateTask{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return WPUpdateTask{}, err
+	}
+	return s.getTask(ctx, id)
+}
+
+func (s *wpUpdateStore) failPreparingPlan(ctx context.Context, id, code string, now time.Time) error {
+	if !wpUpdateTaskIDPattern.MatchString(id) || code == "" {
+		return errors.New("invalid preparing update failure")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stamp := wpUpdateDBTime(now)
+	result, err := tx.ExecContext(ctx, `UPDATE wp_update_tasks SET status='failed',stage='package_prepare',
+		failure_stage='package_prepare',finished_at=?,updated_at=?
+		WHERE id=? AND task_kind='update' AND status='preparing' AND plan_sealed_at IS NULL`, stamp, stamp, id)
+	if err != nil {
+		return err
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return errors.New("preparing update plan not failed")
+	}
+	if err := insertWPUpdateEvent(ctx, tx, id, "package_prepare", "failed", code, stamp); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *wpUpdateStore) claimCoreUpdate(ctx context.Context, id, owner, observedVersion string, now time.Time) (WPUpdateTask, error) {
+	if owner == "" || observedVersion == "" {
+		return WPUpdateTask{}, errors.New("invalid claim")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return WPUpdateTask{}, err
+	}
+	defer tx.Rollback()
+	var status, currentVersion, sha, verification, snapshot, siteType, siteStatus string
+	err = tx.QueryRowContext(ctx, `SELECT t.status,t.current_version,t.downloaded_sha256,t.verification_level,
+		t.package_snapshot_path,w.site_type,w.status FROM wp_update_tasks t
+		JOIN websites w ON w.id=t.site_id WHERE t.id=? AND t.task_kind='update' AND t.component_type='core'`, id).
+		Scan(&status, &currentVersion, &sha, &verification, &snapshot, &siteType, &siteStatus)
+	if err != nil {
+		return WPUpdateTask{}, err
+	}
+	stamp := wpUpdateDBTime(now)
+	if status != wpUpdateQueued || siteType != "wordpress" || siteStatus != "active" || currentVersion != observedVersion ||
+		!wpUpdateSHA256Pattern.MatchString(sha) || verification == "" || !filepath.IsAbs(snapshot) {
+		if status == wpUpdateQueued {
+			_, err = tx.ExecContext(ctx, `UPDATE wp_update_tasks SET status='failed',stage='precheck',failure_stage='precheck',
+				finished_at=?,updated_at=? WHERE id=? AND status='queued'`, stamp, stamp, id)
+			if err == nil {
+				err = insertWPUpdateEvent(ctx, tx, id, "precheck", "failed", "precheck_failed", stamp)
+			}
+			if err == nil {
+				err = tx.Commit()
+			}
+		}
+		return WPUpdateTask{}, errors.New("update claim precheck failed")
+	}
+	leaseUntil := wpUpdateDBTime(now.Add(wpUpdateLease))
+	result, err := tx.ExecContext(ctx, `UPDATE wp_update_tasks SET status='running',stage='claimed',lease_owner=?,
+		lease_expires_at=?,started_at=?,updated_at=? WHERE id=? AND status='queued'`, owner, leaseUntil, stamp, stamp, id)
+	if err != nil {
+		return WPUpdateTask{}, err
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return WPUpdateTask{}, errors.New("update task was not claimed")
+	}
+	if err := insertWPUpdateEvent(ctx, tx, id, "claimed", "success", "", stamp); err != nil {
+		return WPUpdateTask{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return WPUpdateTask{}, err
+	}
+	return s.getTask(ctx, id)
+}
+
+func (s *wpUpdateStore) claimPluginUpdate(ctx context.Context, id, owner, observedVersion, observedSHA string, now time.Time) (WPUpdateTask, error) {
+	return s.claimComponentUpdate(ctx, id, owner, observedVersion, observedSHA, "plugin", validWPPluginComponentKey, now)
+}
+
+func (s *wpUpdateStore) claimThemeUpdate(ctx context.Context, id, owner, observedVersion, observedSHA string, now time.Time) (WPUpdateTask, error) {
+	return s.claimComponentUpdate(ctx, id, owner, observedVersion, observedSHA, "theme", validWPThemeComponentKey, now)
+}
+
+func (s *wpUpdateStore) claimComponentUpdate(ctx context.Context, id, owner, observedVersion, observedSHA, componentType string, validKey func(string) bool, now time.Time) (WPUpdateTask, error) {
+	if owner == "" || observedVersion == "" || !wpUpdateSHA256Pattern.MatchString(observedSHA) ||
+		(componentType != "plugin" && componentType != "theme") || validKey == nil {
+		return WPUpdateTask{}, errors.New("invalid component claim")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return WPUpdateTask{}, err
+	}
+	defer tx.Rollback()
+	var status, currentVersion, sha, verification, snapshot, siteType, siteStatus, componentKey string
+	err = tx.QueryRowContext(ctx, `SELECT t.status,t.current_version,t.downloaded_sha256,t.verification_level,
+		t.package_snapshot_path,w.site_type,w.status,t.component_key FROM wp_update_tasks t
+		JOIN websites w ON w.id=t.site_id WHERE t.id=? AND t.task_kind='update' AND t.component_type=?`, id, componentType).
+		Scan(&status, &currentVersion, &sha, &verification, &snapshot, &siteType, &siteStatus, &componentKey)
+	if err != nil {
+		return WPUpdateTask{}, err
+	}
+	if status != wpUpdateQueued || siteType != "wordpress" || siteStatus != "active" ||
+		currentVersion != observedVersion || sha != observedSHA || verification != "structure_only" ||
+		!filepath.IsAbs(snapshot) || validKey == nil || !validKey(componentKey) {
+		return s.failComponentClaimTx(ctx, tx, id, status, componentType, "precheck_failed", now)
+	}
+	stamp := wpUpdateDBTime(now)
+	leaseUntil := wpUpdateDBTime(now.Add(wpUpdateLease))
+	result, err := tx.ExecContext(ctx, `UPDATE wp_update_tasks SET status='running',stage='claimed',lease_owner=?,
+		lease_expires_at=?,started_at=?,updated_at=? WHERE id=? AND status='queued' AND component_type=?`,
+		owner, leaseUntil, stamp, stamp, id, componentType)
+	if err != nil {
+		return WPUpdateTask{}, err
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return WPUpdateTask{}, errors.New("component update task was not claimed")
+	}
+	if err := insertWPUpdateEvent(ctx, tx, id, "claimed", "success", "", stamp); err != nil {
+		return WPUpdateTask{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return WPUpdateTask{}, err
+	}
+	return s.getTask(ctx, id)
+}
+
+func (s *wpUpdateStore) failPluginClaim(ctx context.Context, id, code string, now time.Time) (WPUpdateTask, error) {
+	return s.failComponentClaim(ctx, id, "plugin", code, now)
+}
+
+func (s *wpUpdateStore) failThemeClaim(ctx context.Context, id, code string, now time.Time) (WPUpdateTask, error) {
+	return s.failComponentClaim(ctx, id, "theme", code, now)
+}
+
+func (s *wpUpdateStore) failComponentClaim(ctx context.Context, id, componentType, code string, now time.Time) (WPUpdateTask, error) {
+	if componentType != "plugin" && componentType != "theme" {
+		return WPUpdateTask{}, errors.New("invalid component claim failure")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return WPUpdateTask{}, err
+	}
+	defer tx.Rollback()
+	return s.failComponentClaimTx(ctx, tx, id, wpUpdateQueued, componentType, code, now)
+}
+
+func (s *wpUpdateStore) failPluginClaimTx(ctx context.Context, tx *sql.Tx, id, status, code string, now time.Time) (WPUpdateTask, error) {
+	return s.failComponentClaimTx(ctx, tx, id, status, "plugin", code, now)
+}
+
+func (s *wpUpdateStore) failComponentClaimTx(ctx context.Context, tx *sql.Tx, id, status, componentType, code string, now time.Time) (WPUpdateTask, error) {
+	if status != wpUpdateQueued || code == "" || (componentType != "plugin" && componentType != "theme") {
+		return WPUpdateTask{}, errors.New("component update claim precheck failed")
+	}
+	stamp := wpUpdateDBTime(now)
+	result, err := tx.ExecContext(ctx, `UPDATE wp_update_tasks SET status='failed',stage='precheck',failure_stage='precheck',
+		finished_at=?,updated_at=? WHERE id=? AND status='queued' AND component_type=?`, stamp, stamp, id, componentType)
+	if err != nil {
+		return WPUpdateTask{}, err
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return WPUpdateTask{}, errors.New("component update claim precheck failed")
+	}
+	if err := insertWPUpdateEvent(ctx, tx, id, "precheck", "failed", code, stamp); err != nil {
+		return WPUpdateTask{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return WPUpdateTask{}, err
+	}
+	return WPUpdateTask{}, errors.New("component update claim precheck failed")
+}
+
+func (s *wpUpdateStore) heartbeat(ctx context.Context, id, owner string, now time.Time) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `UPDATE wp_update_tasks SET lease_expires_at=?,updated_at=?
+		WHERE id=? AND lease_owner=? AND status='running'`, wpUpdateDBTime(now.Add(wpUpdateLease)), wpUpdateDBTime(now), id, owner)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	return changed == 1, err
+}
+
+func (s *wpUpdateStore) nextQueuedCoreUpdate(ctx context.Context) (WPUpdateTask, error) {
+	var id string
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM wp_update_tasks
+		WHERE status='queued' AND task_kind='update' AND component_type='core'
+		ORDER BY requested_at,id LIMIT 1`).Scan(&id)
+	if err != nil {
+		return WPUpdateTask{}, err
+	}
+	return s.getTask(ctx, id)
+}
+
+func (s *wpUpdateStore) nextQueuedUpdateCandidates(ctx context.Context) ([]WPUpdateTask, error) {
+	rows, err := s.db.QueryContext(ctx, `WITH ranked AS (
+		SELECT id,requested_at,component_type,
+			ROW_NUMBER() OVER (PARTITION BY component_type ORDER BY requested_at,id) AS candidate_rank
+		FROM wp_update_tasks
+		WHERE status='queued' AND task_kind='update' AND component_type IN ('core','plugin','theme')
+	)
+	SELECT id FROM ranked WHERE candidate_rank=1 ORDER BY requested_at,id`)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	tasks := make([]WPUpdateTask, 0, len(ids))
+	for _, id := range ids {
+		task, err := s.getTask(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, task)
+	}
+	return tasks, nil
+}
+
+func (s *wpUpdateStore) interruptOwned(ctx context.Context, id, owner, code string, now time.Time) (bool, error) {
+	if owner == "" || code == "" {
+		return false, errors.New("invalid update interruption")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	stamp := wpUpdateDBTime(now)
+	result, err := tx.ExecContext(ctx, `UPDATE wp_update_tasks SET status='interrupted_unknown',stage='interrupted',
+		requires_attention=1,lease_owner='',lease_expires_at=NULL,finished_at=?,updated_at=?
+		WHERE id=? AND lease_owner=? AND status='running'`, stamp, stamp, id, owner)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil || changed == 0 {
+		return false, err
+	}
+	if err := insertWPUpdateEvent(ctx, tx, id, "interrupted", "interrupted", code, stamp); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *wpUpdateStore) recoverExpired(ctx context.Context, now time.Time) (int64, error) {
+	return s.recoverRunning(ctx, "lease_expired", now, false)
+}
+
+func (s *wpUpdateStore) recoverAfterRestart(ctx context.Context, now time.Time) (int64, error) {
+	return s.recoverRunning(ctx, "worker_restarted", now, true)
+}
+
+func (s *wpUpdateStore) recoverRunning(ctx context.Context, code string, now time.Time, allRunning bool) (int64, error) {
+	return s.recoverRunningComponent(ctx, code, now, allRunning, "")
+}
+
+func (s *wpUpdateStore) recoverCoreExpired(ctx context.Context, now time.Time) (int64, error) {
+	return s.recoverRunningComponent(ctx, "lease_expired", now, false, "core")
+}
+
+func (s *wpUpdateStore) recoverCoreAfterRestart(ctx context.Context, now time.Time) (int64, error) {
+	return s.recoverRunningComponent(ctx, "worker_restarted", now, true, "core")
+}
+
+func (s *wpUpdateStore) recoverRunningComponent(ctx context.Context, code string, now time.Time, allRunning bool, component string) (int64, error) {
+	if code == "" {
+		return 0, errors.New("invalid update recovery")
+	}
+	if component != "" && component != "core" {
+		return 0, errors.New("invalid update recovery component")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	stamp := wpUpdateDBTime(now)
+	query := `UPDATE wp_update_tasks SET status='interrupted_unknown',stage='interrupted',
+		requires_attention=1,lease_owner='',lease_expires_at=NULL,finished_at=?,updated_at=?
+		WHERE status='running' AND lease_expires_at<=? RETURNING id`
+	queryArgs := []any{stamp, stamp, stamp}
+	if component == "core" {
+		query = `UPDATE wp_update_tasks SET status='interrupted_unknown',stage='interrupted',
+			requires_attention=1,lease_owner='',lease_expires_at=NULL,finished_at=?,updated_at=?
+			WHERE status='running' AND component_type='core' AND lease_expires_at<=? RETURNING id`
+	}
+	if allRunning {
+		query = `UPDATE wp_update_tasks SET status='interrupted_unknown',stage='interrupted',
+			requires_attention=1,lease_owner='',lease_expires_at=NULL,finished_at=?,updated_at=?
+			WHERE status='running' RETURNING id`
+		queryArgs = []any{stamp, stamp}
+		if component == "core" {
+			query = `UPDATE wp_update_tasks SET status='interrupted_unknown',stage='interrupted',
+				requires_attention=1,lease_owner='',lease_expires_at=NULL,finished_at=?,updated_at=?
+				WHERE status='running' AND component_type='core' RETURNING id`
+		}
+	}
+	rows, err := tx.QueryContext(ctx, query, queryArgs...)
+	if err != nil {
+		return 0, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	for _, id := range ids {
+		if err := insertWPUpdateEvent(ctx, tx, id, "interrupted", "interrupted", code, stamp); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return int64(len(ids)), nil
+}
+
+func (s *wpUpdateStore) runningPluginTasks(ctx context.Context, now time.Time, expiredOnly bool) ([]WPUpdateTask, error) {
+	return s.runningComponentTasks(ctx, "plugin", now, expiredOnly)
+}
+
+func (s *wpUpdateStore) runningThemeTasks(ctx context.Context, now time.Time, expiredOnly bool) ([]WPUpdateTask, error) {
+	return s.runningComponentTasks(ctx, "theme", now, expiredOnly)
+}
+
+func (s *wpUpdateStore) runningComponentTasks(ctx context.Context, componentType string, now time.Time, expiredOnly bool) ([]WPUpdateTask, error) {
+	if componentType != "plugin" && componentType != "theme" {
+		return nil, errors.New("invalid running component lookup")
+	}
+	query := `SELECT id FROM wp_update_tasks WHERE status='running' AND component_type=?`
+	args := []any{componentType}
+	if expiredOnly {
+		query += ` AND lease_expires_at<=?`
+		args = append(args, wpUpdateDBTime(now))
+	}
+	query += ` ORDER BY id`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	tasks := make([]WPUpdateTask, 0, len(ids))
+	for _, id := range ids {
+		task, err := s.getTask(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, task)
+	}
+	return tasks, nil
+}
+
+func (s *wpUpdateStore) markSuccess(ctx context.Context, id, owner string, now time.Time) error {
+	return s.finishOwned(ctx, id, owner, wpUpdateSuccess, "complete", "", false, now)
+}
+
+// refreshCoreInventoryAfterUpdate records the newly installed WordPress version
+// in the site inventory state and removes the just-applied core upgrade
+// candidate. Without this, a subsequent "check core update" (which reads the
+// stored inventory rather than the live site) would still offer the version
+// that was already installed, because the cached inventory scan can remain
+// stale for up to 12 hours after the update succeeds.
+func (s *wpUpdateStore) refreshCoreInventoryAfterUpdate(ctx context.Context, siteID int, newVersion string, now time.Time) error {
+	if siteID <= 0 || newVersion == "" {
+		return errors.New("invalid core inventory refresh")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stamp := wpUpdateDBTime(now)
+	if _, err := tx.ExecContext(ctx, `UPDATE site_wp_inventory_state SET wordpress_version=?, last_success_at=?, updated_at=? WHERE site_id=?`, newVersion, stamp, stamp, siteID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM site_wp_component_updates WHERE site_id=? AND component_type='core' AND component_key='wordpress' AND response='upgrade'`, siteID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// reconcileCoreInventoryVersion updates the cached core version after an
+// out-of-band WordPress update and removes only candidates already satisfied
+// by that version. It intentionally leaves last_success_at unchanged because
+// this is not a complete inventory scan.
+func (s *wpUpdateStore) reconcileCoreInventoryVersion(ctx context.Context, siteID int, collectionID, newVersion string, now time.Time) error {
+	if s == nil || s.db == nil || siteID <= 0 || collectionID == "" || newVersion == "" {
+		return errors.New("invalid core inventory reconciliation")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE site_wp_inventory_state SET wordpress_version=?,updated_at=? WHERE site_id=? AND collection_id=?`, newVersion, wpUpdateDBTime(now), siteID, collectionID)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return tx.Commit()
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT rowid,target_version FROM site_wp_component_updates
+		WHERE site_id=? AND collection_id=? AND component_type='core' AND component_key='wordpress' AND response='upgrade'`, siteID, collectionID)
+	if err != nil {
+		return err
+	}
+	var satisfied []int64
+	for rows.Next() {
+		var rowID int64
+		var target string
+		if err := rows.Scan(&rowID, &target); err != nil {
+			rows.Close()
+			return err
+		}
+		if compareWPVersions(target, newVersion) <= 0 {
+			satisfied = append(satisfied, rowID)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, rowID := range satisfied {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM site_wp_component_updates WHERE rowid=?`, rowID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *wpUpdateStore) markFailure(ctx context.Context, id, owner, failureStage string, attention bool, now time.Time) error {
+	if failureStage == "" {
+		return errors.New("failure stage is required")
+	}
+	return s.finishOwned(ctx, id, owner, wpUpdateFailed, failureStage, failureStage, attention, now)
+}
+
+func (s *wpUpdateStore) advanceOwnedStage(ctx context.Context, id, owner, expectedStage, nextStage string, now time.Time) error {
+	if expectedStage == "" || nextStage == "" || expectedStage == nextStage {
+		return errors.New("update stage is required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stamp := wpUpdateDBTime(now)
+	result, err := tx.ExecContext(ctx, `UPDATE wp_update_tasks SET stage=?,updated_at=?
+		WHERE id=? AND lease_owner=? AND status='running' AND stage=?`, nextStage, stamp, id, owner, expectedStage)
+	if err != nil {
+		return err
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return errors.New("update task ownership lost")
+	}
+	if err := insertWPUpdateEvent(ctx, tx, id, nextStage, "info", "", stamp); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *wpUpdateStore) recordPluginPrepared(ctx context.Context, id, owner string, wasActive bool, now time.Time) error {
+	code := "plugin_observed_inactive"
+	if wasActive {
+		code = "plugin_observed_active"
+	}
+	return s.recordComponentPrepared(ctx, id, owner, "plugin", code, now)
+}
+
+func (s *wpUpdateStore) recordThemePrepared(ctx context.Context, id, owner string, now time.Time) error {
+	return s.recordComponentPrepared(ctx, id, owner, "theme", "theme_state_observed", now)
+}
+
+func (s *wpUpdateStore) recordComponentPrepared(ctx context.Context, id, owner, componentType, code string, now time.Time) error {
+	if (componentType != "plugin" && componentType != "theme") || code == "" {
+		return errors.New("invalid component preparation event")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stamp := wpUpdateDBTime(now)
+	result, err := tx.ExecContext(ctx, `UPDATE wp_update_tasks SET stage='unlocking',updated_at=?
+		WHERE id=? AND component_type=? AND lease_owner=? AND status='running' AND stage='backups_ready'`, stamp, id, componentType, owner)
+	if err != nil {
+		return err
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return errors.New("update task ownership lost")
+	}
+	if err := insertWPUpdateEvent(ctx, tx, id, "prepare", "info", code, stamp); err != nil {
+		return err
+	}
+	if err := insertWPUpdateEvent(ctx, tx, id, "unlocking", "info", "", stamp); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *wpUpdateStore) recordPluginRunnerJournal(ctx context.Context, id, owner string, report wpPluginUpdateJournalReport, now time.Time) error {
+	if len(report.Checkpoints) > len(wpPluginJournalCheckpoints) {
+		return errors.New("invalid plugin runner journal report")
+	}
+	for i, checkpoint := range report.Checkpoints {
+		if checkpoint != wpPluginJournalCheckpoints[i] {
+			return errors.New("invalid plugin runner journal report")
+		}
+	}
+	last := "none"
+	if len(report.Checkpoints) != 0 {
+		last = report.Checkpoints[len(report.Checkpoints)-1]
+	}
+	code := fmt.Sprintf("runner_journal_%d_%s_complete", len(report.Checkpoints), last)
+	if report.Truncated {
+		code = fmt.Sprintf("runner_journal_%d_%s_truncated", len(report.Checkpoints), last)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var owned int
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM wp_update_tasks WHERE id=? AND lease_owner=? AND status='running')`, id, owner).Scan(&owned); err != nil || owned != 1 {
+		return errors.New("update task ownership lost")
+	}
+	var recorded int
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM wp_update_task_events
+		WHERE task_id=? AND stage='runner_journal' AND result='info' AND error_code=?)`, id, code).Scan(&recorded); err != nil {
+		return err
+	}
+	if recorded == 1 {
+		return tx.Commit()
+	}
+	if err := insertWPUpdateEvent(ctx, tx, id, "runner_journal", "info", code, wpUpdateDBTime(now)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// recordEvent 在任务仍处于 running 且由 owner 持锁时，写入一条带 error_code 的事件。
+// 用于把健康检查/回滚等关键步骤的失败原因落到 wp_update_task_events，方便前端一键复制日志。
+func (s *wpUpdateStore) recordEvent(ctx context.Context, id, owner, stage, result, code string, now time.Time) error {
+	return s.recordEventWithStatus(ctx, id, owner, wpUpdateRunning, stage, result, code, now)
+}
+
+// recordEventWithStatus 在任务仍处于 status 且由 owner 持锁时，写入一条带 error_code 的事件。
+// status='running' 供自动执行使用；status='failed' 供批量更新失败后的人工回滚使用。
+func (s *wpUpdateStore) recordEventWithStatus(ctx context.Context, id, owner, status, stage, result, code string, now time.Time) error {
+	if s == nil || s.db == nil {
+		return errors.New("update store unavailable")
+	}
+	if stage == "" || result == "" {
+		return errors.New("invalid event stage/result")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	owned, err := s.ownsTaskWithStatus(ctx, id, owner, status)
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return errors.New("update task ownership lost")
+	}
+	if err := insertWPUpdateEvent(ctx, tx, id, stage, result, code, wpUpdateDBTime(now)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *wpUpdateStore) ownsRunningTask(ctx context.Context, id, owner string) (bool, error) {
+	return s.ownsTaskWithStatus(ctx, id, owner, wpUpdateRunning)
+}
+
+// ownsTaskWithStatus 供自动执行（status='running'）和批量更新失败后的人工回滚
+// （status='failed'）共用同一套持有权校验。
+func (s *wpUpdateStore) ownsTaskWithStatus(ctx context.Context, id, owner, status string) (bool, error) {
+	var owned int
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM wp_update_tasks
+		WHERE id=? AND lease_owner=? AND status=?)`, id, owner, status).Scan(&owned)
+	return owned == 1, err
+}
+
+func (s *wpUpdateStore) beginAutomaticRollback(ctx context.Context, id, owner, failureStage string, now time.Time) error {
+	if failureStage == "" {
+		return errors.New("failure stage is required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stamp := wpUpdateDBTime(now)
+	result, err := tx.ExecContext(ctx, `UPDATE wp_update_tasks SET stage='rollback',failure_stage=?,rollback_status='pending',updated_at=?
+		WHERE id=? AND lease_owner=? AND status='running' AND rollback_status='not_required'`, failureStage, stamp, id, owner)
+	if err != nil {
+		return err
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return errors.New("update task ownership lost")
+	}
+	if err := insertWPUpdateEvent(ctx, tx, id, "rollback", "info", "automatic_rollback_started", stamp); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *wpUpdateStore) finishAutomaticRollback(ctx context.Context, id, owner string, succeeded bool, now time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stamp := wpUpdateDBTime(now)
+	rollbackStatus, attention, resultType, code := "success", 0, "success", "automatic_rollback_succeeded"
+	if !succeeded {
+		rollbackStatus, attention, resultType, code = "failed", 1, "failed", "automatic_rollback_failed"
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE wp_update_tasks SET status='failed',stage='rollback',rollback_status=?,requires_attention=?,
+		lease_owner='',lease_expires_at=NULL,finished_at=?,updated_at=? WHERE id=? AND lease_owner=? AND status='running' AND rollback_status='pending'`,
+		rollbackStatus, attention, stamp, stamp, id, owner)
+	if err != nil {
+		return err
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return errors.New("update task ownership lost")
+	}
+	if err := insertWPUpdateEvent(ctx, tx, id, "rollback", resultType, code, stamp); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// haltForManualRollback 用于 auto_rollback=0 的任务（批量更新）：健康检查/更新失败时不做任何
+// 文件或数据库改动，直接终态化为 failed，rollback_status='pending'，等待用户选择回滚或忽略。
+func (s *wpUpdateStore) haltForManualRollback(ctx context.Context, id, owner, failureStage string, now time.Time) error {
+	if failureStage == "" {
+		return errors.New("failure stage is required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stamp := wpUpdateDBTime(now)
+	result, err := tx.ExecContext(ctx, `UPDATE wp_update_tasks SET status='failed',stage='rollback',failure_stage=?,
+		rollback_status='pending',requires_attention=1,lease_owner='',lease_expires_at=NULL,finished_at=?,updated_at=?
+		WHERE id=? AND lease_owner=? AND status='running' AND rollback_status='not_required' AND auto_rollback=0`,
+		failureStage, stamp, stamp, id, owner)
+	if err != nil {
+		return err
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return errors.New("update task ownership lost")
+	}
+	if err := insertWPUpdateEvent(ctx, tx, id, "rollback", "manual", "auto_rollback_disabled_awaiting_decision", stamp); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// beginManualRollback 认领一个等待人工决定的失败任务（status='failed', rollback_status='pending'），
+// 为其临时加租约以执行用户触发的回滚。租约过期（wpUpdateLease）后可被重新认领，避免执行中途崩溃导致永久卡死。
+// beginManualRollback 认领条件用 requires_attention=1（而不是死抠 rollback_status=
+// 'pending'）：一次人工回滚本身执行失败后 rollback_status 会变成 'failed'，但只要
+// requires_attention 仍是 1、manual_disposition 还没写入，就说明用户还没有对这个任务
+// 做出最终决定，应该允许重新发起回滚（比如上次是磁盘抖动之类的瞬时故障）。
+func (s *wpUpdateStore) beginManualRollback(ctx context.Context, id, owner string, now time.Time) error {
+	if owner == "" {
+		return errors.New("rollback owner is required")
+	}
+	stamp := wpUpdateDBTime(now)
+	leaseUntil := wpUpdateDBTime(now.Add(wpUpdateLease))
+	result, err := s.db.ExecContext(ctx, `UPDATE wp_update_tasks SET lease_owner=?,lease_expires_at=?,updated_at=?
+		WHERE id=? AND status='failed' AND requires_attention=1 AND manual_disposition=''
+		  AND (lease_owner='' OR lease_expires_at IS NULL OR lease_expires_at<?)`,
+		owner, leaseUntil, stamp, id, stamp)
+	if err != nil {
+		return err
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return errors.New("manual rollback task is not claimable")
+	}
+	return nil
+}
+
+// renewManualRollbackClaim 在人工回滚执行过程中的每一步之前续租，把 lease_expires_at
+// 重新推到 now+wpUpdateLease。人工回滚是同步执行的（没有像 worker 那样的独立心跳协程），
+// 如果只在 beginManualRollback 时设置一次固定 10 分钟租约、执行期间从不续租，遇到大数据库
+// 恢复等耗时步骤就可能在回滚还没跑完时租约过期，被第二个请求重新认领、与仍在运行的第一次
+// 执行短暂并发。RowsAffected==1 本身就同时证明了「仍然持有」和「续租成功」。
+func (s *wpUpdateStore) renewManualRollbackClaim(ctx context.Context, id, owner string, now time.Time) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `UPDATE wp_update_tasks SET lease_expires_at=?,updated_at=?
+		WHERE id=? AND lease_owner=? AND status='failed'`, wpUpdateDBTime(now.Add(wpUpdateLease)), wpUpdateDBTime(now), id, owner)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	return changed == 1, err
+}
+
+// abandonManualRollback 释放一次未能进入实际回滚步骤（如加载执行上下文失败）的认领，
+// 使任务立即回到可重新认领状态，而不必等待租约自然过期。
+// abandonManualRollback 释放认领时不能再要求 rollback_status='pending'：一次重试
+// （上一次回滚本身失败过，rollback_status 已经是 'failed'）在 loadExecution/Prepare
+// 阶段又失败，也必须能正确释放，否则 lease_owner 会一直非空——Ignore 要求
+// lease_owner=”（见 disposeFailedTaskIgnored），用户会被卡死，既不能重试也不能忽略。
+// 必须检查 RowsAffected，0 行时说明持有权已经不在这个 owner 手上，视为错误而不是静默成功。
+func (s *wpUpdateStore) abandonManualRollback(ctx context.Context, id, owner string, now time.Time) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE wp_update_tasks SET lease_owner='',lease_expires_at=NULL,updated_at=?
+		WHERE id=? AND lease_owner=? AND status='failed' AND requires_attention=1 AND manual_disposition=''`,
+		wpUpdateDBTime(now), id, owner)
+	if err != nil {
+		return err
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return errors.New("manual rollback claim is not abandonable")
+	}
+	return nil
+}
+
+// finishManualRollback 记录人工触发回滚的最终结果；无论成功与否 status 都保持 failed
+// （原始更新终归是失败的），rollback_status 记录回滚本身是否成功。
+func (s *wpUpdateStore) finishManualRollback(ctx context.Context, id, owner string, succeeded bool, now time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stamp := wpUpdateDBTime(now)
+	rollbackStatus, attention, disposition, resultType, code := "success", 0, "manually_rolled_back", "success", "manual_rollback_succeeded"
+	if !succeeded {
+		rollbackStatus, attention, disposition, resultType, code = "failed", 1, "", "failed", "manual_rollback_failed"
+	}
+	// 不要求 rollback_status='pending'：一次重试（上次回滚本身失败过，rollback_status
+	// 已经是 'failed'）也要能正常写入这次的结果，只靠 lease_owner+status 校验持有权即可。
+	result, err := tx.ExecContext(ctx, `UPDATE wp_update_tasks SET rollback_status=?,requires_attention=?,manual_disposition=?,
+		lease_owner='',lease_expires_at=NULL,updated_at=? WHERE id=? AND lease_owner=? AND status='failed'`,
+		rollbackStatus, attention, disposition, stamp, id, owner)
+	if err != nil {
+		return err
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return errors.New("manual rollback task ownership lost")
+	}
+	if err := insertWPUpdateEvent(ctx, tx, id, "rollback", resultType, code, stamp); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// disposeFailedTaskIgnored 供用户在批量更新失败项上选择「忽略，我自己去后台检查」时使用：
+// 不做任何文件/数据库改动，只是清除 requires_attention 并记录处置结果。
+func (s *wpUpdateStore) disposeFailedTaskIgnored(ctx context.Context, id string, now time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stamp := wpUpdateDBTime(now)
+	// lease_owner 必须为空（且租约已过期或从未设置）才能忽略：如果一个人工回滚正
+	// 认领着这个任务在执行，不能让「忽略」在回滚跑完前抢先改写处置结果，否则会
+	// 出现回滚和忽略同时“成功”、互相覆盖 manual_disposition 的竞态。
+	// 不要求 rollback_status='pending'：哪怕上一次人工回滚本身失败过（rollback_status=
+	// 'failed'），只要 requires_attention 仍是 1 且还没有处置结果，用户也应该能选择
+	// 「不再重试了，我自己去后台确认」，而不是被卡死在无法忽略的状态。
+	result, err := tx.ExecContext(ctx, `UPDATE wp_update_tasks SET manual_disposition='marked_failed_no_action',
+		requires_attention=0,updated_at=? WHERE id=? AND status='failed' AND requires_attention=1 AND manual_disposition=''
+		AND lease_owner='' AND (lease_expires_at IS NULL OR lease_expires_at<?)`,
+		stamp, id, stamp)
+	if err != nil {
+		return err
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return errors.New("failed task is not disposable")
+	}
+	if err := insertWPUpdateEvent(ctx, tx, id, "manual_disposition", "manual", "marked_failed_no_action", stamp); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *wpUpdateStore) finishOwned(ctx context.Context, id, owner, status, stage, failureStage string, attention bool, now time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stamp := wpUpdateDBTime(now)
+	result, err := tx.ExecContext(ctx, `UPDATE wp_update_tasks SET status=?,stage=?,failure_stage=?,requires_attention=?,
+		lease_owner='',lease_expires_at=NULL,finished_at=?,updated_at=? WHERE id=? AND lease_owner=? AND status='running'`,
+		status, stage, failureStage, boolInt(attention), stamp, stamp, id, owner)
+	if err != nil {
+		return err
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return errors.New("update task ownership lost")
+	}
+	resultType := "success"
+	code := ""
+	if status == wpUpdateFailed {
+		resultType, code = "failed", "update_failed"
+	}
+	if err := insertWPUpdateEvent(ctx, tx, id, stage, resultType, code, stamp); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *wpUpdateStore) disposeInterrupted(ctx context.Context, id, disposition string, now time.Time) error {
+	if disposition != "confirmed_target_version" && disposition != "marked_failed_no_action" && disposition != "escalated" {
+		return errors.New("invalid manual disposition")
+	}
+	attention := disposition != "confirmed_target_version"
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stamp := wpUpdateDBTime(now)
+	result, err := tx.ExecContext(ctx, `UPDATE wp_update_tasks SET manual_disposition=?,requires_attention=?,updated_at=?
+		WHERE id=? AND task_kind='update' AND status='interrupted_unknown' AND manual_disposition=''`,
+		disposition, boolInt(attention), stamp, id)
+	if err != nil {
+		return err
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return errors.New("interrupted task is not disposable")
+	}
+	if err := insertWPUpdateEvent(ctx, tx, id, "manual_disposition", "manual", disposition, stamp); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *wpUpdateStore) hasEffectiveManualSuccess(ctx context.Context, siteID int) (bool, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM wp_update_tasks WHERE site_id=? AND task_kind='update'
+		AND trigger_type='manual' AND component_type='core' AND rollback_status='not_required' AND (
+		status='success' OR (status='interrupted_unknown' AND manual_disposition='confirmed_target_version'))`, siteID).Scan(&count)
+	return count > 0, err
+}
+
+func (s *wpUpdateStore) getTask(ctx context.Context, id string) (WPUpdateTask, error) {
+	var task WPUpdateTask
+	var attention, backupReady, autoRollback int
+	var backupSource sql.NullInt64
+	err := s.db.QueryRowContext(ctx, `SELECT id,site_id,component_type,component_key,task_kind,COALESCE(parent_task_id,''),
+		trigger_type,status,stage,failure_stage,rollback_status,requires_attention,manual_disposition,current_version,target_version,
+		package_source,download_url,downloaded_sha256,verification_level,package_snapshot_path,backup_ready,
+		database_backup_mode,database_backup_source_id,auto_rollback,batch_id,COALESCE(plan_sealed_at,''),
+		lease_owner,COALESCE(lease_expires_at,''),requested_at,COALESCE(started_at,''),COALESCE(finished_at,'')
+		FROM wp_update_tasks WHERE id=?`, id).Scan(&task.ID, &task.SiteID, &task.ComponentType, &task.ComponentKey,
+		&task.TaskKind, &task.ParentTaskID, &task.TriggerType, &task.Status, &task.Stage, &task.FailureStage,
+		&task.RollbackStatus, &attention, &task.ManualDisposition, &task.CurrentVersion, &task.TargetVersion,
+		&task.PackageSource, &task.DownloadURL, &task.DownloadedSHA256, &task.VerificationLevel,
+		&task.PackageSnapshotPath, &backupReady, &task.DatabaseBackupMode, &backupSource, &autoRollback, &task.BatchID,
+		&task.PlanSealedAt, &task.LeaseOwner, &task.LeaseExpiresAt,
+		&task.RequestedAt, &task.StartedAt, &task.FinishedAt)
+	task.RequiresAttention = attention != 0
+	task.BackupReady = backupReady != 0
+	task.AutoRollback = autoRollback != 0
+	if backupSource.Valid {
+		task.DatabaseBackupSourceID = backupSource.Int64
+	}
+	return task, err
+}
+
+func nullableBackupSource(id int64) any {
+	if id <= 0 {
+		return nil
+	}
+	return id
+}
+
+func (s *wpUpdateStore) latestCoreUpdateTask(ctx context.Context, siteID int) (WPUpdateTask, error) {
+	if s == nil || s.db == nil || siteID <= 0 {
+		return WPUpdateTask{}, errors.New("invalid update task lookup")
+	}
+	var id string
+	err := s.db.QueryRowContext(ctx, `SELECT t.id FROM wp_update_tasks t
+		JOIN websites w ON w.id=t.site_id
+		WHERE t.site_id=? AND t.task_kind='update' AND t.component_type='core'
+		ORDER BY t.created_at DESC,t.rowid DESC LIMIT 1`, siteID).Scan(&id)
+	if err != nil {
+		return WPUpdateTask{}, err
+	}
+	return s.getTask(ctx, id)
+}
+
+func (s *wpUpdateStore) latestPluginUpdateTask(ctx context.Context, siteID int, componentKey string) (WPUpdateTask, error) {
+	if s == nil || s.db == nil || siteID <= 0 || !validWPPluginComponentKey(componentKey) {
+		return WPUpdateTask{}, errors.New("invalid plugin update task lookup")
+	}
+	var id string
+	err := s.db.QueryRowContext(ctx, `SELECT t.id FROM wp_update_tasks t
+		JOIN websites w ON w.id=t.site_id
+		WHERE t.site_id=? AND t.task_kind='update' AND t.component_type='plugin' AND t.component_key=?
+		ORDER BY t.created_at DESC,t.rowid DESC LIMIT 1`, siteID, componentKey).Scan(&id)
+	if err != nil {
+		return WPUpdateTask{}, err
+	}
+	return s.getTask(ctx, id)
+}
+
+func (s *wpUpdateStore) latestThemeUpdateTask(ctx context.Context, siteID int, componentKey string) (WPUpdateTask, error) {
+	if s == nil || s.db == nil || siteID <= 0 || !validWPThemeComponentKey(componentKey) {
+		return WPUpdateTask{}, errors.New("invalid theme update task lookup")
+	}
+	var id string
+	err := s.db.QueryRowContext(ctx, `SELECT t.id FROM wp_update_tasks t
+		JOIN websites w ON w.id=t.site_id
+		WHERE t.site_id=? AND t.task_kind='update' AND t.component_type='theme' AND t.component_key=?
+		ORDER BY t.created_at DESC,t.rowid DESC LIMIT 1`, siteID, componentKey).Scan(&id)
+	if err != nil {
+		return WPUpdateTask{}, err
+	}
+	return s.getTask(ctx, id)
+}
+
+type wpUpdateBackupRecord struct {
+	Kind     string
+	FilePath string
+	FileSize int64
+	SHA256   string
+}
+
+func (s *wpUpdateStore) markBackupsReady(ctx context.Context, id, owner string, records []wpUpdateBackupRecord, now time.Time) error {
+	return s.markComponentBackupsReady(ctx, id, owner, "core", "core_files", records, now)
+}
+
+func (s *wpUpdateStore) markPluginBackupsReady(ctx context.Context, id, owner string, records []wpUpdateBackupRecord, now time.Time) error {
+	return s.markComponentBackupsReady(ctx, id, owner, "plugin", "plugin_files", records, now)
+}
+
+func (s *wpUpdateStore) markThemeBackupsReady(ctx context.Context, id, owner string, records []wpUpdateBackupRecord, now time.Time) error {
+	return s.markComponentBackupsReady(ctx, id, owner, "theme", "theme_files", records, now)
+}
+
+func (s *wpUpdateStore) markComponentBackupsReady(ctx context.Context, id, owner, componentType, fileKind string, records []wpUpdateBackupRecord, now time.Time) error {
+	validPair := (componentType == "core" && fileKind == "core_files") ||
+		(componentType == "plugin" && fileKind == "plugin_files") ||
+		(componentType == "theme" && fileKind == "theme_files")
+	if !validPair {
+		return errors.New("invalid update backup records")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var mode string
+	var source sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT database_backup_mode,database_backup_source_id
+		FROM wp_update_tasks WHERE id=? AND component_type=? AND status='running' AND lease_owner=?`,
+		id, componentType, owner).Scan(&mode, &source); err != nil {
+		return err
+	}
+	if mode == "fresh" && (len(records) != 2 || records[0].Kind != "database" || records[1].Kind != fileKind) ||
+		mode == "reuse" && (len(records) != 1 || records[0].Kind != fileKind || !source.Valid || source.Int64 <= 0) {
+		return errors.New("invalid update backup records")
+	}
+	stamp := wpUpdateDBTime(now)
+	var databaseBackupID int64
+	for _, record := range records {
+		if !filepath.IsAbs(record.FilePath) || record.FileSize <= 0 || !wpUpdateSHA256Pattern.MatchString(record.SHA256) {
+			return errors.New("invalid update backup record")
+		}
+		result, err := tx.ExecContext(ctx, `INSERT INTO wp_update_task_backups
+			(task_id,kind,file_path,file_size,sha256,protected,created_at) VALUES (?,?,?,?,?,1,?)`,
+			id, record.Kind, filepath.Clean(record.FilePath), record.FileSize, record.SHA256, stamp)
+		if err != nil {
+			return err
+		}
+		if record.Kind == "database" {
+			databaseBackupID, _ = result.LastInsertId()
+		}
+	}
+	if mode == "fresh" && databaseBackupID <= 0 {
+		return errors.New("database backup record unavailable")
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE wp_update_tasks SET backup_ready=1,stage='backups_ready',
+		database_backup_source_id=CASE WHEN database_backup_mode='fresh' THEN ? ELSE database_backup_source_id END,updated_at=?
+		WHERE id=? AND task_kind='update' AND component_type=? AND status='running' AND lease_owner=? AND backup_ready=0`,
+		databaseBackupID, stamp, id, componentType, owner)
+	if err != nil {
+		return err
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return errors.New("update task ownership lost")
+	}
+	if err := insertWPUpdateEvent(ctx, tx, id, "backups_ready", "success", "", stamp); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func insertWPUpdateEvent(ctx context.Context, tx *sql.Tx, id, stage, result, code, stamp string) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO wp_update_task_events(task_id,stage,result,error_code,summary,created_at)
+		VALUES (?,?,?,?,?,?)`, id, stage, result, code, "", stamp)
+	return err
+}
+
+func newWPUpdateTaskID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return "wpu_" + hex.EncodeToString(raw[:]), nil
+}
+
+// WPUpdateDBTime 将时间格式化为 wp_update_tasks 等表里 DATETIME 列存储/比较时使用的
+// 统一字符串（2006-01-02 15:04:05.000000）。handler 与清理逻辑共用同一格式，避免字符串
+// 比较时因格式不一致（如缺少小数秒）导致的边界错判。
+func WPUpdateDBTime(t time.Time) string { return t.UTC().Format("2006-01-02 15:04:05.000000") }
+
+func wpUpdateDBTime(t time.Time) string { return WPUpdateDBTime(t) }
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func validWPUpdateDownloadURL(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && allowedWordPressURL(u)
+}
+
+func validWPPluginComponentKey(key string) bool {
+	if strings.Contains(key, `\`) || strings.Count(key, "/") != 1 {
+		return false
+	}
+	parts := strings.Split(key, "/")
+	return wpComponentSlugPattern.MatchString(parts[0]) && wpComponentPHPFilePattern.MatchString(parts[1])
+}
+
+func validWPPluginDownloadURL(raw, slug, targetVersion string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	if u.Scheme == "https" && u.Hostname() == "downloads.wordpress.org" &&
+		(u.Port() == "" || u.Port() == "443") && u.User == nil && u.RawQuery == "" && u.Fragment == "" &&
+		u.EscapedPath() == "/plugin/"+slug+"."+targetVersion+".zip" {
+		return true
+	}
+	return allowedWPUpdateExternalURL(u)
+}
+
+func validWPThemeComponentKey(key string) bool {
+	return wpComponentSlugPattern.MatchString(key)
+}
+
+// wpUpdateDownloadURLUsesLicenseProtocol reports whether the offer download URL
+// uses a custom (non http/https) scheme such as license:// or edd://. These are
+// commercial/license-based update mechanisms that the panel cannot fetch (it only
+// supports packages served over HTTPS from WordPress.org or an external vendor
+// host). When the offer's slug and version otherwise match the candidate, we
+// surface a dedicated, actionable error (license protocol unsupported) instead of
+// the misleading "site/component/candidate changed, please re-check" conflict.
+func wpUpdateDownloadURLUsesLicenseProtocol(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u == nil || u.Scheme == "" {
+		return false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	return scheme != "http" && scheme != "https"
+}
+
+func validWPThemeDownloadURL(raw, slug, targetVersion string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	if u.Scheme == "https" && u.Hostname() == "downloads.wordpress.org" &&
+		(u.Port() == "" || u.Port() == "443") && u.User == nil && u.RawQuery == "" && u.Fragment == "" &&
+		u.EscapedPath() == "/theme/"+slug+"."+targetVersion+".zip" {
+		return true
+	}
+	return allowedWPUpdateExternalURL(u)
+}

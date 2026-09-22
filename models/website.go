@@ -1,0 +1,83 @@
+package models
+
+import "time"
+
+type WebsiteStatus string
+
+const (
+	StatusActive   WebsiteStatus = "active"
+	StatusPaused   WebsiteStatus = "paused"
+	StatusMigrated WebsiteStatus = "migrated"
+	StatusError    WebsiteStatus = "error"
+	StatusCreating WebsiteStatus = "creating"
+	StatusDeleting WebsiteStatus = "deleting"
+)
+
+type Website struct {
+	ID                          int              `json:"id"`
+	Name                        string           `json:"name"`
+	Domain                      string           `json:"domain"`
+	Aliases                     string           `json:"aliases"`
+	Status                      WebsiteStatus    `json:"status"`
+	SystemUser                  string           `json:"system_user"`
+	WebRoot                     string           `json:"web_root"`
+	DocumentRootSubdir          string           `json:"document_root_subdir"`
+	LogDir                      string           `json:"log_dir"`
+	DBName                      string           `json:"db_name"`
+	DBUser                      string           `json:"db_user"`
+	TablePrefix                 string           `json:"table_prefix"`
+	PHPPoolPath                 string           `json:"php_pool_path"`
+	NginxConfPath               string           `json:"nginx_conf_path"`
+	SiteType                    string           `json:"site_type"`
+	SSLEnabled                  bool             `json:"ssl_enabled"`
+	SSLCertPath                 string           `json:"ssl_cert_path"`
+	SSLKeyPath                  string           `json:"ssl_key_path"`
+	TemplateVersion             string           `json:"template_version"`
+	AccessLogMode               string           `json:"access_log_mode"`
+	SSLExpiresAt                *time.Time       `json:"ssl_expires_at"`
+	SSLLastError                string           `json:"ssl_last_error"`
+	SSLCertSource               string           `json:"ssl_cert_source"`
+	SSLExportEnabled            bool             `json:"ssl_export_enabled"`
+	FCacheEnabled               bool             `json:"fastcgi_cache_enabled"`
+	FCacheTTL                   int              `json:"fastcgi_cache_ttl"`
+	FCacheKey                   string           `json:"fastcgi_cache_key"`
+	MonitoringEnabled           bool             `json:"monitoring_enabled"`
+	MonitoringInterval          int              `json:"monitoring_interval"`
+	DisableWPUpdates            bool             `json:"disable_wp_updates"`
+	DisableFileEditing          bool             `json:"disable_file_editing"`
+	XMLRPCEnabled               bool             `json:"xmlrpc_enabled"`
+	DisableApplicationPasswords bool             `json:"disable_application_passwords"`
+	WPDebugEnabled              bool             `json:"wp_debug_enabled"`
+	WPDebugDisplay              bool             `json:"wp_debug_display"`
+	WPPostRevisions             int              `json:"wp_post_revisions"`
+	WPMemoryLimit               string           `json:"wp_memory_limit"`
+	FileLockEnabled             bool             `json:"file_lock_enabled"`
+	FileLockMode                string           `json:"file_lock_mode"`
+	FileLockApplyStatus         string           `json:"file_lock_apply_status"`
+	PasswordResetMode           string           `json:"password_reset_mode"`
+	LogRetentionDays            int              `json:"log_retention_days"`
+	CDNRealIPEnabled            bool             `json:"cdn_realip_enabled"`
+	CDNRealIPGroups             []CDNRealIPGroup `json:"cdn_realip_groups,omitempty"`
+	PHPFPMMaxChildren           int              `json:"php_fpm_max_children"`
+	ExpiresAt                   *time.Time       `json:"expires_at"`
+	CreatedAt                   time.Time        `json:"created_at"`
+	UpdatedAt                   time.Time        `json:"updated_at"`
+}
+
+type CreateWebsiteRequest struct {
+	Domain             string   `json:"domain" binding:"required"`
+	Aliases            []string `json:"aliases"`
+	SSLEnabled         bool     `json:"ssl_enabled"`
+	DBPassword         string   `json:"db_password"`
+	ExpiresAt          string   `json:"expires_at"`
+	SiteType           string   `json:"site_type"`
+	DocumentRootSubdir string   `json:"document_root_subdir"`
+	CleanDefaults      bool     `json:"clean_defaults"`
+	RemoveUnusedThemes bool     `json:"remove_unused_themes"`
+	InstallThemes      []string `json:"install_themes"`
+	InstallPlugins     []string `json:"install_plugins"`
+}
+
+type UpdateWebsiteStatusRequest struct {
+	Action string `json:"action" binding:"required,oneof=pause enable restore_migrated"`
+}

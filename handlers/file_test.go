@@ -1,0 +1,993 @@
+package handlers
+
+import (
+	"archive/tar"
+	"archive/zip"
+	"compress/gzip"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"strings"
+	"testing"
+	"testing/iotest"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/zangwp/yub-wpanel/config"
+	"github.com/zangwp/yub-wpanel/executor"
+	"github.com/zangwp/yub-wpanel/models"
+	"golang.org/x/text/encoding/simplifiedchinese"
+)
+
+func TestCalculateDirectorySizeSkipsSymlinks(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "one.txt"), []byte("123"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	subdir := filepath.Join(root, "sub")
+	if err := os.Mkdir(subdir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subdir, "two.txt"), []byte("12345"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	external := t.TempDir()
+	if err := os.WriteFile(filepath.Join(external, "large.txt"), make([]byte, 1024), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, filepath.Join(root, "external-link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	size, err := calculateDirectorySize(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size != 8 {
+		t.Fatalf("size = %d, want 8", size)
+	}
+}
+
+func TestCalculateDirectorySizeHonorsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := calculateDirectorySize(ctx, t.TempDir()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context canceled", err)
+	}
+}
+
+func TestDirectorySizeUsesBackupRootAndRejectsEscapes(t *testing.T) {
+	oldConfig := config.AppConfig
+	backupRoot := t.TempDir()
+	config.AppConfig = &config.Config{Panel: config.PanelConfig{BackupDir: backupRoot}}
+	t.Cleanup(func() { config.AppConfig = oldConfig })
+	if err := os.Mkdir(filepath.Join(backupRoot, "nested"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(backupRoot, "nested", "backup.bin"), []byte("123456"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	router := gin.New()
+	router.GET("/api/files/size", (&FileHandler{}).DirectorySize)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/files/size?site_id=0&path=/nested", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		Data struct {
+			Size int64 `json:"size"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Data.Size != 6 {
+		t.Fatalf("size = %d, want 6", response.Data.Size)
+	}
+
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/files/size?site_id=0&path=/../../", nil))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("escape status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	if err := os.Symlink(filepath.Join(backupRoot, "nested"), filepath.Join(backupRoot, "nested-link")); err == nil {
+		rec = httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/files/size?site_id=0&path=/nested-link", nil))
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("symlink status = %d, body = %s", rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestDirectorySizeRejectsConcurrentOverflow(t *testing.T) {
+	oldConfig := config.AppConfig
+	oldSlots := directorySizeSlots
+	backupRoot := t.TempDir()
+	config.AppConfig = &config.Config{Panel: config.PanelConfig{BackupDir: backupRoot}}
+	directorySizeSlots = make(chan struct{}, 1)
+	directorySizeSlots <- struct{}{}
+	t.Cleanup(func() {
+		config.AppConfig = oldConfig
+		directorySizeSlots = oldSlots
+	})
+
+	router := gin.New()
+	router.GET("/api/files/size", (&FileHandler{}).DirectorySize)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/files/size?site_id=0&path=/", nil))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDeleteRejectsManagedBackupRoot(t *testing.T) {
+	oldConfig := config.AppConfig
+	backupRoot := t.TempDir()
+	config.AppConfig = &config.Config{Panel: config.PanelConfig{BackupDir: backupRoot}}
+	t.Cleanup(func() { config.AppConfig = oldConfig })
+	marker := filepath.Join(backupRoot, "keep.txt")
+	if err := os.WriteFile(marker, []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	router := gin.New()
+	router.DELETE("/api/files/delete", (&FileHandler{}).Delete)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/api/files/delete?site_id=0&path=%2F", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("managed root contents changed: %v", err)
+	}
+}
+
+func TestRenameRejectsPathAndExistingTarget(t *testing.T) {
+	oldConfig := config.AppConfig
+	backupRoot := t.TempDir()
+	config.AppConfig = &config.Config{Panel: config.PanelConfig{BackupDir: backupRoot}}
+	t.Cleanup(func() { config.AppConfig = oldConfig })
+	if err := os.WriteFile(filepath.Join(backupRoot, "old.txt"), []byte("old"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(backupRoot, "existing.txt"), []byte("existing"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	router := gin.New()
+	router.PUT("/api/files/rename", (&FileHandler{}).Rename)
+	for _, tc := range []struct {
+		name    string
+		newName string
+		status  int
+	}{
+		{name: "path", newName: "nested/moved.txt", status: http.StatusBadRequest},
+		{name: "overwrite", newName: "existing.txt", status: http.StatusConflict},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := strings.NewReader(`{"site_id":0,"old_path":"/old.txt","new_name":"` + tc.newName + `"}`)
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPut, "/api/files/rename", body)
+			req.Header.Set("Content-Type", "application/json")
+			router.ServeHTTP(rec, req)
+			if rec.Code != tc.status {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+	if data, err := os.ReadFile(filepath.Join(backupRoot, "old.txt")); err != nil || string(data) != "old" {
+		t.Fatalf("source changed: data=%q err=%v", data, err)
+	}
+	if data, err := os.ReadFile(filepath.Join(backupRoot, "existing.txt")); err != nil || string(data) != "existing" {
+		t.Fatalf("target changed: data=%q err=%v", data, err)
+	}
+}
+
+func TestUploadSessionIDIsStableForResume(t *testing.T) {
+	session := uploadSession{
+		Filename:     "backup.zip",
+		FileSize:     uploadChunkSize + 1,
+		TotalChunks:  2,
+		SiteID:       7,
+		Path:         "/wp-content",
+		LastModified: 1770000000000,
+		CreatedAt:    1,
+	}
+
+	resumed := session
+	resumed.CreatedAt = 2
+	if makeUploadID(session) != makeUploadID(resumed) {
+		t.Fatal("upload ID should be stable for the same file upload")
+	}
+
+	otherPath := session
+	otherPath.Path = "/uploads"
+	if makeUploadID(session) == makeUploadID(otherPath) {
+		t.Fatal("upload ID should include the target path")
+	}
+}
+
+func TestUploadChunkTrackingIgnoresMetadataAndFindsMissingChunks(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"session.json", "chunk-0", "chunk-2", "chunk-2.tmp"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	completed := completedUploadChunks(dir, 3)
+	if !reflect.DeepEqual(completed, []int{0, 2}) {
+		t.Fatalf("completed chunks = %v, want [0 2]", completed)
+	}
+
+	missing := missingUploadChunks(dir, 3)
+	if !reflect.DeepEqual(missing, []int{1}) {
+		t.Fatalf("missing chunks = %v, want [1]", missing)
+	}
+}
+
+func TestExpectedUploadChunksAllowsEmptyFiles(t *testing.T) {
+	tests := []struct {
+		size int64
+		want int
+	}{
+		{size: 0, want: 0},
+		{size: 1, want: 1},
+		{size: uploadChunkSize, want: 1},
+		{size: uploadChunkSize + 1, want: 2},
+	}
+
+	for _, tt := range tests {
+		if got := expectedUploadChunks(tt.size); got != tt.want {
+			t.Fatalf("expectedUploadChunks(%d) = %d, want %d", tt.size, got, tt.want)
+		}
+	}
+}
+
+func TestUploadSessionDirUsesPanelDataDir(t *testing.T) {
+	oldConfig := config.AppConfig
+	defer func() { config.AppConfig = oldConfig }()
+
+	dataDir := t.TempDir()
+	config.AppConfig = &config.Config{Panel: config.PanelConfig{DataDir: dataDir}}
+
+	got := uploadSessionDir("../abc123")
+	want := filepath.Join(dataDir, "upload-sessions", uploadSessionDirPrefix+"abc123")
+	if got != want {
+		t.Fatalf("uploadSessionDir = %q, want %q", got, want)
+	}
+}
+
+func TestCleanupExpiredUploadSessionsOnlyRemovesExpiredUploadDirs(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now()
+	expired := filepath.Join(root, uploadSessionDirPrefix+"expired")
+	active := filepath.Join(root, uploadSessionDirPrefix+"active")
+	other := filepath.Join(root, "not-upload-expired")
+	for _, dir := range []string{expired, active, other} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := saveUploadSession(expired, uploadSession{CreatedAt: now.Add(-25 * time.Hour).Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(expired, now.Add(-25*time.Hour), now.Add(-25*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveUploadSession(active, uploadSession{CreatedAt: now.Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(other, now.Add(-25*time.Hour), now.Add(-25*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	cleanupExpiredUploadSessions(root, 24*time.Hour)
+
+	if _, err := os.Stat(expired); !os.IsNotExist(err) {
+		t.Fatalf("expired upload session still exists, err=%v", err)
+	}
+	if _, err := os.Stat(active); err != nil {
+		t.Fatalf("active upload session removed: %v", err)
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Fatalf("non-upload directory removed: %v", err)
+	}
+}
+
+func TestArchiveFormatSupportsCommonWebsitePackages(t *testing.T) {
+	tests := map[string]string{
+		"site.zip":        "zip",
+		"site.tar":        "tar",
+		"site.tar.gz":     "tar.gz",
+		"site.tgz":        "tar.gz",
+		"site.tar.bz2":    "tar.bz2",
+		"site.tbz2":       "tar.bz2",
+		"database.sql":    "",
+		"database.sql.gz": "",
+	}
+
+	for name, want := range tests {
+		if got := archiveFormat(name); got != want {
+			t.Fatalf("archiveFormat(%q) = %q, want %q", name, got, want)
+		}
+	}
+}
+
+func TestArchiveSSHExtractCommandUsesMatchingFormat(t *testing.T) {
+	tests := []struct {
+		path   string
+		format string
+		want   string
+	}{
+		{"/www/wwwroot/example.com/backup.zip", "zip", "cd '/www/wwwroot/example.com' && unzip -o 'backup.zip'"},
+		{"/www/wwwroot/example.com/backup.tar", "tar", "cd '/www/wwwroot/example.com' && tar xvf 'backup.tar'"},
+		{"/www/wwwroot/example.com/backup.tar.gz", "tar.gz", "cd '/www/wwwroot/example.com' && tar zxvf 'backup.tar.gz'"},
+		{"/www/wwwroot/example.com/backup.tar.bz2", "tar.bz2", "cd '/www/wwwroot/example.com' && tar jxvf 'backup.tar.bz2'"},
+	}
+
+	for _, tt := range tests {
+		if got := archiveSSHExtractCommand(tt.path, tt.format); got != tt.want {
+			t.Fatalf("archiveSSHExtractCommand(%q, %q) = %q, want %q", tt.path, tt.format, got, tt.want)
+		}
+	}
+}
+
+func TestArchiveSSHExtractCommandQuotesSingleQuote(t *testing.T) {
+	got := archiveSSHExtractCommand("/www/wwwroot/site's/backup's.tar.gz", "tar.gz")
+	want := "cd '/www/wwwroot/site'\\''s' && tar zxvf 'backup'\\''s.tar.gz'"
+	if got != want {
+		t.Fatalf("archiveSSHExtractCommand quoted = %q, want %q", got, want)
+	}
+}
+
+func TestExtractTarGzArchive(t *testing.T) {
+	base := t.TempDir()
+	archivePath := filepath.Join(base, "site.tar.gz")
+	writeTarGz(t, archivePath, map[string]string{
+		"wp-content/uploads/readme.txt": "ok",
+	})
+
+	conflicts, err := checkTarArchive(archivePath, "tar.gz", base, base, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(conflicts) != 0 {
+		t.Fatalf("conflicts = %v, want none", conflicts)
+	}
+
+	if err := extractTarArchive(archivePath, "tar.gz", base, base, nil); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(base, "wp-content", "uploads", "readme.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "ok" {
+		t.Fatalf("extracted content = %q, want ok", string(data))
+	}
+
+	conflicts, err = checkTarArchive(archivePath, "tar.gz", base, base, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(conflicts, []string{"wp-content/uploads/readme.txt"}) {
+		t.Fatalf("conflicts = %v, want extracted file", conflicts)
+	}
+}
+
+func TestTarArchiveRejectsPathTraversal(t *testing.T) {
+	base := t.TempDir()
+	archivePath := filepath.Join(base, "site.tar.gz")
+	writeTarGz(t, archivePath, map[string]string{
+		"../escape.txt": "bad",
+	})
+
+	if _, err := checkTarArchive(archivePath, "tar.gz", base, base, false, nil); err == nil {
+		t.Fatal("expected path traversal archive to be rejected")
+	}
+}
+
+func TestFileLockWriteGuardAllowsRuntimeDataAndBlocksCode(t *testing.T) {
+	root := t.TempDir()
+	wpContent := filepath.Join(root, "wp-content")
+	uploads := filepath.Join(wpContent, "uploads")
+	cache := filepath.Join(wpContent, "cache")
+	languages := filepath.Join(wpContent, "languages")
+	wflogs := filepath.Join(wpContent, "wflogs")
+	for _, dir := range []string{uploads, cache, languages, wflogs} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(wpContent, "plugins"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	site := &models.Website{
+		WebRoot:         root,
+		SiteType:        "wordpress",
+		FileLockEnabled: true,
+		FileLockMode:    executor.FileLockModeStandard,
+	}
+
+	for _, target := range []string{
+		filepath.Join(uploads, "photo.jpg"),
+		filepath.Join(cache, "page.html"),
+		filepath.Join(cache, "pages", ".htaccess"),
+		filepath.Join(wflogs, "config-livewaf.php.json"),
+	} {
+		if err := checkFileLockWrite(site, target, false, false); err != nil {
+			t.Fatalf("runtime data write should be allowed for %s: %v", target, err)
+		}
+	}
+	for _, target := range []string{
+		filepath.Join(uploads, "shell.php"),
+		filepath.Join(cache, "shell.phtml"),
+		filepath.Join(wpContent, "advanced-cache.php"),
+		filepath.Join(wpContent, ".user.ini"),
+		filepath.Join(cache, ".user.ini"),
+		filepath.Join(languages, "zh_CN.mo"),
+		filepath.Join(wpContent, "upgrade", "wordpress.zip"),
+		filepath.Join(wpContent, "upgrade-temp-backup", "plugins", "plugin.zip"),
+		filepath.Join(root, "wordfence-waf.php"),
+	} {
+		if err := checkFileLockWrite(site, target, false, false); !isFileLockWriteError(err) {
+			t.Fatalf("locked file write error for %s = %v, want file lock rejection", target, err)
+		}
+	}
+	if err := checkFileLockWrite(site, filepath.Join(root, "wp-content", "plugins", "plugin.php"), false, false); !isFileLockWriteError(err) {
+		t.Fatalf("code directory write error = %v, want file lock rejection", err)
+	}
+	if err := checkFileLockWrite(site, filepath.Join(uploads, "shell.php"), false, true); err != nil {
+		t.Fatalf("runtime PHP cleanup should be allowed: %v", err)
+	}
+	if err := checkFileLockWrite(site, filepath.Join(wpContent, "advanced-cache.php"), false, true); !isFileLockWriteError(err) {
+		t.Fatalf("drop-in PHP cleanup error = %v, want file lock rejection", err)
+	}
+	if err := checkFileLockWrite(site, filepath.Join(wpContent, "new-plugin-data"), true, false); !isFileLockWriteError(err) {
+		t.Fatalf("top-level runtime directory creation error = %v, want file lock rejection", err)
+	}
+
+	site.FileLockMode = executor.FileLockModeStrict
+	if err := checkFileLockWrite(site, filepath.Join(uploads, "strict-photo.jpg"), false, false); err != nil {
+		t.Fatalf("strict uploads write should be allowed: %v", err)
+	}
+	if err := checkFileLockWrite(site, filepath.Join(cache, "strict-cache.html"), false, false); !isFileLockWriteError(err) {
+		t.Fatalf("strict cache write error = %v, want file lock rejection", err)
+	}
+}
+
+func TestFileLockWriteGuardRejectsUploadsSymlinkEscape(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink behavior differs on Windows")
+	}
+	root := t.TempDir()
+	uploads := filepath.Join(root, "wp-content", "uploads")
+	if err := os.MkdirAll(uploads, 0755); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(uploads, "linked")); err != nil {
+		t.Fatal(err)
+	}
+	site := &models.Website{
+		WebRoot:         root,
+		SiteType:        "wordpress",
+		FileLockEnabled: true,
+		FileLockMode:    executor.FileLockModeStrict,
+	}
+
+	target := filepath.Join(uploads, "linked", "photo.jpg")
+	if err := checkFileLockWrite(site, target, false, false); !isFileLockWriteError(err) {
+		t.Fatalf("symlink escape error = %v, want file lock rejection", err)
+	}
+}
+
+func TestFileOperationNameRejectsTraversal(t *testing.T) {
+	for _, name := range []string{"", ".", "..", "../x", "sub/file", `sub\file`} {
+		if _, err := cleanFileOperationName(name); err == nil {
+			t.Fatalf("cleanFileOperationName(%q) error = nil, want error", name)
+		}
+	}
+	if got, err := cleanFileOperationName("readme.txt"); err != nil || got != "readme.txt" {
+		t.Fatalf("cleanFileOperationName safe = %q, %v", got, err)
+	}
+}
+
+func TestNormalizeFileConflictPolicy(t *testing.T) {
+	for _, policy := range []string{"", fileConflictPolicyError, fileConflictPolicyOverwrite, fileConflictPolicySkip} {
+		if _, err := normalizeFileConflictPolicy(policy); err != nil {
+			t.Fatalf("normalizeFileConflictPolicy(%q) returned error: %v", policy, err)
+		}
+	}
+	if _, err := normalizeFileConflictPolicy("replace"); err == nil {
+		t.Fatal("normalizeFileConflictPolicy invalid policy error = nil, want error")
+	}
+}
+
+func TestFileEntryPaginationDefaultsToFifty(t *testing.T) {
+	files := make([]fileEntry, 60)
+	for i := range files {
+		files[i] = fileEntry{Name: string(rune('a' + i%26))}
+	}
+
+	page, perPage := normalizeFilePage(0, 0)
+	if page != 1 || perPage != defaultFilePageSize {
+		t.Fatalf("normalizeFilePage defaults = (%d, %d), want (1, %d)", page, perPage, defaultFilePageSize)
+	}
+
+	pageFiles, gotPage, totalPages := paginateFileEntries(files, page, perPage)
+	if gotPage != 1 {
+		t.Fatalf("page = %d, want 1", gotPage)
+	}
+	if totalPages != 2 {
+		t.Fatalf("totalPages = %d, want 2", totalPages)
+	}
+	if len(pageFiles) != defaultFilePageSize {
+		t.Fatalf("page size = %d, want %d", len(pageFiles), defaultFilePageSize)
+	}
+}
+
+func TestFileEntryPaginationClampsLastPage(t *testing.T) {
+	files := make([]fileEntry, 55)
+	for i := range files {
+		files[i] = fileEntry{Name: string(rune('a' + i%26))}
+	}
+
+	pageFiles, page, totalPages := paginateFileEntries(files, 99, 50)
+	if page != 2 {
+		t.Fatalf("page = %d, want 2", page)
+	}
+	if totalPages != 2 {
+		t.Fatalf("totalPages = %d, want 2", totalPages)
+	}
+	if len(pageFiles) != 5 {
+		t.Fatalf("last page size = %d, want 5", len(pageFiles))
+	}
+}
+
+func TestNormalizeFilePageClampsMaxPageSize(t *testing.T) {
+	page, perPage := normalizeFilePage(-1, 300)
+	if page != 1 || perPage != maxFilePageSize {
+		t.Fatalf("normalizeFilePage = (%d, %d), want (1, %d)", page, perPage, maxFilePageSize)
+	}
+}
+
+func TestFileEntryPaginationEmptyList(t *testing.T) {
+	pageFiles, page, totalPages := paginateFileEntries(nil, 1, 50)
+	if page != 1 || totalPages != 1 || len(pageFiles) != 0 {
+		t.Fatalf("empty pagination = len %d page %d totalPages %d, want 0/1/1", len(pageFiles), page, totalPages)
+	}
+}
+
+func TestFileEntryPaginationWithSmallPageSize(t *testing.T) {
+	files := []fileEntry{{Name: "a"}, {Name: "b"}}
+	pageFiles, page, totalPages := paginateFileEntries(files, 2, 1)
+	if page != 2 || totalPages != 2 || len(pageFiles) != 1 || pageFiles[0].Name != "b" {
+		t.Fatalf("pagination = %#v page %d totalPages %d, want second single item", pageFiles, page, totalPages)
+	}
+}
+
+func TestSortFileEntriesKeepsDirectoriesFirst(t *testing.T) {
+	files := []fileEntry{
+		{Name: "z.txt", Size: 1},
+		{Name: "assets", IsDir: true},
+		{Name: "a.txt", Size: 2},
+		{Name: "uploads", IsDir: true},
+	}
+
+	sortFileEntries(files, "name", "desc")
+	got := []string{files[0].Name, files[1].Name, files[2].Name, files[3].Name}
+	want := []string{"uploads", "assets", "z.txt", "a.txt"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("sorted names = %v, want %v", got, want)
+	}
+}
+
+func TestSortFileEntriesBySizeAndInvalidOptions(t *testing.T) {
+	files := []fileEntry{
+		{Name: "b.log", Size: 20},
+		{Name: "a.txt", Size: 10},
+	}
+
+	sortFileEntries(files, "size", "asc")
+	if got := []string{files[0].Name, files[1].Name}; !reflect.DeepEqual(got, []string{"a.txt", "b.log"}) {
+		t.Fatalf("size asc = %v", got)
+	}
+
+	sortFileEntries(files, "unknown", "invalid")
+	if got := []string{files[0].Name, files[1].Name}; !reflect.DeepEqual(got, []string{"a.txt", "b.log"}) {
+		t.Fatalf("fallback name asc = %v", got)
+	}
+}
+
+func TestSortFileEntriesByTypeAndTime(t *testing.T) {
+	files := []fileEntry{
+		{Name: "b.zip", ModTime: "2026-01-02 00:00:00"},
+		{Name: "a.txt", ModTime: "2026-01-01 00:00:00"},
+	}
+
+	sortFileEntries(files, "type", "asc")
+	if got := []string{files[0].Name, files[1].Name}; !reflect.DeepEqual(got, []string{"a.txt", "b.zip"}) {
+		t.Fatalf("type asc = %v", got)
+	}
+
+	sortFileEntries(files, "time", "desc")
+	if got := []string{files[0].Name, files[1].Name}; !reflect.DeepEqual(got, []string{"b.zip", "a.txt"}) {
+		t.Fatalf("time desc = %v", got)
+	}
+}
+
+func TestCopyFileOrDirRejectsDirectoryIntoItself(t *testing.T) {
+	base := t.TempDir()
+	src := filepath.Join(base, "wp-content")
+	dest := filepath.Join(src, "copy")
+	if err := os.MkdirAll(src, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFileOrDir(base, base, src, dest); err == nil {
+		t.Fatal("copyFileOrDir into itself error = nil, want error")
+	}
+}
+
+func TestCopyFileOrDirAllowsSeparateBases(t *testing.T) {
+	srcBase := t.TempDir()
+	destBase := t.TempDir()
+	src := filepath.Join(srcBase, "readme.txt")
+	dest := filepath.Join(destBase, "readme.txt")
+	if err := os.WriteFile(src, []byte("ok"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := copyFileOrDir(srcBase, destBase, src, dest); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "ok" {
+		t.Fatalf("copied content = %q, want ok", string(data))
+	}
+}
+
+func TestCopyFileOrDirOverwriteMergesDirectoryAndKeepsExtraTargetFiles(t *testing.T) {
+	srcBase := t.TempDir()
+	destBase := t.TempDir()
+	src := filepath.Join(srcBase, "wp-content")
+	dest := filepath.Join(destBase, "wp-content")
+
+	if err := os.MkdirAll(filepath.Join(src, "themes", "twentytwenty"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "index.php"), []byte("new core"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "themes", "twentytwenty", "style.css"), []byte("theme"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dest, "uploads", "2026"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dest, "index.php"), []byte("old core"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dest, "uploads", "2026", "photo.jpg"), []byte("user upload"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := copyFileOrDirWithOverwrite(srcBase, destBase, src, dest, true); err != nil {
+		t.Fatal(err)
+	}
+
+	index, err := os.ReadFile(filepath.Join(dest, "index.php"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(index) != "new core" {
+		t.Fatalf("overwritten index = %q, want new core", string(index))
+	}
+	upload, err := os.ReadFile(filepath.Join(dest, "uploads", "2026", "photo.jpg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(upload) != "user upload" {
+		t.Fatalf("target upload = %q, want user upload", string(upload))
+	}
+	if _, err := os.Stat(filepath.Join(dest, "themes", "twentytwenty", "style.css")); err != nil {
+		t.Fatalf("new nested file missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(src, "index.php")); err != nil {
+		t.Fatalf("copy should keep source file: %v", err)
+	}
+}
+
+func TestCopyFileOrDirWithoutOverwriteRejectsExistingFile(t *testing.T) {
+	srcBase := t.TempDir()
+	destBase := t.TempDir()
+	src := filepath.Join(srcBase, "readme.txt")
+	dest := filepath.Join(destBase, "readme.txt")
+	if err := os.WriteFile(src, []byte("new"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dest, []byte("old"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := copyFileOrDirWithOverwrite(srcBase, destBase, src, dest, false); err == nil {
+		t.Fatal("copyFileOrDirWithOverwrite without overwrite error = nil, want error")
+	}
+	data, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "old" {
+		t.Fatalf("destination changed to %q, want old", string(data))
+	}
+}
+
+func TestCopyFileOrDirOverwriteRejectsDirectoryOntoFile(t *testing.T) {
+	srcBase := t.TempDir()
+	destBase := t.TempDir()
+	src := filepath.Join(srcBase, "wp-content")
+	dest := filepath.Join(destBase, "wp-content")
+	if err := os.MkdirAll(src, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dest, []byte("file"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := copyFileOrDirWithOverwrite(srcBase, destBase, src, dest, true); err == nil {
+		t.Fatal("copyFileOrDirWithOverwrite directory onto file error = nil, want error")
+	}
+}
+
+func TestCopyFileOrDirPreservesFileMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not reliably preserve Unix executable bits")
+	}
+	srcBase := t.TempDir()
+	destBase := t.TempDir()
+	src := filepath.Join(srcBase, "wp-cli")
+	dest := filepath.Join(destBase, "wp-cli")
+	if err := os.WriteFile(src, []byte("ok"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(src, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := copyFileOrDir(srcBase, destBase, src, dest); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0755 {
+		t.Fatalf("copied mode = %o, want 0755", got)
+	}
+}
+
+func TestCopyFileOrDirRejectsDestinationOutsideBase(t *testing.T) {
+	srcBase := t.TempDir()
+	destBase := t.TempDir()
+	outside := t.TempDir()
+	src := filepath.Join(srcBase, "readme.txt")
+	dest := filepath.Join(outside, "readme.txt")
+	if err := os.WriteFile(src, []byte("ok"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := copyFileOrDir(srcBase, destBase, src, dest); err == nil {
+		t.Fatal("copyFileOrDir outside destination error = nil, want error")
+	}
+}
+
+func TestZipTargetRejectsSpecialEntries(t *testing.T) {
+	base := t.TempDir()
+	header := &zip.FileHeader{Name: "link"}
+	header.SetMode(os.ModeSymlink | 0777)
+	f := &zip.File{FileHeader: *header}
+	if _, _, _, err := zipTargetForFile(base, base, f); err == nil {
+		t.Fatal("zipTargetForFile symlink error = nil, want error")
+	}
+}
+
+func TestZipTargetRejectsPathTraversal(t *testing.T) {
+	base := t.TempDir()
+	f := &zip.File{FileHeader: zip.FileHeader{Name: "../escape.txt"}}
+	if _, _, _, err := zipTargetForFile(base, base, f); err == nil {
+		t.Fatal("zipTargetForFile traversal error = nil, want error")
+	}
+}
+
+func TestZipTargetDecodesGB18030EntryName(t *testing.T) {
+	base := t.TempDir()
+	rawName, err := simplifiedchinese.GB18030.NewEncoder().String("资料/测试.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &zip.File{FileHeader: zip.FileHeader{Name: rawName, NonUTF8: true}}
+
+	target, name, skip, err := zipTargetForFile(base, base, f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skip {
+		t.Fatal("zipTargetForFile skip = true, want false")
+	}
+	if name != "资料/测试.txt" {
+		t.Fatalf("decoded name = %q, want 资料/测试.txt", name)
+	}
+	want := filepath.Join(base, "资料", "测试.txt")
+	if target != want {
+		t.Fatalf("target = %q, want %q", target, want)
+	}
+}
+
+func TestZipTargetKeepsValidUTF8NameWhenNonUTF8FlagIsWrong(t *testing.T) {
+	base := t.TempDir()
+	// archive/zip sets NonUTF8=true whenever the UTF-8 language flag bit isn't
+	// set on the entry, even if the raw bytes already are valid UTF-8 - this is
+	// exactly what tools like the Linux `zip` command produce for CJK names.
+	f := &zip.File{FileHeader: zip.FileHeader{Name: "资料/测试.txt", NonUTF8: true}}
+
+	target, name, skip, err := zipTargetForFile(base, base, f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skip {
+		t.Fatal("zipTargetForFile skip = true, want false")
+	}
+	if name != "资料/测试.txt" {
+		t.Fatalf("decoded name = %q, want 资料/测试.txt (must not be re-decoded)", name)
+	}
+	want := filepath.Join(base, "资料", "测试.txt")
+	if target != want {
+		t.Fatalf("target = %q, want %q", target, want)
+	}
+}
+
+func TestZipTargetRejectsGB18030PathTraversal(t *testing.T) {
+	base := t.TempDir()
+	rawName, err := simplifiedchinese.GB18030.NewEncoder().String("../越权.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &zip.File{FileHeader: zip.FileHeader{Name: rawName, NonUTF8: true}}
+
+	if _, _, _, err := zipTargetForFile(base, base, f); err == nil {
+		t.Fatal("zipTargetForFile decoded traversal error = nil, want error")
+	}
+}
+
+func TestArchiveFormatRecognizesZip(t *testing.T) {
+	if got := archiveFormat("backup.ZIP"); got != "zip" {
+		t.Fatalf("archiveFormat = %q, want zip", got)
+	}
+}
+
+func TestWriteZIPArchivePreservesExistingTargetOnFailure(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.txt")
+	target := filepath.Join(root, "archive.zip")
+	if err := os.WriteFile(source, []byte("new content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("old archive"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := writeZIPArchive(ctx, target, root, root, []string{source}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("writeZIPArchive error = %v, want context canceled", err)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "old archive" {
+		t.Fatalf("target changed to %q", data)
+	}
+}
+
+func TestWriteZIPArchiveCreatesReadableArchive(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.txt")
+	target := filepath.Join(root, "archive.zip")
+	if err := os.WriteFile(source, []byte("hello"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeZIPArchive(context.Background(), target, root, root, []string{source}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0644 {
+		t.Fatalf("archive mode = %v, want 0644", info.Mode().Perm())
+	}
+	r, err := zip.OpenReader(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if len(r.File) != 1 || r.File[0].Name != "source.txt" {
+		t.Fatalf("archive entries = %#v", r.File)
+	}
+	src, err := r.File[0].Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(src)
+	_ = src.Close()
+	if err != nil || string(data) != "hello" {
+		t.Fatalf("archive body = %q, error = %v", data, err)
+	}
+}
+
+func TestExtractFileAtomicallyPreservesExistingTargetOnReadFailure(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target.txt")
+	if err := os.WriteFile(target, []byte("old"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	src := io.MultiReader(strings.NewReader("partial"), iotest.ErrReader(errors.New("read failed")))
+	if err := extractFileAtomically(target, src); err == nil {
+		t.Fatal("extractFileAtomically error = nil, want read failure")
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "old" {
+		t.Fatalf("target changed to %q", data)
+	}
+}
+
+func TestValidateExpandedArchiveSizeRejectsPanelLimit(t *testing.T) {
+	if err := validateExpandedArchiveSize(t.TempDir(), maxPanelExtractedBytes+1); err == nil {
+		t.Fatal("validateExpandedArchiveSize error = nil, want size limit")
+	}
+}
+
+func writeTarGz(t *testing.T, path string, files map[string]string) {
+	t.Helper()
+
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	gz := gzip.NewWriter(file)
+	defer gz.Close()
+	tw := tar.NewWriter(gz)
+	defer tw.Close()
+
+	for name, body := range files {
+		if err := tw.WriteHeader(&tar.Header{
+			Name: name,
+			Mode: 0644,
+			Size: int64(len(body)),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
