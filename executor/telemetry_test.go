@@ -154,7 +154,7 @@ func TestRecordFirstHeartbeatSentDoesNotOverwriteFirstSuccess(t *testing.T) {
 	}
 
 	var value, updatedAt string
-	if err := database.GetDB().QueryRow(`SELECT svalue, updated_at FROM security_settings WHERE skey='telemetry_first_sent'`).Scan(&value, &updatedAt); err != nil {
+	if err := database.GetDB().QueryRow(`SELECT svalue, CAST(updated_at AS TEXT) FROM security_settings WHERE skey='telemetry_first_sent'`).Scan(&value, &updatedAt); err != nil {
 		t.Fatalf("read first heartbeat marker: %v", err)
 	}
 	if want := first.Format(time.RFC3339); value != want {
