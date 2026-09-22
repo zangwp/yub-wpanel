@@ -1,5 +1,5 @@
-// YUB WPanel 匿名安装统计 Worker
-// POST /api/heartbeat — 面板匿名心跳上报
+// YUB WPanel 可选运行统计 Worker
+// POST /api/heartbeat — 面板伪匿名心跳上报
 // GET  /api/stats     — 公开统计（total + 精确 active_24h 滚动窗口）
 // GET  /api/ip-ranges/googlebot — Google 官方爬虫 IP 的最后有效缓存
 
@@ -50,7 +50,7 @@ export default {
       });
     }
 
-    // 匿名心跳 — 面板定时上报
+    // 伪匿名心跳 — 面板定时上报
     if (request.method === 'POST' && url.pathname === '/api/heartbeat') {
       try {
         const body = await request.json();
@@ -179,7 +179,7 @@ async function getStats(env) {
   };
 }
 
-// 写入心跳：每个匿名实例保留首次和最近一次上报时间。
+// 写入心跳：每个伪匿名实例保留首次和最近一次上报时间。
 async function saveHeartbeat(env, anonymousId, version) {
   const now = new Date().toISOString();
   const idKey = `id:${anonymousId}`;

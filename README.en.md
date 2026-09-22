@@ -42,28 +42,26 @@ YUB WPanel focuses on one job: **running WordPress sites efficiently on VPS serv
 | **Alerts** | Receive email alerts for low resources, stopped services, expiring certificates or sites, and available updates; each alert type can be switched separately |
 | **Software and runtime** | Manage PHP, Nginx, MariaDB, and Redis, inspect logs, and adjust PHP or Nginx settings for individual sites |
 | **Panel security** | Use a private login path and two login checks; repeated password failures or repeated scans of invalid paths are restricted automatically |
-| **Safe updates** | Check for panel and Debian software updates; panel packages are verified before installation and restored to the previous version if an update fails |
+| **Safe updates** | Check for panel and Debian software updates; panel packages are signature-verified and the updater attempts rollback after a failed health check |
 | **Backups and offsite copies** | Back up sites and panel data automatically, and copy site backups to another server or object storage to reduce single-server risk |
 
-## One-Click Installation
+## Verified Installation
 
-```bash
-apt-get update && apt-get install -y wget ca-certificates && wget -qO- https://raw.githubusercontent.com/zangwp/yub-wpanel/main/install.sh | bash
-```
+On a production server, download the installer, SHA-256 manifest, and Ed25519 signature from a GitHub Release. Run the installer as root only after verification. Do not pipe a mutable branch script directly into a shell. The China-friendly entry is verified the same way and supports an administrator-selected HTTPS GitHub proxy.
 
-If GitHub is not reachable from your server, use the China-friendly installer:
+See the **[verified installation guide](docs/verified-install.md)** for copyable commands, the public key, and local release-bundle instructions.
 
-```bash
-apt-get update && apt-get install -y wget ca-certificates && wget -qO- https://cdn.jsdelivr.net/gh/zangwp/yub-wpanel@main/install-cn.sh | bash
-```
+> **v2.0.0 upgrade notice:** Do not use the updater built into v2.0.0 for the direct upgrade to v2.0.1. Download the fixed v2.0.1 Release assets for `install.sh`, `yub-wpanel`, and the third-party license archive, including all three SHA-256 manifests and Ed25519 signatures (nine files total), verify them, then run the local `install.sh` and select repair. The version-bound updater and isolated watchdog apply from v2.0.1 onward. See the [upgrade compatibility note](docs/upgrade-compatibility.md).
 
 After installation, the script prints the panel URL and the two login layers: BasicAuth and web login.
 
-> The browser may warn about a self-signed certificate on the first visit. Click "Advanced" and continue.
+> The initial self-signed certificate encrypts traffic but does not independently authenticate the server. Verify its SHA-256 fingerprint over SSH before the first login. For ongoing public access, use a trusted certificate and restrict access to the management port.
+
+> An installation created under another distribution identity cannot be migrated by renaming files or running repair. Read **[installation identity and upgrade compatibility](docs/upgrade-compatibility.md)** first.
 
 ## Quick Start
 
-1. Install the panel with the one-line installer.
+1. Verify and run the release installer.
 2. Open the panel URL printed by the installer.
 3. Sign in with BasicAuth first, then complete the web login.
 4. Run `yubw info` to confirm the panel version, port, and entry path.
@@ -86,7 +84,7 @@ YUB WPanel can move WordPress or generic PHP sites between two servers running t
 
 ## Security
 
-**Short version: if the server and your computer have not already been compromised, the private login path and both sets of credentials remain secret, and YUB WPanel is kept up to date, an outsider relying only on internet scanning or guessing is extremely unlikely to enter the panel.**
+**Short version: the private path, two login layers, and automatic throttling raise the cost of internet scanning and password guessing, but they do not replace a trusted client, strong credentials, timely updates, network access controls, and recoverable backups.**
 
 A normal login requires the server's unique private path, the browser prompt, and the web login. Repeated attempts to find the path or guess passwords are restricted automatically. No internet-connected software can promise that compromise is impossible, but YUB WPanel does not rely on a single password for protection.
 
@@ -106,7 +104,7 @@ A normal login requires the server's unique private path, the browser prompt, an
 
 - every site runs under its own system user and PHP-FPM pool
 - every site uses its own MariaDB database
-- one broken site should not take down the others
+- separate users and PHP-FPM pools reduce cross-site impact, while the kernel, database, and host resources remain shared boundaries
 
 ### WordPress-Specific Protection
 
@@ -129,15 +127,16 @@ A normal login requires the server's unique private path, the browser prompt, an
 ### Update Safety
 
 - update packages are verified with YUB WPanel's independent Ed25519 public key so damaged or replaced files are rejected
-- a failed update automatically restores the previous version so the panel can remain available
+- the signed candidate binary must report the same canonical stable version as the Release tag, preventing an older valid package from being replayed as a newer release
+- the updater backs up the current binary and panel database before replacement and attempts rollback after a failed health check; this is not a full-server snapshot and rollback can fail
 
 ### Code Transparency
 
 - 100% open source under GPL-3.0
-- no sensitive business data is collected; anonymous stats are limited to the version number and can be disabled in the panel
-- update checks connect only to GitHub, not to other external services
+- runtime telemetry is disabled by default and has no preset endpoint; when a custom endpoint is enabled it receives a stable pseudonymous ID and the version, not business content
+- panel version metadata comes from GitHub by default; WordPress updates and administrator-enabled integrations connect to their documented upstream services
 - no web shell and no online code editor
-- passwords are stored with bcrypt cost 12, never in plain text
+- panel login passwords use bcrypt; database and third-party credentials required at runtime may be stored in root-only configuration or databases
 
 ### Deep-Dive Security Notes
 
@@ -158,10 +157,10 @@ White-hat researchers are welcome to test this project. If you find a security i
 |------|------|
 | Operating system | Debian 13 (Trixie) |
 | CPU | 1 core or more |
-| Memory | 1 GB or more (Swap is created automatically below that) |
+| Memory | 1 GB or more (the installer may create a 2 GB swap file when RAM is at most 8 GB, no swap is active, and disk checks pass) |
 | Architecture | x86_64 |
 
-> Cloud vendor custom images can introduce unknown problems. If installation is troublesome, reinstall to a clean Debian 13 system with [bin456789/reinstall](https://github.com/bin456789/reinstall) and try again.
+> Cloud-vendor images can introduce compatibility differences. Preserve logs and check networking, APT, signatures, and the OS version first. Third-party reinstall projects are not maintained by YUB WPanel; reinstalling an OS erases data and should only be considered on a new host or after verifying a complete snapshot.
 
 ## Why These Tech Choices
 
@@ -179,11 +178,11 @@ WordPress recommends MariaDB 10.6 or newer, and Debian 12/13 ships compatible Ma
 
 **Why build a Go binary instead of using Docker or PM2?**
 
-The panel ships as a single binary with zero extra runtime dependency and is managed by `systemd`. It uses only a few dozen megabytes of memory, which is a good fit for 1 GB VPS plans. It does not share ports with Nginx, and there is no container layer or runtime overhead.
+The panel application is distributed as one static Go binary and managed by `systemd`, without Docker or PM2. Full functionality still depends on the system services and commands installed by the installer. The management service does not share its port with Nginx and has no container-runtime overhead.
 
 ## Runtime Components
 
-All runtime components are installed through APT packages; the panel does not compile them itself:
+The server-stack components below are installed through APT. The panel binary comes from a signed GitHub Release, while WordPress and WP-CLI use their own upstream distribution channels:
 
 | Component | Notes |
 |------|------|
@@ -271,7 +270,7 @@ cp /root/panel-db-backup/panel_20260107_023000.db /www/server/panel/panel.db
 systemctl start yub-wpanel
 ```
 
-> Older backups may miss newer database fields. When the panel starts, the upgrade chain will fill them in automatically.
+> This procedure only supports SQLite backups from the same YUB WPanel distribution line while they remain in the documented support range. Do not directly restore a backup from another distribution identity. A panel database backup does not include site files, MariaDB data, or configuration outside the panel directory. See the [upgrade compatibility note](docs/upgrade-compatibility.md).
 
 ## FAQ
 
@@ -297,7 +296,7 @@ Yes. Remote backup sync supports rsync/SSH and S3-compatible object storage.
 
 ### What if GitHub is blocked from my server?
 
-Use the China-friendly `install-cn.sh` installer.
+Verify the China-friendly `install-cn.sh` release asset and configure an HTTPS GitHub proxy you selected. See the [verified installation guide](docs/verified-install.md).
 
 ## Project Structure
 
@@ -323,3 +322,10 @@ Use the China-friendly `install-cn.sh` installer.
 ## License
 
 GPL-3.0
+
+YUB WPanel is a modified work distributed under GPL-3.0. The project was
+substantially modified and rebranded by zangwp on 2026-09-21, and subsequent
+changes are maintained in this repository. See [`LICENSE`](LICENSE) for the
+complete terms, [`NOTICE.md`](NOTICE.md) for the modification notice, and
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) plus the signed license
+archive attached to each Release for third-party terms.

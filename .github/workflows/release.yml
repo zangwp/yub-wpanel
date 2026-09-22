@@ -5,77 +5,538 @@ on:
     tags:
       - 'v*'
 
+# Deny write access by default. Individual jobs opt in only when required.
 permissions:
-  contents: write
+  contents: read
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: Build and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      # Require every downloaded module to match go.sum and disallow VCS fallback.
+      GOFLAGS: -mod=readonly
+      GOPROXY: https://proxy.golang.org
+      GOSUMDB: sum.golang.org
+      GONOSUMDB: ''
+      GOPRIVATE: ''
+      GOINSECURE: ''
+      GOVCS: '*:off'
+      GOTOOLCHAIN: local
+      RELEASE_PUBLIC_KEY_HEX: 7351099720eeaf147f4894bc313a5456c01bbd29ad7d401ab6869bc7f7f92af5
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
+      - name: Check out the tagged commit
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          go-version-file: 'go.mod'
+          ref: ${{ github.sha }}
+          # The release gate below requires the authoritative main ref.
+          fetch-depth: 0
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - name: Set up the pinned Go toolchain
+        # actions/setup-go v7.0.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
-          node-version: 24
+          go-version-file: go.mod
+          check-latest: false
+          cache: false
 
-      - name: Prepare static assets
+      - name: Validate release inputs
+        shell: bash
         run: |
-          mkdir -p static/css static/js bin
+          set -euo pipefail
 
-          curl -sSL "https://cdn.jsdelivr.net/npm/alpinejs@3.13.7/dist/cdn.min.js" -o static/js/alpine.min.js
-          curl -sSL "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" -o static/js/chart.min.js
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA"
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Unsupported release tag: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
 
-          TAILWIND_VERSION="v3.4.4"
-          curl -sSL "https://github.com/tailwindlabs/tailwindcss/releases/download/${TAILWIND_VERSION}/tailwindcss-linux-x64" -o bin/tailwindcss
-          chmod +x bin/tailwindcss
-          bin/tailwindcss -i input.css -o static/css/main.css --minify
+          bash -n install.sh install-cn.sh
+
+          # These vendored browser assets are part of the reviewed Git commit.
+          # Release builds must never replace them with live CDN downloads.
+          test -s static/css/main.css
+          test -s static/js/alpine.min.js
+          test -s static/js/chart.min.js
+          test -s static/js/app.js
+          test -s LICENSE
+          test -s NOTICE.md
+          test -s THIRD_PARTY_NOTICES.md
+          test -s third_party/adminer-6.0.1/LICENSE-APACHE-2.0.txt
+          test -s third_party/adminer-6.0.1/NOTICE.txt
+          grep -Fq '* @copyright 2007 Jakub Vrana' executor/assets/adminer-6.0.1-mysql.php
+          grep -Fq '* @version 6.0.1' executor/assets/adminer-6.0.1-mysql.php
+          git diff --exit-code -- static
+          grep -Fq "ReleasePublicKeyHex = \"$RELEASE_PUBLIC_KEY_HEX\"" config/distribution.go
+
+      - name: Download and verify Go modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          go mod download
+          go mod verify
 
       - name: Test
+        shell: bash
         run: |
-          packages=$(go list ./... | grep -v '/scratch$')
-          go test $packages
+          set -euo pipefail
+          packages_file="$RUNNER_TEMP/release-packages"
+          go list ./... | grep -v '/scratch$' > "$packages_file"
+          mapfile -t packages < "$packages_file"
+          test "${#packages[@]}" -gt 0
+          go test -trimpath "${packages[@]}"
 
       - name: Static check
+        shell: bash
         run: |
-          packages=$(go list ./... | grep -v '/scratch$')
-          go vet $packages
+          set -euo pipefail
+          packages_file="$RUNNER_TEMP/release-packages"
+          go list ./... | grep -v '/scratch$' > "$packages_file"
+          mapfile -t packages < "$packages_file"
+          test "${#packages[@]}" -gt 0
+          go vet "${packages[@]}"
 
-      - name: Build binary
+      - name: Build release inputs with normalized metadata
+        shell: bash
         run: |
-          VERSION=${GITHUB_REF#refs/tags/}
-          BUILD_TIME=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-          CGO_ENABLED=0 go build -ldflags "-s -w -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME}" -o yub-wpanel .
+          set -euo pipefail
+          worktree_status="$(git status --porcelain --untracked-files=all)"
+          if [[ -n "$worktree_status" ]]; then
+            echo "Tests or tools modified the release source tree:" >&2
+            printf '%s\n' "$worktree_status" >&2
+            exit 1
+          fi
+          mkdir -p dist
 
-      - name: Generate SHA256
-        run: sha256sum yub-wpanel > yub-wpanel.sha256
+          version="$GITHUB_REF_NAME"
+          source_date_epoch="$(git show -s --format=%ct HEAD)"
+          build_time="$(date --utc --date="@$source_date_epoch" '+%Y-%m-%dT%H:%M:%SZ')"
 
-      - name: Sign SHA256
+          CGO_ENABLED=0 go build \
+            -trimpath \
+            -buildvcs=true \
+            -ldflags="-s -w -buildid= -X main.Version=$version -X main.BuildTime=$build_time" \
+            -o dist/yub-wpanel \
+            .
+
+          test -s dist/yub-wpanel
+          test "$(od -An -tx1 -N4 dist/yub-wpanel | tr -d ' \n')" = '7f454c46'
+
+          preflight_dir="$RUNNER_TEMP/yub-wpanel-release-preflight"
+          install -d -m 0700 "$preflight_dir"
+          cat > "$preflight_dir/config.json" <<EOF
+          {
+            "panel": {
+              "port": 8888,
+              "tls_port": 8443,
+              "random_suffix": "release-preflight",
+              "data_dir": "$preflight_dir",
+              "backup_dir": "$preflight_dir",
+              "log_dir": "$preflight_dir"
+            },
+            "sqlite": {"path": "$preflight_dir/preflight.db"},
+            "mariadb": {"root_password": "release-preflight-only"},
+            "admin": {"username": "preflight", "password_hash": "preflight"},
+            "paths": {"cron_file": "/etc/cron.d/yub_wpanel_cron"},
+            "systemd": {
+              "service_name": "yub-wpanel",
+              "service_path": "/etc/systemd/system/yub-wpanel.service",
+              "binary_path": "/usr/local/bin/yub-wpanel"
+            }
+          }
+          EOF
+          chmod 0600 "$preflight_dir/config.json"
+          ./dist/yub-wpanel --info --config "$preflight_dir/config.json" > "$preflight_dir/info.txt"
+          grep -Fq 'YUB WPanel' "$preflight_dir/info.txt"
+          grep -Fq "版本: $version " "$preflight_dir/info.txt"
+
+          # Publish the reviewed installers as downloadable assets. They are copied,
+          # hashed, and later signed as data; no downstream job executes them.
+          sed \
+            "s/^INSTALLER_RELEASE_VERSION=.*/INSTALLER_RELEASE_VERSION=\"$version\"/" \
+            install.sh > dist/install.sh
+          sed \
+            "s/^BOOTSTRAP_RELEASE_VERSION=.*/BOOTSTRAP_RELEASE_VERSION=\"$version\"/" \
+            install-cn.sh > dist/install-cn.sh
+          chmod 0755 dist/install.sh dist/install-cn.sh
+          test "$(head -n 1 dist/install.sh)" = '#!/bin/bash'
+          test "$(head -n 1 dist/install-cn.sh)" = '#!/bin/bash'
+          grep -Fxq "INSTALLER_RELEASE_VERSION=\"$version\"" dist/install.sh
+          grep -Fxq "BOOTSTRAP_RELEASE_VERSION=\"$version\"" dist/install-cn.sh
+
+          # Collect the reviewed browser notices plus the exact license files
+          # from every external Go module linked into the release binary.
+          license_root="$RUNNER_TEMP/yub-wpanel-third-party-licenses"
+          module_list="$RUNNER_TEMP/yub-wpanel-release-modules"
+          install -d -m 0755 "$license_root"
+          install -m 0644 LICENSE "$license_root/LICENSE"
+          install -m 0644 NOTICE.md "$license_root/NOTICE.md"
+          install -m 0644 THIRD_PARTY_NOTICES.md "$license_root/THIRD_PARTY_NOTICES.md"
+          printf '%s\n' "$version" > "$license_root/RELEASE_VERSION"
+
+          # The released binary is statically linked with this exact Go toolchain.
+          # Standard-library packages have no .Module metadata, so preserve the
+          # toolchain license explicitly instead of silently dropping it.
+          go_root="$(realpath -e -- "$(go env GOROOT)")"
+          go_version="$(go env GOVERSION)"
+          required_go_version="$(awk '$1 == "toolchain" { print $2; exit }' go.mod)"
+          test -n "$required_go_version"
+          test "$required_go_version" = 'go1.26.8'
+          test "$go_version" = "$required_go_version"
+          test -f "$go_root/LICENSE"
+          test ! -L "$go_root/LICENSE"
+          install -d -m 0755 "$license_root/go-toolchain"
+          printf '%s\n' "$go_version" > "$license_root/go-toolchain/VERSION"
+          install -m 0644 "$go_root/LICENSE" "$license_root/go-toolchain/LICENSE"
+          if [[ -e "$go_root/PATENTS" ]] || [[ -L "$go_root/PATENTS" ]]; then
+            test -f "$go_root/PATENTS"
+            test ! -L "$go_root/PATENTS"
+            install -m 0644 "$go_root/PATENTS" "$license_root/go-toolchain/PATENTS"
+          fi
+
+          # Adminer is embedded as PHP source in the Go binary. It is distributed
+          # under its Apache-2.0 option, with the exact version/copyright notice.
+          install -d -m 0755 "$license_root/adminer-6.0.1"
+          install -m 0644 third_party/adminer-6.0.1/LICENSE-APACHE-2.0.txt \
+            "$license_root/adminer-6.0.1/LICENSE-APACHE-2.0.txt"
+          install -m 0644 third_party/adminer-6.0.1/NOTICE.txt \
+            "$license_root/adminer-6.0.1/NOTICE.txt"
+
+          CGO_ENABLED=0 go list -deps -f '{{with .Module}}{{.Path}}|{{.Version}}|{{.Dir}}{{end}}' . \
+            | LC_ALL=C sort -u > "$module_list"
+          main_module="$(go list -m -f '{{.Path}}')"
+          gomodcache_real="$(realpath -e -- "$(go env GOMODCACHE)")"
+          module_index=0
+          while IFS='|' read -r module_path module_version module_dir; do
+            [[ -n "$module_path" ]] || continue
+            [[ "$module_path" != "$main_module" ]] || continue
+            [[ -n "$module_version" ]] || {
+              echo "External module has no pinned version: $module_path" >&2
+              exit 1
+            }
+            module_dir_real="$(realpath -e -- "$module_dir")"
+            case "$module_dir_real" in
+              "$gomodcache_real"/*) ;;
+              *)
+                echo "Module directory escaped GOMODCACHE: $module_path" >&2
+                exit 1
+                ;;
+            esac
+
+            module_index=$((module_index + 1))
+            module_output="$license_root/$(printf '%03d' "$module_index")"
+            install -d -m 0755 "$module_output"
+            printf '%s\n%s\n' "$module_path" "$module_version" > "$module_output/MODULE"
+            license_count=0
+            license_file_list="$RUNNER_TEMP/yub-wpanel-license-files-$(printf '%03d' "$module_index")"
+            find "$module_dir_real" -mindepth 1 -maxdepth 1 -type f \
+              \( -iname 'LICENSE' -o -iname 'LICENSE.*' \
+                 -o -iname 'LICENCE' -o -iname 'LICENCE.*' \
+                 -o -iname 'COPYING' -o -iname 'COPYING.*' \
+                 -o -iname 'NOTICE' -o -iname 'NOTICE.*' \) \
+              -print0 | LC_ALL=C sort -z > "$license_file_list"
+            while IFS= read -r -d '' license_file; do
+              license_name="$(basename -- "$license_file")"
+              [[ "$license_name" =~ ^[A-Za-z0-9._-]+$ ]] || {
+                echo "Unsafe license filename for $module_path: $license_name" >&2
+                exit 1
+              }
+              install -m 0644 "$license_file" "$module_output/$license_name"
+              license_count=$((license_count + 1))
+            done < "$license_file_list"
+            rm -f -- "$license_file_list"
+            if [[ "$license_count" -eq 0 ]]; then
+              echo "No top-level license or notice found for $module_path@$module_version" >&2
+              exit 1
+            fi
+          done < "$module_list"
+          test "$module_index" -gt 0
+
+          tar --sort=name \
+            --format=posix \
+            --pax-option=delete=atime,delete=ctime \
+            --mtime="@$source_date_epoch" \
+            --owner=0 --group=0 --numeric-owner \
+            -cf - -C "$license_root" . \
+            | gzip -n -9 > dist/yub-wpanel-third-party-licenses.tar.gz
+          test -s dist/yub-wpanel-third-party-licenses.tar.gz
+
+          cd dist
+          for asset in \
+            yub-wpanel \
+            install.sh \
+            install-cn.sh \
+            yub-wpanel-third-party-licenses.tar.gz; do
+            sha256sum "$asset" > "$asset.unsigned.sha256"
+            sha256sum --check --strict "$asset.unsigned.sha256"
+          done
+
+      - name: Upload unsigned release input
+        # actions/upload-artifact v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: unsigned-release-${{ github.sha }}
+          path: |
+            dist/yub-wpanel
+            dist/yub-wpanel.unsigned.sha256
+            dist/install.sh
+            dist/install.sh.unsigned.sha256
+            dist/install-cn.sh
+            dist/install-cn.sh.unsigned.sha256
+            dist/yub-wpanel-third-party-licenses.tar.gz
+            dist/yub-wpanel-third-party-licenses.tar.gz.unsigned.sha256
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
+
+  sign:
+    name: Sign release assets
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: release-signing
+    # Artifact transport uses the runner's scoped artifact token, not GITHUB_TOKEN.
+    permissions: {}
+    env:
+      RELEASE_PUBLIC_KEY_HEX: 7351099720eeaf147f4894bc313a5456c01bbd29ad7d401ab6869bc7f7f92af5
+      RELEASE_PUBLIC_KEY_SPKI_B64: MCowBQYDK2VwAyEAc1EJlyDurxR/SJS8MTpUVsAbvSmtfUAatoabx/f5KvU=
+    steps:
+      # Do not check out or execute repository code in this job.
+      - name: Download unsigned release input
+        # actions/download-artifact v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: unsigned-release-${{ github.sha }}
+          path: release-assets
+
+      - name: Validate unsigned release input
+        shell: bash
+        working-directory: release-assets
+        run: |
+          set -euo pipefail
+          test "$(find . -mindepth 1 -maxdepth 1 | wc -l)" -eq 8
+          for asset in \
+            yub-wpanel \
+            install.sh \
+            install-cn.sh \
+            yub-wpanel-third-party-licenses.tar.gz; do
+            test -f "$asset"
+            test ! -L "$asset"
+            test -f "$asset.unsigned.sha256"
+            test ! -L "$asset.unsigned.sha256"
+            test "$(cat "$asset.unsigned.sha256")" = "$(sha256sum "$asset")"
+            sha256sum --check --strict "$asset.unsigned.sha256"
+            mv "$asset.unsigned.sha256" "$asset.sha256"
+          done
+
+      - name: Sign checksums and self-check against pinned key
+        shell: bash
+        working-directory: release-assets
         env:
           RELEASE_SIGNING_KEY_B64: ${{ secrets.RELEASE_SIGNING_KEY_B64 }}
         run: |
-          test -n "$RELEASE_SIGNING_KEY_B64"
-          trap 'rm -f release-signing-key.pem' EXIT
-          printf '%s' "$RELEASE_SIGNING_KEY_B64" | base64 --decode > release-signing-key.pem
-          chmod 600 release-signing-key.pem
-          openssl pkeyutl -sign -rawin \
-            -inkey release-signing-key.pem \
-            -in yub-wpanel.sha256 \
-            -out yub-wpanel.sha256.sig
-          test "$(wc -c < yub-wpanel.sha256.sig)" -eq 64
+          set -euo pipefail
+          umask 077
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+          key_file="$RUNNER_TEMP/release-signing-key.pem"
+          public_file="$RUNNER_TEMP/release-signing-public.pem"
+          cleanup() {
+            rm -f "$key_file" "$public_file"
+          }
+          trap cleanup EXIT
+
+          test -n "$RELEASE_SIGNING_KEY_B64"
+          printf '%s' "$RELEASE_SIGNING_KEY_B64" | base64 --decode > "$key_file"
+          openssl pkey -in "$key_file" -check -noout
+          openssl pkey -in "$key_file" -pubout -out "$public_file"
+
+          actual_public_key_hex="$(
+            openssl pkey -pubin -in "$public_file" -outform DER |
+              tail -c 32 |
+              od -An -tx1 |
+              tr -d ' \n'
+          )"
+          if [[ "$actual_public_key_hex" != "$RELEASE_PUBLIC_KEY_HEX" ]]; then
+            echo "Release signing key does not match the embedded public key" >&2
+            exit 1
+          fi
+          actual_public_key_spki_b64="$(
+            openssl pkey -pubin -in "$public_file" -outform DER |
+              base64 |
+              tr -d '\n'
+          )"
+          if [[ "$actual_public_key_spki_b64" != "$RELEASE_PUBLIC_KEY_SPKI_B64" ]]; then
+            echo "Release signing key has an unexpected SPKI encoding" >&2
+            exit 1
+          fi
+
+          for checksum in \
+            yub-wpanel.sha256 \
+            install.sh.sha256 \
+            install-cn.sh.sha256 \
+            yub-wpanel-third-party-licenses.tar.gz.sha256; do
+            openssl pkeyutl -sign -rawin \
+              -inkey "$key_file" \
+              -in "$checksum" \
+              -out "$checksum.sig"
+            test "$(wc -c < "$checksum.sig")" -eq 64
+            openssl pkeyutl -verify -rawin -pubin \
+              -inkey "$public_file" \
+              -in "$checksum" \
+              -sigfile "$checksum.sig"
+          done
+
+      - name: Upload signed release assets
+        # actions/upload-artifact v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: ${{ github.ref_name }}
-          files: |
-            yub-wpanel
-            yub-wpanel.sha256
-            yub-wpanel.sha256.sig
-          generate_release_notes: true
+          name: signed-release-${{ github.sha }}
+          path: |
+            release-assets/yub-wpanel
+            release-assets/yub-wpanel.sha256
+            release-assets/yub-wpanel.sha256.sig
+            release-assets/install.sh
+            release-assets/install.sh.sha256
+            release-assets/install.sh.sha256.sig
+            release-assets/install-cn.sh
+            release-assets/install-cn.sh.sha256
+            release-assets/install-cn.sh.sha256.sig
+            release-assets/yub-wpanel-third-party-licenses.tar.gz
+            release-assets/yub-wpanel-third-party-licenses.tar.gz.sha256
+            release-assets/yub-wpanel-third-party-licenses.tar.gz.sha256.sig
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
+
+  release:
+    name: Verify and publish release
+    needs: sign
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      RELEASE_PUBLIC_KEY_SPKI_B64: MCowBQYDK2VwAyEAc1EJlyDurxR/SJS8MTpUVsAbvSmtfUAatoabx/f5KvU=
+    steps:
+      # Do not check out or execute repository code in this job.
+      - name: Download signed release assets
+        # actions/download-artifact v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: signed-release-${{ github.sha }}
+          path: release-assets
+
+      - name: Verify release assets
+        shell: bash
+        working-directory: release-assets
+        run: |
+          set -euo pipefail
+          test "$(find . -mindepth 1 -maxdepth 1 | wc -l)" -eq 12
+
+          public_pem="$RUNNER_TEMP/release-signing-public.pem"
+          cleanup() {
+            rm -f "$public_pem"
+          }
+          trap cleanup EXIT
+
+          printf '%s\n' \
+            '-----BEGIN PUBLIC KEY-----' \
+            "$RELEASE_PUBLIC_KEY_SPKI_B64" \
+            '-----END PUBLIC KEY-----' > "$public_pem"
+          openssl pkey -pubin -in "$public_pem" -noout
+          for asset in \
+            yub-wpanel \
+            install.sh \
+            install-cn.sh \
+            yub-wpanel-third-party-licenses.tar.gz; do
+            test -f "$asset"
+            test ! -L "$asset"
+            test -f "$asset.sha256"
+            test ! -L "$asset.sha256"
+            test -f "$asset.sha256.sig"
+            test ! -L "$asset.sha256.sig"
+            test "$(wc -c < "$asset.sha256.sig")" -eq 64
+            test "$(cat "$asset.sha256")" = "$(sha256sum "$asset")"
+            sha256sum --check --strict "$asset.sha256"
+            openssl pkeyutl -verify -rawin -pubin \
+              -inkey "$public_pem" \
+              -in "$asset.sha256" \
+              -sigfile "$asset.sha256.sig"
+          done
+
+      - name: Create or update GitHub Release
+        shell: bash
+        working-directory: release-assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          assets=(
+            yub-wpanel yub-wpanel.sha256 yub-wpanel.sha256.sig
+            install.sh install.sh.sha256 install.sh.sha256.sig
+            install-cn.sh install-cn.sh.sha256 install-cn.sh.sha256.sig
+            yub-wpanel-third-party-licenses.tar.gz
+            yub-wpanel-third-party-licenses.tar.gz.sha256
+            yub-wpanel-third-party-licenses.tar.gz.sha256.sig
+          )
+
+          # Re-resolve the remote tag immediately before publication. The build
+          # job checked main earlier, but a mutable tag could otherwise be moved
+          # while the protected signing job is awaiting approval. Repository
+          # rules must also make v* tags immutable to close the final API race.
+          tag_object="$(
+            gh api "/repos/$GH_REPO/git/ref/tags/$GITHUB_REF_NAME" \
+              --jq '.object.type + " " + .object.sha'
+          )"
+          resolved_tag_commit=""
+          for _ in 1 2 3 4 5 6 7 8; do
+            read -r object_type object_sha extra_field <<< "$tag_object"
+            test -z "${extra_field:-}"
+            [[ "$object_sha" =~ ^[0-9a-f]{40}$ ]]
+            case "$object_type" in
+              commit)
+                resolved_tag_commit="$object_sha"
+                break
+                ;;
+              tag)
+                tag_object="$(
+                  gh api "/repos/$GH_REPO/git/tags/$object_sha" \
+                    --jq '.object.type + " " + .object.sha'
+                )"
+                ;;
+              *)
+                echo "Release tag resolved to unsupported object type: $object_type" >&2
+                exit 1
+                ;;
+            esac
+          done
+          if [[ "$resolved_tag_commit" != "$GITHUB_SHA" ]]; then
+            echo "Release tag no longer resolves to the reviewed commit" >&2
+            echo "expected=$GITHUB_SHA actual=${resolved_tag_commit:-unresolved}" >&2
+            exit 1
+          fi
+
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists; refusing to replace published assets" >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes "IMPORTANT for v2.0.0: do not use its built-in online updater for the first hop. Download all nine fixed v2.0.1 installer, panel, and license-archive assets, verify the Ed25519-signed SHA-256 manifests, then run install.sh and select repair. The protected online updater applies from v2.0.1 onward. See [CHANGELOG.md](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/CHANGELOG.md) and [the verified upgrade guide](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/docs/verified-install.md)."

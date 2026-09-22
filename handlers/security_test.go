@@ -500,6 +500,168 @@ func TestUpdateSecuritySettingsSerializesSnapshotThroughRuntimeApply(t *testing.
 	}
 }
 
+func TestUpdateTelemetrySettingPersistsEnableAndDisable(t *testing.T) {
+	setupSecurityTestDB(t)
+	restoreSecurityExecutorHooks(t)
+
+	rec := performSecurityRequest(http.MethodPut, "/settings", `{"telemetry_enabled":"true"}`, func(router *gin.Engine, h *SecurityHandler) {
+		router.PUT("/settings", h.UpdateSettings)
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("enable without endpoint status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := securitySettingValue(t, "telemetry_enabled"); got != "false" {
+		t.Fatalf("telemetry_enabled changed after rejected enable: %q", got)
+	}
+
+	rec = performSecurityRequest(http.MethodPut, "/settings", `{"telemetry_enabled":"true","telemetry_url":"https://8.8.8.8/telemetry/"}`, func(router *gin.Engine, h *SecurityHandler) {
+		router.PUT("/settings", h.UpdateSettings)
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("enable with endpoint status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := securitySettingValue(t, "telemetry_enabled"); got != "true" {
+		t.Fatalf("telemetry_enabled = %q, want true", got)
+	}
+	if got := securitySettingValue(t, "telemetry_url"); got != "https://8.8.8.8/telemetry" {
+		t.Fatalf("telemetry_url = %q, want canonical endpoint", got)
+	}
+
+	rec = performSecurityRequest(http.MethodPut, "/settings", `{"telemetry_url":""}`, func(router *gin.Engine, h *SecurityHandler) {
+		router.PUT("/settings", h.UpdateSettings)
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("clear while enabled status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := securitySettingValue(t, "telemetry_url"); got != "https://8.8.8.8/telemetry" {
+		t.Fatalf("telemetry_url changed after rejected clear: %q", got)
+	}
+
+	rec = performSecurityRequest(http.MethodPut, "/settings", `{"telemetry_enabled":false,"telemetry_url":""}`, func(router *gin.Engine, h *SecurityHandler) {
+		router.PUT("/settings", h.UpdateSettings)
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("disable and clear status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := securitySettingValue(t, "telemetry_enabled"); got != "false" {
+		t.Fatalf("telemetry_enabled = %q, want false", got)
+	}
+	if got := securitySettingValue(t, "telemetry_url"); got != "" {
+		t.Fatalf("telemetry_url = %q, want empty", got)
+	}
+}
+
+func TestUpdateTelemetrySettingValidatesStoredEndpointOnEnable(t *testing.T) {
+	setupSecurityTestDB(t)
+	restoreSecurityExecutorHooks(t)
+
+	rec := performSecurityRequest(http.MethodPut, "/settings", `{"telemetry_url":"https://8.8.8.8/telemetry"}`, func(router *gin.Engine, h *SecurityHandler) {
+		router.PUT("/settings", h.UpdateSettings)
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save endpoint status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	rec = performSecurityRequest(http.MethodPut, "/settings", `{"telemetry_enabled":true}`, func(router *gin.Engine, h *SecurityHandler) {
+		router.PUT("/settings", h.UpdateSettings)
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("enable with stored endpoint status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	if _, err := database.GetDB().Exec(`UPDATE security_settings SET svalue='false' WHERE skey='telemetry_enabled'`); err != nil {
+		t.Fatalf("disable telemetry fixture: %v", err)
+	}
+	if _, err := database.GetDB().Exec(`UPDATE security_settings SET svalue='https://192.0.2.1/legacy' WHERE skey='telemetry_url'`); err != nil {
+		t.Fatalf("set legacy endpoint fixture: %v", err)
+	}
+	rec = performSecurityRequest(http.MethodPut, "/settings", `{"telemetry_enabled":true}`, func(router *gin.Engine, h *SecurityHandler) {
+		router.PUT("/settings", h.UpdateSettings)
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("enable with unsafe stored endpoint status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := securitySettingValue(t, "telemetry_enabled"); got != "false" {
+		t.Fatalf("telemetry_enabled changed after unsafe stored endpoint: %q", got)
+	}
+}
+
+func TestUpdateTelemetryURLPersistsOnlySafeHTTPSValue(t *testing.T) {
+	setupSecurityTestDB(t)
+	restoreSecurityExecutorHooks(t)
+
+	rec := performSecurityRequest(http.MethodPut, "/settings", `{"telemetry_url":"https://8.8.8.8/telemetry/"}`, func(router *gin.Engine, h *SecurityHandler) {
+		router.PUT("/settings", h.UpdateSettings)
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("safe URL status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := securitySettingValue(t, "telemetry_url"); got != "https://8.8.8.8/telemetry" {
+		t.Fatalf("telemetry_url = %q, want canonical safe URL", got)
+	}
+
+	for _, unsafe := range []string{
+		"http://8.8.8.8/telemetry",
+		"https://user:pass@8.8.8.8/telemetry",
+		"https://8.8.8.8/telemetry#fragment",
+		"https://8.8.8.8/telemetry?token=secret",
+		"https://8.8.8.8:70000/telemetry",
+		"https://localhost/telemetry",
+		"https://127.0.0.1/telemetry",
+		"https://10.0.0.1/telemetry",
+		"https://169.254.169.254/latest/meta-data",
+		"https://192.0.2.1/telemetry",
+		"https://198.18.0.1/telemetry",
+		"https://198.51.100.1/telemetry",
+		"https://203.0.113.1/telemetry",
+		"https://[::1]/telemetry",
+		"https://[2001:db8::1]/telemetry",
+	} {
+		payload, err := json.Marshal(map[string]string{"telemetry_url": unsafe})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec = performSecurityRequest(http.MethodPut, "/settings", string(payload), func(router *gin.Engine, h *SecurityHandler) {
+			router.PUT("/settings", h.UpdateSettings)
+		})
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("unsafe URL %q status = %d, body = %s", unsafe, rec.Code, rec.Body.String())
+		}
+		if got := securitySettingValue(t, "telemetry_url"); got != "https://8.8.8.8/telemetry" {
+			t.Fatalf("telemetry_url changed after rejecting %q: %q", unsafe, got)
+		}
+	}
+
+	rec = performSecurityRequest(http.MethodPut, "/settings", `{"telemetry_url":""}`, func(router *gin.Engine, h *SecurityHandler) {
+		router.PUT("/settings", h.UpdateSettings)
+	})
+	if rec.Code != http.StatusOK || securitySettingValue(t, "telemetry_url") != "" {
+		t.Fatalf("clear telemetry URL failed: status=%d body=%s value=%q", rec.Code, rec.Body.String(), securitySettingValue(t, "telemetry_url"))
+	}
+}
+
+func TestUpdateSecuritySettingsContinuesToIgnoreUnknownKeys(t *testing.T) {
+	setupSecurityTestDB(t)
+	restoreSecurityExecutorHooks(t)
+	before := securitySettingValue(t, "telemetry_enabled")
+
+	rec := performSecurityRequest(http.MethodPut, "/settings", `{"telemetry_enabled_typo":"true"}`, func(router *gin.Engine, h *SecurityHandler) {
+		router.PUT("/settings", h.UpdateSettings)
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := securitySettingValue(t, "telemetry_enabled"); got != before {
+		t.Fatalf("known setting changed from %q to %q after unknown-only update", before, got)
+	}
+	var count int
+	if err := database.GetDB().QueryRow(`SELECT COUNT(*) FROM security_settings WHERE skey='telemetry_enabled_typo'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("unknown security setting was persisted, count=%d", count)
+	}
+}
+
 func TestNormalizeSecuritySettingAcceptsBotLimitSettings(t *testing.T) {
 	for _, tc := range []struct {
 		key  string

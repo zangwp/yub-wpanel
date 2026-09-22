@@ -1,0 +1,5 @@
+# Shell scripts and GitHub Actions run on Linux and must keep LF endings,
+# including when contributors work from Windows.
+*.sh text eol=lf
+.github/workflows/*.yml text eol=lf
+.github/workflows/*.yaml text eol=lf

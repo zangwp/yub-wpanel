@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"errors"
@@ -26,7 +27,11 @@ var restartCronService = func() (string, error) {
 	return executeCommand("systemctl", "restart", "cron")
 }
 
-const cronLogKeepLines = 1000
+const (
+	cronLogKeepLines  = 1000
+	managedCronHeader = "# YUB WPanel Cron Jobs — DO NOT EDIT MANUALLY"
+	managedCronPath   = "/etc/cron.d/yub_wpanel_cron"
+)
 
 // ReconcileInterruptedManualCronJobs releases claims owned by the main
 // process's in-memory queue. The scheduled Cron CLI never sets running, so a
@@ -78,7 +83,7 @@ func renderCronConfig() TaskResult {
 	defer rows.Close()
 
 	var cronLines []string
-	cronLines = append(cronLines, "# YUB WPanel Cron Jobs — DO NOT EDIT MANUALLY")
+	cronLines = append(cronLines, managedCronHeader)
 	cronLines = append(cronLines, "SHELL=/bin/bash")
 	cronLines = append(cronLines, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 	cronLines = append(cronLines, "")
@@ -99,7 +104,7 @@ func renderCronConfig() TaskResult {
 
 	cronContent := strings.Join(cronLines, "\n") + "\n"
 
-	if err := os.WriteFile(cfg.Paths.CronFile, []byte(cronContent), 0644); err != nil {
+	if err := writeManagedCronFile(cfg.Paths.CronFile, []byte(cronContent)); err != nil {
 		log.Printf("写入Cron文件失败: %v", err)
 		return TaskResult{Success: false, Message: "写入Cron文件失败"}
 	}
@@ -110,6 +115,114 @@ func renderCronConfig() TaskResult {
 	}
 
 	return TaskResult{Success: true, Message: "Cron配置已更新"}
+}
+
+// ValidateManagedCronFileIdentity accepts an absent target or the one exact
+// regular file format owned by this distribution. Production's canonical
+// /etc/cron.d target must be root-owned. Alternate paths are used by tests and
+// must be owned by the current process.
+func ValidateManagedCronFileIdentity(path string) error {
+	path = filepath.Clean(strings.TrimSpace(path))
+	if path == "." || !filepath.IsAbs(path) {
+		return fmt.Errorf("cron identity path is not absolute")
+	}
+
+	expectedUID := uint32(os.Geteuid())
+	if path == managedCronPath {
+		if os.Geteuid() != 0 {
+			return fmt.Errorf("canonical cron identity requires root")
+		}
+		expectedUID = 0
+	}
+	parent := filepath.Dir(path)
+	parentInfo, err := os.Lstat(parent)
+	if err != nil {
+		return fmt.Errorf("inspect cron parent: %w", err)
+	}
+	if !parentInfo.IsDir() || parentInfo.Mode()&os.ModeSymlink != 0 || parentInfo.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("cron parent identity is unsafe")
+	}
+	parentStat, ok := parentInfo.Sys().(*syscall.Stat_t)
+	if !ok || parentStat.Uid != expectedUID {
+		return fmt.Errorf("cron parent ownership is unsafe")
+	}
+
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect cron target: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("cron target identity is unsafe")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != expectedUID || stat.Nlink != 1 {
+		return fmt.Errorf("cron target ownership is unsafe")
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open cron target: %w", err)
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 256), 4096)
+	if !scanner.Scan() || scanner.Text() != managedCronHeader {
+		return fmt.Errorf("cron target is not YUB WPanel managed")
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read cron target: %w", err)
+	}
+	return nil
+}
+
+func writeManagedCronFile(path string, content []byte) (retErr error) {
+	path = filepath.Clean(strings.TrimSpace(path))
+	if len(content) == 0 || !strings.HasPrefix(string(content), managedCronHeader+"\n") {
+		return fmt.Errorf("cron content is missing the ownership marker")
+	}
+	if err := ValidateManagedCronFileIdentity(path); err != nil {
+		return err
+	}
+
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create cron temporary file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		if retErr != nil {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(0o644); err != nil {
+		return fmt.Errorf("set cron temporary permissions: %w", err)
+	}
+	if _, err := tmp.Write(content); err != nil {
+		return fmt.Errorf("write cron temporary file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("sync cron temporary file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close cron temporary file: %w", err)
+	}
+
+	// Re-check immediately before rename. Rename replaces a raced symlink
+	// itself instead of following it, and keeps the update atomic for cron.
+	if err := ValidateManagedCronFileIdentity(path); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("replace cron target: %w", err)
+	}
+	if err := ValidateManagedCronFileIdentity(path); err != nil {
+		return fmt.Errorf("verify replaced cron target: %w", err)
+	}
+	return nil
 }
 
 func executeRunCron(task *Task) TaskResult {

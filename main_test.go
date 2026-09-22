@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -93,5 +94,80 @@ func TestStopWPCoreUpdateWorkerUsesBoundedContext(t *testing.T) {
 	}
 	if elapsed < timeout || elapsed > 500*time.Millisecond {
 		t.Fatalf("shutdown elapsed=%s", elapsed)
+	}
+}
+
+func TestPanelHTTPServerHasBoundedHeadersAndIdleConnections(t *testing.T) {
+	handler := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
+	server := newPanelHTTPServer(":9443", handler)
+	if server.Addr != ":9443" || server.Handler == nil {
+		t.Fatalf("server address/handler not configured: %#v", server)
+	}
+	if server.ReadHeaderTimeout != panelReadHeaderTimeout || server.ReadHeaderTimeout <= 0 {
+		t.Fatalf("ReadHeaderTimeout=%s", server.ReadHeaderTimeout)
+	}
+	if server.IdleTimeout != panelIdleTimeout || server.IdleTimeout <= 0 {
+		t.Fatalf("IdleTimeout=%s", server.IdleTimeout)
+	}
+	if server.MaxHeaderBytes != panelMaxHeaderBytes || server.MaxHeaderBytes <= 0 {
+		t.Fatalf("MaxHeaderBytes=%d", server.MaxHeaderBytes)
+	}
+}
+
+func TestPrivilegedCLIModesPassRuntimeIdentityGate(t *testing.T) {
+	sourceBytes, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(sourceBytes)
+	repair := strings.Index(source, "if *repairConfigCheck {")
+	info := strings.Index(source, "if *showInfo {")
+	watchdogMode := strings.Index(source, `if *updateWatchdog != "" {`)
+	watchdogGate := strings.Index(source, "executor.ValidateUpdateWatchdogDistributionIdentity")
+	gate := strings.Index(source, "executor.ValidateRuntimeDistributionIdentity")
+	systemUpdate := strings.Index(source, `if *systemPackageUpdatePlan != "" {`)
+	databaseRestore := strings.Index(source, `if *panelDBRestorePlan != "" {`)
+	fail2ban := strings.Index(source, `if *banIPNginx != "" || *unbanIPNginx != ""`)
+	watchdogDatabaseOpen := strings.Index(source[watchdogGate:], "database.Open(cfg.SQLite.Path)")
+	if watchdogDatabaseOpen >= 0 {
+		watchdogDatabaseOpen += watchdogGate
+	}
+	watchdogReady := strings.Index(source[watchdogDatabaseOpen:], "executor.SignalUpdateWatchdogReady")
+	if watchdogReady >= 0 {
+		watchdogReady += watchdogDatabaseOpen
+	}
+	watchdogRun := strings.Index(source[watchdogReady:], "executor.RunUpdateWatchdog")
+	if watchdogRun >= 0 {
+		watchdogRun += watchdogReady
+	}
+	databaseOpen := strings.Index(source[gate:], "database.Open(cfg.SQLite.Path)")
+	if databaseOpen >= 0 {
+		databaseOpen += gate
+	}
+	for name, offset := range map[string]int{
+		"repair": repair, "info": info, "watchdog mode": watchdogMode, "watchdog gate": watchdogGate,
+		"watchdog database open": watchdogDatabaseOpen, "watchdog ready": watchdogReady, "watchdog run": watchdogRun,
+		"gate": gate, "system update": systemUpdate,
+		"database restore": databaseRestore, "fail2ban": fail2ban, "database open": databaseOpen,
+	} {
+		if offset < 0 {
+			t.Fatalf("main.go is missing %s path", name)
+		}
+	}
+	if !(repair < info && info < watchdogMode && watchdogMode <= watchdogGate && watchdogGate < watchdogDatabaseOpen && watchdogDatabaseOpen < watchdogReady && watchdogReady < watchdogRun && watchdogRun < gate) {
+		t.Fatalf("read-only/watchdog gate order invalid: repair=%d info=%d watchdog_mode=%d watchdog_gate=%d watchdog_db=%d watchdog_ready=%d watchdog_run=%d gate=%d", repair, info, watchdogMode, watchdogGate, watchdogDatabaseOpen, watchdogReady, watchdogRun, gate)
+	}
+	if !strings.Contains(source[watchdogMode:watchdogGate], "flag.NFlag() != 2") {
+		t.Fatal("update watchdog mode does not reject mixed CLI actions")
+	}
+	for name, offset := range map[string]int{
+		"system update":    systemUpdate,
+		"database restore": databaseRestore,
+		"fail2ban":         fail2ban,
+		"database open":    databaseOpen,
+	} {
+		if gate >= offset {
+			t.Fatalf("runtime gate offset=%d must precede %s offset=%d", gate, name, offset)
+		}
 	}
 }

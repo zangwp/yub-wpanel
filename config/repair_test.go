@@ -119,6 +119,39 @@ func TestCheckRepairConfigRejectsUnsafeFileAndCustomMissingTLS(t *testing.T) {
 	}
 }
 
+func TestCheckRepairConfigRejectsForeignDistributionIdentity(t *testing.T) {
+	tests := []struct {
+		name  string
+		field string
+		old   string
+		new   string
+	}{
+		{name: "cron file", field: "paths.cron_file", old: `"cron_file":"/etc/cron.d/yub_wpanel_cron"`, new: `"cron_file":"/etc/cron.d/foreign_panel_cron"`},
+		{name: "service name", field: "systemd.service_name", old: `"service_name":"yub-wpanel"`, new: `"service_name":"foreign-panel"`},
+		{name: "service path", field: "systemd.service_path", old: `"service_path":"/etc/systemd/system/yub-wpanel.service"`, new: `"service_path":"/etc/systemd/system/foreign-panel.service"`},
+		{name: "binary path", field: "systemd.binary_path", old: `"binary_path":"/usr/local/bin/yub-wpanel"`, new: `"binary_path":"/usr/local/bin/foreign-panel"`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path, original := writeRepairConfig(t, "")
+			foreign := strings.Replace(original, tc.old, tc.new, 1)
+			if foreign == original {
+				t.Fatalf("fixture does not contain %s", tc.old)
+			}
+			if err := os.WriteFile(path, []byte(foreign), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "config_distribution_identity_mismatch: "+tc.field) {
+				t.Fatalf("startup identity error = %v", err)
+			}
+			_, err := CheckRepairConfig(path)
+			if err == nil || !strings.Contains(err.Error(), "config_distribution_identity_mismatch: "+tc.field) {
+				t.Fatalf("identity error = %v", err)
+			}
+		})
+	}
+}
+
 func writeRepairConfig(t *testing.T, panelOverrides string) (string, string) {
 	t.Helper()
 	root := t.TempDir()

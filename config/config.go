@@ -121,5 +121,8 @@ func (c *Config) Validate() error {
 	if c.Admin.Username == "" || c.Admin.PasswordHash == "" {
 		return fmt.Errorf("admin credentials incomplete")
 	}
+	if err := validateDistributionIdentity(c); err != nil {
+		return err
+	}
 	return nil
 }

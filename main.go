@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"math/big"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -31,7 +33,13 @@ var (
 	BuildTime = "unknown"
 )
 
-const wpCoreUpdateWorkerShutdownTimeout = 30 * time.Second
+const (
+	wpCoreUpdateWorkerShutdownTimeout = 30 * time.Second
+	panelHTTPShutdownTimeout          = 30 * time.Second
+	panelReadHeaderTimeout            = 10 * time.Second
+	panelIdleTimeout                  = 2 * time.Minute
+	panelMaxHeaderBytes               = 1 << 20
+)
 
 type wpCoreUpdateWorkerLifecycle interface {
 	Start() error
@@ -63,20 +71,6 @@ func main() {
 	panelDBRestorePlan := flag.String("panel-db-restore-plan", "", "内部使用：执行面板数据库恢复计划")
 	systemPackageUpdatePlan := flag.String("system-package-update-plan", "", "内部使用：执行系统软件包更新计划")
 	flag.Parse()
-	if *systemPackageUpdatePlan != "" {
-		if err := executor.RunSystemPackageUpdatePlan(*systemPackageUpdatePlan); err != nil {
-			log.Printf("系统软件包更新失败: %v", err)
-			os.Exit(1)
-		}
-		return
-	}
-	if *panelDBRestorePlan != "" {
-		if err := executor.RunPanelDBRestorePlan(*panelDBRestorePlan); err != nil {
-			log.Printf("面板数据库恢复失败: %v", err)
-			os.Exit(1)
-		}
-		return
-	}
 
 	if *repairConfigCheck {
 		result, err := config.CheckRepairConfig(*configPath)
@@ -91,17 +85,11 @@ func main() {
 		return
 	}
 
-	if *banIPNginx != "" || *unbanIPNginx != "" || *recordFail2banIP != "" || *unbanFail2banIP != "" {
-		handleFail2banCLI(*configPath, *banIPNginx, *unbanIPNginx, *recordFail2banIP, *unbanFail2banIP, *banJail, *banTime, *banCount, *banRestored)
-		return
-	}
-
-	cfg, err := config.LoadConfig(*configPath)
-	if err != nil {
-		log.Fatalf("加载配置失败: %v", err)
-	}
-
 	if *showInfo {
+		cfg, err := config.LoadConfig(*configPath)
+		if err != nil {
+			log.Fatalf("加载配置失败: %v", err)
+		}
 		fmt.Printf("%s 面板信息\n", config.ProductName)
 		fmt.Println("─────────────────")
 		if BuildTime != "" && BuildTime != "unknown" {
@@ -125,6 +113,57 @@ func main() {
 		return
 	}
 
+	// Every state-changing daemon/CLI mode must prove both the config identity
+	// and the identities of the running executable and managed cron file first.
+	// The signed installer candidate's --info and --repair-config-check paths
+	// above are intentionally read-only exemptions. The update watchdog is the
+	// only non-canonical executable: it is anchored to the protected rollback
+	// plan and old-binary inode before the database or system is touched.
+	cfg, err := config.LoadConfig(*configPath)
+	if err != nil {
+		log.Fatalf("加载配置失败: %v", err)
+	}
+	if *updateWatchdog != "" {
+		if flag.NFlag() != 2 || flag.NArg() != 0 {
+			log.Fatal("更新守护模式只允许 --update-watchdog 与 --config")
+		}
+		if err := executor.ValidateUpdateWatchdogDistributionIdentity(cfg, *configPath, *updateWatchdog); err != nil {
+			log.Fatalf("YUB WPanel更新守护身份校验失败: %v", err)
+		}
+		if err := database.Open(cfg.SQLite.Path); err != nil {
+			log.Fatalf("打开数据库失败: %v", err)
+		}
+		defer database.Close()
+		if err := executor.SignalUpdateWatchdogReady(cfg, *configPath, *updateWatchdog); err != nil {
+			_ = database.Close()
+			log.Fatalf("更新守护就绪握手失败: %v", err)
+		}
+		executor.RunUpdateWatchdog(cfg, *configPath, *updateWatchdog)
+		return
+	}
+	if err := executor.ValidateRuntimeDistributionIdentity(cfg.Systemd.BinaryPath, cfg.Paths.CronFile); err != nil {
+		log.Fatalf("YUB WPanel运行身份校验失败: %v", err)
+	}
+
+	if *systemPackageUpdatePlan != "" {
+		if err := executor.RunSystemPackageUpdatePlan(*systemPackageUpdatePlan); err != nil {
+			log.Printf("系统软件包更新失败: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *panelDBRestorePlan != "" {
+		if err := executor.RunPanelDBRestorePlan(*panelDBRestorePlan); err != nil {
+			log.Printf("面板数据库恢复失败: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *banIPNginx != "" || *unbanIPNginx != "" || *recordFail2banIP != "" || *unbanFail2banIP != "" {
+		handleFail2banCLI(*configPath, *banIPNginx, *unbanIPNginx, *recordFail2banIP, *unbanFail2banIP, *banJail, *banTime, *banCount, *banRestored)
+		return
+	}
+
 	if err := database.Open(cfg.SQLite.Path); err != nil {
 		log.Fatalf("打开数据库失败: %v", err)
 	}
@@ -138,11 +177,6 @@ func main() {
 			log.Print(result.Message)
 			os.Exit(1)
 		}
-		return
-	}
-
-	if *updateWatchdog != "" {
-		executor.RunUpdateWatchdog(cfg, *updateWatchdog)
 		return
 	}
 
@@ -172,7 +206,7 @@ func main() {
 		log.Printf("AI 开发授权中间状态恢复失败（相关网站将继续保持操作门禁）: %v", err)
 	}
 	executor.ResetStuckImageOptimizationJobs()
-	executor.FinalizePendingPanelUpdate(cfg, Version)
+	executor.FinalizePendingPanelUpdate(cfg, *configPath, Version)
 	executor.SetAIDevelopmentPanelVersion(Version)
 	if err := aiDevelopmentService.RefreshEnabledHandoffs(context.Background()); err != nil {
 		log.Printf("AI 开发服务器交接文档刷新失败: %v", err)
@@ -357,29 +391,43 @@ func main() {
 	}()
 
 	r := router.SetupRouter(cfg, TemplatesFS, StaticFS, Version, *configPath)
-
-	if cfg.Panel.TLSPort > 0 && cfg.Panel.TLSCertPath != "" && cfg.Panel.TLSKeyPath != "" {
-		go func() {
-			addr := fmt.Sprintf(":%d", cfg.Panel.TLSPort)
-			log.Printf("%s 启动于端口 %d (HTTPS)", config.ProductName, cfg.Panel.TLSPort)
-			if err := r.RunTLS(addr, cfg.Panel.TLSCertPath, cfg.Panel.TLSKeyPath); err != nil {
-				log.Fatalf("HTTPS 服务启动失败: %v", err)
-			}
-		}()
-	} else {
-		go func() {
-			addr := fmt.Sprintf(":%d", cfg.Panel.Port)
-			log.Printf("%s 启动于端口 %d（HTTP，未配置TLS）", config.ProductName, cfg.Panel.Port)
-			if err := r.Run(addr); err != nil {
-				log.Fatalf("HTTP 服务启动失败: %v", err)
-			}
-		}()
+	useTLS := cfg.Panel.TLSPort > 0 && cfg.Panel.TLSCertPath != "" && cfg.Panel.TLSKeyPath != ""
+	port := cfg.Panel.Port
+	if useTLS {
+		port = cfg.Panel.TLSPort
 	}
+	server := newPanelHTTPServer(fmt.Sprintf(":%d", port), r)
+	serverErr := make(chan error, 1)
+	go func() {
+		if useTLS {
+			log.Printf("%s 启动于端口 %d (HTTPS)", config.ProductName, port)
+			serverErr <- server.ListenAndServeTLS(cfg.Panel.TLSCertPath, cfg.Panel.TLSKeyPath)
+			return
+		}
+		log.Printf("%s 启动于端口 %d（HTTP，未配置TLS）", config.ProductName, port)
+		serverErr <- server.ListenAndServe()
+	}()
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-	log.Println("正在关闭面板...")
+	defer signal.Stop(quit)
+	var serveErr error
+	select {
+	case <-quit:
+		log.Println("正在关闭面板...")
+		ctx, cancel := context.WithTimeout(context.Background(), panelHTTPShutdownTimeout)
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("HTTP 服务优雅关闭超时: %v", err)
+			_ = server.Close()
+		}
+		cancel()
+	case serveErr = <-serverErr:
+		if errors.Is(serveErr, http.ErrServerClosed) {
+			serveErr = nil
+		} else {
+			log.Printf("面板 HTTP 服务异常退出: %v", serveErr)
+		}
+	}
 	executor.GlobalAdminer.DisableAll()
 	executor.StopAllImageOptimizationJobsForShutdown(wpCoreUpdateWorkerShutdownTimeout)
 	if migrationWorker != nil {
@@ -405,6 +453,19 @@ func main() {
 		}
 	}
 	executor.StopWPSecurityEventIngestor()
+	if serveErr != nil {
+		log.Fatalf("面板服务启动失败: %v", serveErr)
+	}
+}
+
+func newPanelHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: panelReadHeaderTimeout,
+		IdleTimeout:       panelIdleTimeout,
+		MaxHeaderBytes:    panelMaxHeaderBytes,
+	}
 }
 
 func startWPCoreUpdateWorker(cfg *config.Config, factory wpCoreUpdateWorkerFactory) (wpCoreUpdateWorkerLifecycle, error) {

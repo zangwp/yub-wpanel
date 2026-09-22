@@ -18,6 +18,8 @@ CONFIG_FILE="$INSTALL_DIR/config.json"
 DB_PATH="$INSTALL_DIR/panel.db"
 BIN_PATH="/usr/local/bin/yub-wpanel"
 SERVICE_PATH="/etc/systemd/system/yub-wpanel.service"
+CRON_PATH="/etc/cron.d/yub_wpanel_cron"
+LICENSE_DOC_DIR="/usr/share/doc/yub-wpanel"
 PANEL_PORT=8888
 MYSQL_PASS=""
 GHPROXY="${YUB_WPANEL_GITHUB_PROXY:-}"
@@ -27,12 +29,44 @@ REPAIR_MODE=false
 REPAIR_BACKUP_DIR=""
 REPAIR_SERVICE_WAS_ACTIVE=false
 REPAIR_COMMITTED=false
+INSTALL_WORKDIR=""
 PANEL_CANDIDATE=""
+PANEL_SHA256_FILE=""
+PANEL_SIGNATURE_FILE=""
+LICENSE_ARCHIVE=""
+LICENSE_SHA256_FILE=""
+LICENSE_SIGNATURE_FILE=""
+PROJECT_LICENSE_FILE=""
+PROJECT_NOTICE_FILE=""
+THIRD_PARTY_NOTICE_FILE=""
+LICENSE_RELEASE_VERSION_FILE=""
+PANEL_CANDIDATE_VERIFIED=false
 REPAIR_BIN_EXISTED=false
 REPAIR_UNIT_EXISTED=false
 REPAIR_TLS_EXISTED=false
 REPAIR_DB_EXISTED=false
 REPAIR_MUTATED=false
+ATOMIC_STAGE_PATH=""
+# The signed bootstrap validates this marker before it delegates execution.
+# shellcheck disable=SC2034
+RELEASE_PUBLIC_KEY_HEX="7351099720eeaf147f4894bc313a5456c01bbd29ad7d401ab6869bc7f7f92af5"
+INSTALLER_RELEASE_VERSION="__YUB_WPANEL_RELEASE_VERSION__"
+MIN_PANEL_VERSION="v2.0.1"
+DEBSURY_KEYRING_PACKAGE="debsuryorg-archive-keyring"
+DEBSURY_KEYRING_VERSION="2025.11.18"
+DEBSURY_KEYRING_SHA256="7511384559c9ddf1d5ce5f60be429ae9d4e7d01d9480d6f1b7a30c0810cf8b60"
+PANEL_ASSET_MAX_BYTES=$((256 * 1024 * 1024))
+CHECKSUM_ASSET_MAX_BYTES=$((4 * 1024))
+SIGNATURE_ASSET_MAX_BYTES=64
+LICENSE_ARCHIVE_MAX_BYTES=$((64 * 1024 * 1024))
+PHP_KEYRING_MAX_BYTES=$((1 * 1024 * 1024))
+WORDPRESS_ZIP_MAX_BYTES=$((256 * 1024 * 1024))
+PUBLIC_IP_MAX_BYTES=$((4 * 1024))
+# SubjectPublicKeyInfo PEM derived from RELEASE_PUBLIC_KEY_HEX. Keeping the raw
+# key above makes key rotation and cross-checking with the application explicit.
+RELEASE_PUBLIC_KEY_PEM='-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAc1EJlyDurxR/SJS8MTpUVsAbvSmtfUAatoabx/f5KvU=
+-----END PUBLIC KEY-----'
 
 if [[ "${YUB_WPANEL_PREFER_CN_MIRROR:-0}" == "1" ]] || [[ "${YUB_WPANEL_PREFER_CN_MIRROR:-}" == "true" ]]; then
     PREFER_CN=true
@@ -41,6 +75,110 @@ fi
 log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+
+assert_supported_platform() {
+    local os_id=""
+    local version_id=""
+    local machine=""
+    local dpkg_arch=""
+    local platform_cmd=""
+
+    for platform_cmd in dpkg head sed tr uname; do
+        command -v "$platform_cmd" >/dev/null 2>&1 || log_error "缺少平台检测命令: ${platform_cmd}"
+    done
+    [[ -r /etc/os-release ]] || log_error "无法读取 /etc/os-release；仅支持 Debian 13 amd64"
+    os_id=$(sed -n 's/^ID=//p' /etc/os-release | head -n 1 | tr -d '"')
+    version_id=$(sed -n 's/^VERSION_ID=//p' /etc/os-release | head -n 1 | tr -d '"')
+    machine=$(uname -m 2>/dev/null || true)
+    dpkg_arch=$(dpkg --print-architecture 2>/dev/null || true)
+
+    [[ "$os_id" == "debian" ]] || log_error "此脚本仅支持 Debian 13，当前系统: ${os_id:-unknown}"
+    [[ "$version_id" == "13" ]] || log_error "此脚本仅支持 Debian 13，当前版本: ${version_id:-unknown}"
+    case "$machine" in
+        x86_64|amd64) ;;
+        *) log_error "当前只发布 amd64/x86_64 二进制，检测到架构: ${machine:-unknown}" ;;
+    esac
+    [[ "$dpkg_arch" == "amd64" ]] || \
+        log_error "当前只支持 Debian amd64 用户空间，检测到 dpkg 架构: ${dpkg_arch:-unknown}"
+}
+
+init_install_workdir() {
+    local required_cmd=""
+    local previous_umask=""
+
+    for required_cmd in awk chmod cmp dpkg-deb find flock grep head install mktemp mv openssl readlink rm sed sha256sum stat sync systemctl systemd-analyze tar timeout tr uname wc; do
+        command -v "$required_cmd" >/dev/null 2>&1 || log_error "缺少安装安全预检命令: ${required_cmd}"
+    done
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        log_error "缺少下载工具：请先安装 curl 或 wget"
+    fi
+
+    previous_umask=$(umask)
+    umask 077
+    INSTALL_WORKDIR=$(mktemp -d /tmp/yub-wpanel-install.XXXXXXXXXX) || \
+        log_error "无法创建安装临时工作目录"
+    chmod 0700 "$INSTALL_WORKDIR"
+    umask "$previous_umask"
+    PANEL_CANDIDATE="$INSTALL_WORKDIR/yub-wpanel"
+    PANEL_SHA256_FILE="$INSTALL_WORKDIR/yub-wpanel.sha256"
+    PANEL_SIGNATURE_FILE="$INSTALL_WORKDIR/yub-wpanel.sha256.sig"
+    LICENSE_ARCHIVE="$INSTALL_WORKDIR/yub-wpanel-third-party-licenses.tar.gz"
+    LICENSE_SHA256_FILE="$INSTALL_WORKDIR/yub-wpanel-third-party-licenses.tar.gz.sha256"
+    LICENSE_SIGNATURE_FILE="$INSTALL_WORKDIR/yub-wpanel-third-party-licenses.tar.gz.sha256.sig"
+    PROJECT_LICENSE_FILE="$INSTALL_WORKDIR/LICENSE"
+    PROJECT_NOTICE_FILE="$INSTALL_WORKDIR/NOTICE.md"
+    THIRD_PARTY_NOTICE_FILE="$INSTALL_WORKDIR/THIRD_PARTY_NOTICES.md"
+    LICENSE_RELEASE_VERSION_FILE="$INSTALL_WORKDIR/RELEASE_VERSION"
+}
+
+cleanup_install_workdir() {
+    [[ -n "$INSTALL_WORKDIR" ]] || return 0
+    case "$INSTALL_WORKDIR" in
+        /tmp/yub-wpanel-install.??????????)
+            [[ -d "$INSTALL_WORKDIR" ]] && rm -rf -- "$INSTALL_WORKDIR"
+            ;;
+        *)
+            log_warn "拒绝清理异常临时目录路径: $INSTALL_WORKDIR"
+            ;;
+    esac
+}
+
+cleanup_atomic_stage_file() {
+	[[ -n "$ATOMIC_STAGE_PATH" ]] || return 0
+	case "$ATOMIC_STAGE_PATH" in
+		/usr/local/bin/.yub-wpanel.yub-install.????????|/www/server/panel/.panel.db.yub-install.????????)
+			rm -f -- "$ATOMIC_STAGE_PATH"
+			;;
+		*)
+			log_warn "拒绝清理异常原子暂存文件路径: $ATOMIC_STAGE_PATH"
+			;;
+	esac
+	ATOMIC_STAGE_PATH=""
+}
+
+installer_exit() {
+    local exit_code=$?
+    set +e
+    if [[ $exit_code -ne 0 ]]; then
+        repair_rollback
+    fi
+	cleanup_atomic_stage_file
+    cleanup_install_workdir
+    if [[ $exit_code -ne 0 ]]; then
+        echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "${RED}  安装未完成 / Installation incomplete${NC}"
+        echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "  请先保存本次终端完整输出，不要在未定位原因前直接重装系统。"
+        echo -e "  优先检查：网络/DNS 与系统时间、APT 错误、发行包哈希/签名、Debian 13 amd64 平台检测，以及现有服务冲突。"
+        echo -e "  可结合 ${BOLD}journalctl -u yub-wpanel -n 100 --no-pager${NC} 和 APT 输出排查，再携带已脱敏日志提交 GitHub Issue。"
+        echo -e "  Save the complete terminal output first. Check networking/DNS, system time, APT, release hash/signature, platform validation, and existing service conflicts before considering an OS reinstall."
+        echo ""
+        echo -e "  GitHub: https://github.com/zangwp/yub-wpanel/issues"
+        echo ""
+    fi
+    trap - EXIT
+    exit "$exit_code"
+}
 
 systemctl_enable_best_effort() {
     local svc="$1"
@@ -153,8 +291,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# 异常退出时显示友好反馈提示
-trap 'e=$?; rm -f "${PANEL_CANDIDATE:-}"; if [[ $e -ne 0 ]]; then repair_rollback; echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"; echo -e "${RED}  安装未完成 / Installation incomplete${NC}"; echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"; echo -e "  安装失败通常与系统环境不纯净有关。"; echo -e "  Installation failures are commonly caused by a non-clean system environment."; echo -e "  建议使用纯净版 Debian 13 重装系统后再安装，或通过 GitHub Issues 提交错误信息。"; echo -e "  Please retry on a clean Debian 13 system, or report the error through GitHub Issues."; echo ""; echo -e "  GitHub: https://github.com/zangwp/yub-wpanel/issues"; echo ""; fi' EXIT
+# 异常退出时回滚 repair，并只清理由 mktemp 创建的本次工作目录。
+trap installer_exit EXIT
 
 # ============================================================
 # PHP 8.3 源选择（官方源 + 国内镜像多重兜底）
@@ -183,47 +321,501 @@ set_php_source_meta() {
     esac
 }
 
+file_size_within_limit() {
+    local path="$1"
+    local max_bytes="$2"
+    local actual_bytes=""
+
+    [[ "$max_bytes" =~ ^[1-9][0-9]*$ ]] || return 1
+    [[ -f "$path" ]] && [[ ! -L "$path" ]] || return 1
+    actual_bytes=$(stat -c '%s' -- "$path" 2>/dev/null) || return 1
+    [[ "$actual_bytes" =~ ^[0-9]+$ ]] || return 1
+    (( actual_bytes > 0 && actual_bytes <= max_bytes ))
+}
+
 download_file() {
     local url="$1"
     local output="$2"
-    local timeout="${3:-30}"
+    local total_timeout="${3:-120}"
+    local max_bytes="${4:-0}"
+    local connect_timeout=15
+
+    [[ "$max_bytes" =~ ^[1-9][0-9]*$ ]] || return 1
+    if [[ "$total_timeout" -lt "$connect_timeout" ]]; then
+        connect_timeout="$total_timeout"
+    fi
 
     rm -f "$output"
     if command -v curl &>/dev/null; then
-        curl -fsSL --connect-timeout "$timeout" -o "$output" "$url" 2>/dev/null && [[ -s "$output" ]] && return 0
+        if timeout "${total_timeout}s" curl -q -fsSL \
+            --proto '=https' \
+            --proto-redir '=https' \
+            --connect-timeout "$connect_timeout" \
+            --max-time "$total_timeout" \
+            --max-filesize "$max_bytes" \
+            --speed-limit 1024 \
+            --speed-time 30 \
+            --retry 3 \
+            --retry-delay 2 \
+            --retry-all-errors \
+            "$url" 2>/dev/null | head -c "$((max_bytes + 1))" > "$output"; then
+            file_size_within_limit "$output" "$max_bytes" && return 0
+        fi
+        rm -f "$output"
     fi
     if command -v wget &>/dev/null; then
-        wget -q -T "$timeout" -O "$output" "$url" 2>/dev/null && [[ -s "$output" ]] && return 0
+        if timeout "${total_timeout}s" wget --no-config -q --https-only --no-hsts \
+            --connect-timeout="$connect_timeout" \
+            --read-timeout=30 \
+            --tries=3 \
+            --retry-connrefused \
+            --waitretry=2 \
+            -O - "$url" 2>/dev/null | head -c "$((max_bytes + 1))" > "$output"; then
+            file_size_within_limit "$output" "$max_bytes" && return 0
+        fi
+        rm -f "$output"
     fi
     rm -f "$output"
     return 1
 }
 
+verify_signed_release_asset() {
+    local asset_file="$1"
+    local sha_file="$2"
+    local sig_file="$3"
+    local expected_name="$4"
+    local asset_max_bytes="$5"
+    local public_key_file="$INSTALL_WORKDIR/release-public-key.pem"
+    local expected_sha=""
+    local signed_name=""
+    local extra_field=""
+    local actual_sha=""
+    local nonempty_lines=""
+
+    file_size_within_limit "$asset_file" "$asset_max_bytes" || return 1
+    file_size_within_limit "$sha_file" "$CHECKSUM_ASSET_MAX_BYTES" || return 1
+    file_size_within_limit "$sig_file" "$SIGNATURE_ASSET_MAX_BYTES" || return 1
+    [[ "$(wc -c < "$sig_file" | tr -d '[:space:]')" == "64" ]] || return 1
+
+    printf '%s\n' "$RELEASE_PUBLIC_KEY_PEM" > "$public_key_file"
+    chmod 0600 "$public_key_file"
+    openssl pkeyutl -verify -pubin -inkey "$public_key_file" -rawin \
+        -in "$sha_file" -sigfile "$sig_file" >/dev/null 2>&1 || return 1
+
+    nonempty_lines=$(awk 'NF {count++} END {print count+0}' "$sha_file")
+    [[ "$nonempty_lines" == "1" ]] || return 1
+    read -r expected_sha signed_name extra_field < "$sha_file" || return 1
+    [[ -z "$extra_field" ]] || return 1
+    [[ "$expected_sha" =~ ^[0-9a-fA-F]{64}$ ]] || return 1
+    [[ "$signed_name" == "$expected_name" ]] || return 1
+
+    actual_sha=$(sha256sum "$asset_file" | awk '{print $1}') || return 1
+    [[ "${actual_sha,,}" == "${expected_sha,,}" ]] || return 1
+}
+
+verify_panel_release_bundle() {
+    verify_signed_release_asset "$1" "$2" "$3" "yub-wpanel" "$PANEL_ASSET_MAX_BYTES"
+}
+
+verify_license_release_bundle() {
+    local archive_file="$1"
+    local sha_file="$2"
+    local sig_file="$3"
+    local listing_file="$INSTALL_WORKDIR/license-archive.list"
+    local archive_member=""
+    local normalized_member=""
+    local required_member=""
+    local archive_release_version=""
+
+    verify_signed_release_asset \
+        "$archive_file" "$sha_file" "$sig_file" \
+        "yub-wpanel-third-party-licenses.tar.gz" "$LICENSE_ARCHIVE_MAX_BYTES" || return 1
+    tar -tzf "$archive_file" > "$listing_file" 2>/dev/null || return 1
+    [[ -s "$listing_file" ]] || return 1
+    while IFS= read -r archive_member; do
+        [[ -n "$archive_member" ]] || return 1
+        [[ "$archive_member" == ./* ]] || return 1
+        [[ "$archive_member" != *\\* ]] || return 1
+        [[ "$archive_member" == "./" ]] && continue
+        normalized_member="${archive_member#./}"
+        [[ -n "$normalized_member" ]] || return 1
+        [[ ! "/$normalized_member/" =~ /\.\.?/ ]] || return 1
+    done < "$listing_file"
+    for required_member in \
+        ./LICENSE \
+        ./NOTICE.md \
+        ./THIRD_PARTY_NOTICES.md \
+        ./RELEASE_VERSION \
+        ./go-toolchain/LICENSE \
+        ./go-toolchain/VERSION \
+        ./adminer-6.0.1/LICENSE-APACHE-2.0.txt \
+        ./adminer-6.0.1/NOTICE.txt; do
+        [[ "$(grep -Fxc -- "$required_member" "$listing_file")" == "1" ]] || return 1
+    done
+
+    tar -xOzf "$archive_file" ./RELEASE_VERSION > "$LICENSE_RELEASE_VERSION_FILE" 2>/dev/null || return 1
+    [[ "$(wc -l < "$LICENSE_RELEASE_VERSION_FILE" | tr -d '[:space:]')" == "1" ]] || return 1
+    archive_release_version=$(cat "$LICENSE_RELEASE_VERSION_FILE") || return 1
+    [[ "$archive_release_version" == "$INSTALLER_RELEASE_VERSION" ]] || return 1
+    tar -xOzf "$archive_file" ./LICENSE > "$PROJECT_LICENSE_FILE" 2>/dev/null || return 1
+    tar -xOzf "$archive_file" ./NOTICE.md > "$PROJECT_NOTICE_FILE" 2>/dev/null || return 1
+    tar -xOzf "$archive_file" ./THIRD_PARTY_NOTICES.md > "$THIRD_PARTY_NOTICE_FILE" 2>/dev/null || return 1
+    [[ -s "$PROJECT_LICENSE_FILE" ]] || return 1
+    [[ -s "$PROJECT_NOTICE_FILE" ]] || return 1
+    [[ -s "$THIRD_PARTY_NOTICE_FILE" ]] || return 1
+    chmod 0600 "$PROJECT_LICENSE_FILE" "$PROJECT_NOTICE_FILE" "$THIRD_PARTY_NOTICE_FILE"
+}
+
+verify_complete_release_bundle() {
+    verify_panel_release_bundle \
+        "$PANEL_CANDIDATE" "$PANEL_SHA256_FILE" "$PANEL_SIGNATURE_FILE" &&
+    verify_license_release_bundle \
+        "$LICENSE_ARCHIVE" "$LICENSE_SHA256_FILE" "$LICENSE_SIGNATURE_FILE"
+}
+
+validate_installer_release_version() {
+    [[ "$INSTALLER_RELEASE_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] &&
+        panel_version_at_least "$INSTALLER_RELEASE_VERSION" "$MIN_PANEL_VERSION"
+}
+
+preflight_panel_candidate() {
+    local preflight_config="$INSTALL_WORKDIR/preflight-config.json"
+    local preflight_output="$INSTALL_WORKDIR/preflight-info.txt"
+    local candidate_version=""
+
+    cat > "$preflight_config" << PREFLIGHTEOF
+{
+  "panel": {
+    "port": 8888,
+    "tls_port": 8443,
+    "random_suffix": "installer-preflight",
+    "data_dir": "$INSTALL_WORKDIR",
+    "backup_dir": "$INSTALL_WORKDIR",
+    "log_dir": "$INSTALL_WORKDIR"
+  },
+  "sqlite": {"path": "$INSTALL_WORKDIR/preflight.db"},
+  "mariadb": {"root_password": "installer-preflight-only"},
+  "admin": {"username": "preflight", "password_hash": "preflight"},
+  "paths": {"cron_file": "/etc/cron.d/yub_wpanel_cron"},
+  "systemd": {
+    "service_name": "yub-wpanel",
+    "service_path": "/etc/systemd/system/yub-wpanel.service",
+    "binary_path": "/usr/local/bin/yub-wpanel"
+  }
+}
+PREFLIGHTEOF
+    chmod 0600 "$preflight_config"
+    chmod 0700 "$PANEL_CANDIDATE"
+    timeout 20s "$PANEL_CANDIDATE" --info --config "$preflight_config" \
+        > "$preflight_output" 2>&1 || return 1
+    grep -q "YUB WPanel" "$preflight_output" || return 1
+    candidate_version=$(sed -n 's/^版本: \(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)\([[:space:]].*\)\{0,1\}$/\1/p' "$preflight_output")
+    [[ $(printf '%s\n' "$candidate_version" | awk 'NF {count++} END {print count+0}') == "1" ]] || return 1
+    panel_version_at_least "$candidate_version" "$MIN_PANEL_VERSION" || return 1
+    [[ "$candidate_version" == "$INSTALLER_RELEASE_VERSION" ]] || return 1
+}
+
+panel_version_at_least() {
+    [[ "$1" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || return 1
+    [[ "$2" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || return 1
+    local actual="${1#v}"
+    local minimum="${2#v}"
+    local actual_major="" actual_minor="" actual_patch=""
+    local minimum_major="" minimum_minor="" minimum_patch=""
+
+    [[ "$actual" =~ ^([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})$ ]] || return 1
+    actual_major="${BASH_REMATCH[1]}"
+    actual_minor="${BASH_REMATCH[2]}"
+    actual_patch="${BASH_REMATCH[3]}"
+    [[ "$minimum" =~ ^([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})$ ]] || return 1
+    minimum_major="${BASH_REMATCH[1]}"
+    minimum_minor="${BASH_REMATCH[2]}"
+    minimum_patch="${BASH_REMATCH[3]}"
+
+    (( 10#$actual_major > 10#$minimum_major )) && return 0
+    (( 10#$actual_major < 10#$minimum_major )) && return 1
+    (( 10#$actual_minor > 10#$minimum_minor )) && return 0
+    (( 10#$actual_minor < 10#$minimum_minor )) && return 1
+    (( 10#$actual_patch >= 10#$minimum_patch ))
+}
+
+write_panel_service_unit() {
+    local target="$1"
+    local mode="$2"
+
+    cat > "$target" << SYSTEMDEOF
+[Unit]
+Description=WordPress Server Management Panel
+After=network.target mariadb.service redis-server.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=$BIN_PATH --config=$CONFIG_FILE
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=yub-wpanel
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+SYSTEMDEOF
+    chmod "$mode" "$target"
+}
+
+validate_repair_service_unit() {
+    local expected_unit="$INSTALL_WORKDIR/expected-yub-wpanel.service"
+    local unit_owner=""
+    local unit_mode=""
+    local unit_links=""
+
+    [[ -f "$SERVICE_PATH" ]] && [[ ! -L "$SERVICE_PATH" ]] || return 1
+    unit_owner=$(stat -c '%u' "$SERVICE_PATH" 2>/dev/null) || return 1
+    unit_mode=$(stat -c '%a' "$SERVICE_PATH" 2>/dev/null) || return 1
+    unit_links=$(stat -c '%h' "$SERVICE_PATH" 2>/dev/null) || return 1
+    [[ "$unit_owner" == "0" ]] || return 1
+    [[ "$unit_links" == "1" ]] || return 1
+    [[ "$unit_mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#$unit_mode & 0022) == 0 )) || return 1
+
+    write_panel_service_unit "$expected_unit" 0600 || return 1
+    cmp -s -- "$expected_unit" "$SERVICE_PATH" || return 1
+
+    validate_no_panel_service_dropins || return 1
+    systemctl daemon-reload >/dev/null 2>&1 || return 1
+    validate_effective_panel_service_unit
+}
+
+validate_existing_panel_binary() {
+    local binary_owner=""
+    local binary_mode=""
+    local binary_links=""
+    local binary_path=""
+
+    [[ -f "$BIN_PATH" ]] && [[ ! -L "$BIN_PATH" ]] && [[ -s "$BIN_PATH" ]] && [[ -x "$BIN_PATH" ]] || return 1
+    binary_owner=$(stat -c '%u' "$BIN_PATH" 2>/dev/null) || return 1
+    binary_mode=$(stat -c '%a' "$BIN_PATH" 2>/dev/null) || return 1
+    binary_links=$(stat -c '%h' "$BIN_PATH" 2>/dev/null) || return 1
+    binary_path=$(readlink -f -- "$BIN_PATH" 2>/dev/null) || return 1
+    [[ "$binary_owner" == "0" ]] || return 1
+    [[ "$binary_mode" == "755" ]] || return 1
+    [[ "$binary_links" == "1" ]] || return 1
+    [[ "$binary_path" == "$BIN_PATH" ]]
+}
+
+validate_no_panel_service_dropins() {
+    local unit_paths=""
+    local unit_dir=""
+    local dropin_name=""
+    local dropin_dir=""
+
+    unit_paths=$(systemd-analyze unit-paths 2>/dev/null) || return 1
+    [[ -n "$unit_paths" ]] || return 1
+
+    # systemd applies exact-name, dash-truncated and type-wide drop-ins from
+    # every configured unit load path (including *.control, transient and
+    # generator paths). Reject any effective source rather than maintaining a
+    # hand-written partial directory list.
+    while IFS= read -r unit_dir; do
+        [[ -n "$unit_dir" ]] || continue
+        for dropin_name in yub-wpanel.service.d yub-.service.d service.d; do
+            dropin_dir="${unit_dir%/}/${dropin_name}"
+            if [[ -e "$dropin_dir" ]] || [[ -L "$dropin_dir" ]]; then
+                [[ -d "$dropin_dir" ]] && [[ ! -L "$dropin_dir" ]] || return 1
+                if find "$dropin_dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | grep -q .; then
+                    return 1
+                fi
+            fi
+        done
+    done <<< "$unit_paths"
+}
+
+validate_effective_panel_service_unit() {
+    local load_state=""
+    local fragment_path=""
+    local dropin_paths=""
+    local exec_start=""
+    local expected_exec_prefix="{ path=$BIN_PATH ; argv[]=$BIN_PATH --config=$CONFIG_FILE ; "
+
+    load_state=$(systemctl show yub-wpanel.service --property=LoadState --value 2>/dev/null) || return 1
+    fragment_path=$(systemctl show yub-wpanel.service --property=FragmentPath --value 2>/dev/null) || return 1
+    dropin_paths=$(systemctl show yub-wpanel.service --property=DropInPaths --value 2>/dev/null) || return 1
+    exec_start=$(systemctl show yub-wpanel.service --property=ExecStart --value 2>/dev/null) || return 1
+
+    [[ "$load_state" == "loaded" ]] || return 1
+    [[ "$fragment_path" == "$SERVICE_PATH" ]] || return 1
+    [[ -z "${dropin_paths//[[:space:]]/}" ]] || return 1
+    [[ "$exec_start" == "$expected_exec_prefix"* ]] || return 1
+    [[ "$exec_start" != *"} {"* ]] || return 1
+}
+
+validate_running_panel_service_identity() {
+    local main_pid=""
+    local running_executable=""
+    local installed_executable=""
+
+    [[ -f "$BIN_PATH" ]] && [[ ! -L "$BIN_PATH" ]] || return 1
+    installed_executable=$(readlink -f -- "$BIN_PATH" 2>/dev/null) || return 1
+    [[ "$installed_executable" == "$BIN_PATH" ]] || return 1
+
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        main_pid=$(systemctl show yub-wpanel.service --property=MainPID --value 2>/dev/null || true)
+        if [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] && [[ -e "/proc/${main_pid}/exe" ]]; then
+            running_executable=$(readlink -- "/proc/${main_pid}/exe" 2>/dev/null || true)
+            if [[ "$running_executable" == "$BIN_PATH" ]]; then
+                return 0
+            fi
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+validate_existing_panel_cron_file() {
+	local cron_parent="${CRON_PATH%/*}"
+	local parent_owner=""
+	local parent_mode=""
+    local cron_owner=""
+    local cron_mode=""
+    local cron_links=""
+    local first_line=""
+
+	[[ -d "$cron_parent" ]] && [[ ! -L "$cron_parent" ]] || return 1
+	parent_owner=$(stat -c '%u' "$cron_parent" 2>/dev/null) || return 1
+	parent_mode=$(stat -c '%a' "$cron_parent" 2>/dev/null) || return 1
+	[[ "$parent_owner" == "0" ]] || return 1
+	[[ "$parent_mode" =~ ^[0-7]{3,4}$ ]] || return 1
+	(( (8#$parent_mode & 0022) == 0 )) || return 1
+
+    if [[ ! -e "$CRON_PATH" ]] && [[ ! -L "$CRON_PATH" ]]; then
+        return 0
+    fi
+    [[ -f "$CRON_PATH" ]] && [[ ! -L "$CRON_PATH" ]] || return 1
+    cron_owner=$(stat -c '%u' "$CRON_PATH" 2>/dev/null) || return 1
+    cron_mode=$(stat -c '%a' "$CRON_PATH" 2>/dev/null) || return 1
+    cron_links=$(stat -c '%h' "$CRON_PATH" 2>/dev/null) || return 1
+    [[ "$cron_owner" == "0" ]] || return 1
+    [[ "$cron_links" == "1" ]] || return 1
+    [[ "$cron_mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#$cron_mode & 0022) == 0 )) || return 1
+    IFS= read -r first_line < "$CRON_PATH" || return 1
+    [[ "$first_line" == "# YUB WPanel Cron Jobs — DO NOT EDIT MANUALLY" ]]
+}
+
+validate_fresh_panel_cron_location() {
+	local cron_parent="${CRON_PATH%/*}"
+	local nearest_parent="$cron_parent"
+	local parent_owner=""
+	local parent_mode=""
+	local next_parent=""
+
+	if [[ -e "$cron_parent" ]] || [[ -L "$cron_parent" ]]; then
+		validate_existing_panel_cron_file
+		return
+	fi
+	# Minimal Debian images may not have /etc/cron.d until cron-daemon-common is
+	# installed. Reject broken links and validate the nearest existing parent;
+	# after package installation the exact /etc/cron.d directory is rechecked.
+	while [[ ! -e "$nearest_parent" ]]; do
+		[[ ! -L "$nearest_parent" ]] || return 1
+		next_parent="${nearest_parent%/*}"
+		[[ -n "$next_parent" ]] && [[ "$next_parent" != "$nearest_parent" ]] || return 1
+		nearest_parent="$next_parent"
+	done
+	[[ -d "$nearest_parent" ]] && [[ ! -L "$nearest_parent" ]] || return 1
+	parent_owner=$(stat -c '%u' "$nearest_parent" 2>/dev/null) || return 1
+	parent_mode=$(stat -c '%a' "$nearest_parent" 2>/dev/null) || return 1
+	[[ "$parent_owner" == "0" ]] || return 1
+	[[ "$parent_mode" =~ ^[0-7]{3,4}$ ]] || return 1
+	(( (8#$parent_mode & 0022) == 0 ))
+}
+
+copy_local_release_bundle() {
+    local script_dir="$1"
+
+    file_size_within_limit "$script_dir/yub-wpanel" "$PANEL_ASSET_MAX_BYTES" || return 1
+    file_size_within_limit "$script_dir/yub-wpanel.sha256" "$CHECKSUM_ASSET_MAX_BYTES" || return 1
+    file_size_within_limit "$script_dir/yub-wpanel.sha256.sig" "$SIGNATURE_ASSET_MAX_BYTES" || return 1
+    file_size_within_limit "$script_dir/yub-wpanel-third-party-licenses.tar.gz" "$LICENSE_ARCHIVE_MAX_BYTES" || return 1
+    file_size_within_limit "$script_dir/yub-wpanel-third-party-licenses.tar.gz.sha256" "$CHECKSUM_ASSET_MAX_BYTES" || return 1
+    file_size_within_limit "$script_dir/yub-wpanel-third-party-licenses.tar.gz.sha256.sig" "$SIGNATURE_ASSET_MAX_BYTES" || return 1
+    install -m 0600 "$script_dir/yub-wpanel" "$PANEL_CANDIDATE"
+    install -m 0600 "$script_dir/yub-wpanel.sha256" "$PANEL_SHA256_FILE"
+    install -m 0600 "$script_dir/yub-wpanel.sha256.sig" "$PANEL_SIGNATURE_FILE"
+    install -m 0600 "$script_dir/yub-wpanel-third-party-licenses.tar.gz" "$LICENSE_ARCHIVE"
+    install -m 0600 "$script_dir/yub-wpanel-third-party-licenses.tar.gz.sha256" "$LICENSE_SHA256_FILE"
+    install -m 0600 "$script_dir/yub-wpanel-third-party-licenses.tar.gz.sha256.sig" "$LICENSE_SIGNATURE_FILE"
+}
+
+download_release_bundle() {
+    local release_base_url="$1"
+    local binary_url="${release_base_url}/yub-wpanel"
+    local license_url="${release_base_url}/yub-wpanel-third-party-licenses.tar.gz"
+
+    rm -f \
+        "$PANEL_CANDIDATE" "$PANEL_SHA256_FILE" "$PANEL_SIGNATURE_FILE" \
+        "$LICENSE_ARCHIVE" "$LICENSE_SHA256_FILE" "$LICENSE_SIGNATURE_FILE"
+    download_file "$binary_url" "$PANEL_CANDIDATE" 180 "$PANEL_ASSET_MAX_BYTES" || return 1
+    download_file "${binary_url}.sha256" "$PANEL_SHA256_FILE" 60 "$CHECKSUM_ASSET_MAX_BYTES" || return 1
+    download_file "${binary_url}.sha256.sig" "$PANEL_SIGNATURE_FILE" 60 "$SIGNATURE_ASSET_MAX_BYTES" || return 1
+    download_file "$license_url" "$LICENSE_ARCHIVE" 120 "$LICENSE_ARCHIVE_MAX_BYTES" || return 1
+    download_file "${license_url}.sha256" "$LICENSE_SHA256_FILE" 60 "$CHECKSUM_ASSET_MAX_BYTES" || return 1
+    download_file "${license_url}.sha256.sig" "$LICENSE_SIGNATURE_FILE" 60 "$SIGNATURE_ASSET_MAX_BYTES" || return 1
+}
+
 prepare_panel_candidate() {
     local script_dir=""
-    local github_release="https://github.com/zangwp/yub-wpanel/releases/latest/download/yub-wpanel"
-    local proxy_release=""
+    local github_release_base=""
+    local proxy_release_base=""
+    local bundle_source=""
 
+    validate_installer_release_version || \
+        log_error "安装器缺少规范、受支持的固定 Release 版本；请使用已签名 GitHub Release 资产"
+    github_release_base="https://github.com/zangwp/yub-wpanel/releases/download/${INSTALLER_RELEASE_VERSION}"
     if [[ -n "$GHPROXY" ]]; then
-        proxy_release="${GHPROXY%/}/${github_release}"
+        proxy_release_base="${GHPROXY%/}/${github_release_base}"
     fi
 
-    [[ -n "$PANEL_CANDIDATE" ]] && [[ -x "$PANEL_CANDIDATE" ]] && return 0
-    PANEL_CANDIDATE="/tmp/yub-wpanel.$$.candidate"
+    if $PANEL_CANDIDATE_VERIFIED && [[ -x "$PANEL_CANDIDATE" ]]; then
+        return 0
+    fi
+    [[ -n "$INSTALL_WORKDIR" ]] && [[ -d "$INSTALL_WORKDIR" ]] || \
+        log_error "安装临时工作目录尚未初始化"
     script_dir="$(cd "$(dirname "$0")" && pwd)"
 
-    if [[ -s "$script_dir/yub-wpanel" ]]; then
-        cp "$script_dir/yub-wpanel" "$PANEL_CANDIDATE"
-    elif $PREFER_CN && [[ -n "$proxy_release" ]]; then
-        download_file "$proxy_release" "$PANEL_CANDIDATE" 60 || \
-            download_file "$github_release" "$PANEL_CANDIDATE" 60 || \
-            log_error "无法获取用于安装校验的面板二进制"
+    if copy_local_release_bundle "$script_dir"; then
+        bundle_source="同目录离线发布包"
+        if ! verify_complete_release_bundle; then
+            log_error "同目录面板与许可发布包未通过 Ed25519 签名、SHA256 或内容校验"
+        fi
+    elif $PREFER_CN && [[ -n "$proxy_release_base" ]]; then
+        if download_release_bundle "$proxy_release_base" && \
+           verify_complete_release_bundle; then
+            bundle_source="自定义 GitHub 反代"
+        elif download_release_bundle "$github_release_base" && \
+             verify_complete_release_bundle; then
+            bundle_source="GitHub Releases"
+        else
+            log_error "无法获取通过 Ed25519 签名、SHA256 和内容校验的面板与许可发布包"
+        fi
     else
-        download_file "$github_release" "$PANEL_CANDIDATE" 60 || \
-            { [[ -n "$proxy_release" ]] && download_file "$proxy_release" "$PANEL_CANDIDATE" 60; } || \
-            log_error "无法获取用于安装校验的面板二进制"
+        if download_release_bundle "$github_release_base" && \
+           verify_complete_release_bundle; then
+            bundle_source="GitHub Releases"
+        elif [[ -n "$proxy_release_base" ]] && download_release_bundle "$proxy_release_base" && \
+             verify_complete_release_bundle; then
+            bundle_source="自定义 GitHub 反代"
+        else
+            log_error "无法获取通过 Ed25519 签名、SHA256 和内容校验的面板与许可发布包"
+        fi
     fi
-    chmod 0755 "$PANEL_CANDIDATE"
+
+    preflight_panel_candidate || log_error "已验签面板二进制未通过 --info 安全预检"
+    PANEL_CANDIDATE_VERIFIED=true
+    log_info "固定版本 ${INSTALLER_RELEASE_VERSION} 的面板与许可发布包验签、内容校验和预检通过: ${bundle_source}"
 }
 
 create_repair_backup() {
@@ -258,6 +850,110 @@ create_repair_backup() {
     sha256sum -c "$REPAIR_BACKUP_DIR/SHA256SUMS" >/dev/null || log_error "repair备份校验失败"
 }
 
+atomic_install_managed_file() {
+	local source_path="$1"
+	local target_path="$2"
+	local target_mode="$3"
+	local target_dir="${target_path%/*}"
+	local target_base="${target_path##*/}"
+	local dir_owner=""
+	local dir_mode=""
+
+	[[ "$target_path" == "$BIN_PATH" ]] || [[ "$target_path" == "$DB_PATH" ]] || return 1
+	[[ -f "$source_path" ]] && [[ ! -L "$source_path" ]] || return 1
+	[[ -d "$target_dir" ]] && [[ ! -L "$target_dir" ]] || return 1
+	dir_owner=$(stat -c '%u' "$target_dir" 2>/dev/null) || return 1
+	dir_mode=$(stat -c '%a' "$target_dir" 2>/dev/null) || return 1
+	[[ "$dir_owner" == "0" ]] || return 1
+	[[ "$dir_mode" =~ ^[0-7]{3,4}$ ]] || return 1
+	(( (8#$dir_mode & 0022) == 0 )) || return 1
+
+	cleanup_atomic_stage_file
+	ATOMIC_STAGE_PATH=$(mktemp "${target_dir}/.${target_base}.yub-install.XXXXXXXX") || return 1
+	if ! install -m "$target_mode" "$source_path" "$ATOMIC_STAGE_PATH" || \
+	   ! sync -f "$ATOMIC_STAGE_PATH" || \
+	   ! mv -f -- "$ATOMIC_STAGE_PATH" "$target_path"; then
+		cleanup_atomic_stage_file
+		return 1
+	fi
+	ATOMIC_STAGE_PATH=""
+	sync -f "$target_dir"
+}
+
+validate_license_document_directory() {
+    local doc_parent="${LICENSE_DOC_DIR%/*}"
+    local path_owner=""
+    local path_mode=""
+
+    [[ "$doc_parent" == "/usr/share/doc" ]] || return 1
+    [[ -d "$doc_parent" ]] && [[ ! -L "$doc_parent" ]] || return 1
+    [[ "$(readlink -f -- "$doc_parent" 2>/dev/null)" == "$doc_parent" ]] || return 1
+    path_owner=$(stat -c '%u' "$doc_parent" 2>/dev/null) || return 1
+    path_mode=$(stat -c '%a' "$doc_parent" 2>/dev/null) || return 1
+    [[ "$path_owner" == "0" ]] || return 1
+    [[ "$path_mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#$path_mode & 0022) == 0 )) || return 1
+
+    if [[ -e "$LICENSE_DOC_DIR" ]] || [[ -L "$LICENSE_DOC_DIR" ]]; then
+        [[ -d "$LICENSE_DOC_DIR" ]] && [[ ! -L "$LICENSE_DOC_DIR" ]] || return 1
+    else
+        install -d -m 0755 "$LICENSE_DOC_DIR" || return 1
+    fi
+    [[ "$(readlink -f -- "$LICENSE_DOC_DIR" 2>/dev/null)" == "$LICENSE_DOC_DIR" ]] || return 1
+    path_owner=$(stat -c '%u' "$LICENSE_DOC_DIR" 2>/dev/null) || return 1
+    path_mode=$(stat -c '%a' "$LICENSE_DOC_DIR" 2>/dev/null) || return 1
+    [[ "$path_owner" == "0" ]] || return 1
+    [[ "$path_mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#$path_mode & 0022) == 0 ))
+}
+
+atomic_install_license_document() {
+    local source_path="$1"
+    local target_path="$2"
+    local target_base="${target_path##*/}"
+    local stage_path=""
+
+    [[ -f "$source_path" ]] && [[ ! -L "$source_path" ]] || return 1
+    case "$target_path" in
+        "$LICENSE_DOC_DIR/LICENSE"|\
+        "$LICENSE_DOC_DIR/NOTICE.md"|\
+        "$LICENSE_DOC_DIR/THIRD_PARTY_NOTICES.md"|\
+        "$LICENSE_DOC_DIR/yub-wpanel-third-party-licenses.tar.gz"|\
+        "$LICENSE_DOC_DIR/yub-wpanel-third-party-licenses.tar.gz.sha256"|\
+        "$LICENSE_DOC_DIR/yub-wpanel-third-party-licenses.tar.gz.sha256.sig"|\
+        "$LICENSE_DOC_DIR/release-public-key.pem") ;;
+        *) return 1 ;;
+    esac
+    if [[ -e "$target_path" ]] || [[ -L "$target_path" ]]; then
+        [[ -f "$target_path" ]] && [[ ! -L "$target_path" ]] || return 1
+    fi
+
+    stage_path=$(mktemp "$LICENSE_DOC_DIR/.${target_base}.yub-install.XXXXXXXX") || return 1
+    if ! install -m 0644 "$source_path" "$stage_path" || \
+       ! sync -f "$stage_path" || \
+       ! mv -f -- "$stage_path" "$target_path"; then
+        rm -f -- "$stage_path"
+        return 1
+    fi
+    sync -f "$LICENSE_DOC_DIR"
+}
+
+install_release_license_documentation() {
+    local public_key_file="$INSTALL_WORKDIR/release-public-key.pem"
+
+    validate_license_document_directory || return 1
+    atomic_install_license_document "$PROJECT_LICENSE_FILE" "$LICENSE_DOC_DIR/LICENSE" || return 1
+    atomic_install_license_document "$PROJECT_NOTICE_FILE" "$LICENSE_DOC_DIR/NOTICE.md" || return 1
+    atomic_install_license_document "$THIRD_PARTY_NOTICE_FILE" "$LICENSE_DOC_DIR/THIRD_PARTY_NOTICES.md" || return 1
+    atomic_install_license_document "$LICENSE_ARCHIVE" \
+        "$LICENSE_DOC_DIR/yub-wpanel-third-party-licenses.tar.gz" || return 1
+    atomic_install_license_document "$LICENSE_SHA256_FILE" \
+        "$LICENSE_DOC_DIR/yub-wpanel-third-party-licenses.tar.gz.sha256" || return 1
+    atomic_install_license_document "$LICENSE_SIGNATURE_FILE" \
+        "$LICENSE_DOC_DIR/yub-wpanel-third-party-licenses.tar.gz.sha256.sig" || return 1
+    atomic_install_license_document "$public_key_file" "$LICENSE_DOC_DIR/release-public-key.pem" || return 1
+}
+
 repair_rollback() {
     [[ "$REPAIR_MODE" == true ]] || return 0
     [[ "$REPAIR_COMMITTED" == false ]] || return 0
@@ -265,8 +961,6 @@ repair_rollback() {
     [[ -n "$REPAIR_BACKUP_DIR" ]] && [[ -d "$REPAIR_BACKUP_DIR" ]] || return 0
 
     local db_rollback_ok=true
-    local db_rollback_tmp="${DB_PATH}.repair-rollback.$$"
-
     log_warn "repair未完成，正在恢复repair前的面板程序和数据库"
     # 新二进制可能已经升级SQLite结构。必须先停服并恢复同一时间点的数据库，
     # 不能让恢复后的旧二进制继续读取新结构。
@@ -274,11 +968,9 @@ repair_rollback() {
         log_warn "严重：无法停止yub-wpanel，未恢复面板数据库，保持服务停止后请联系开发者处理"
         db_rollback_ok=false
     elif $REPAIR_DB_EXISTED; then
-        rm -f "$db_rollback_tmp"
-        if install -m 0600 "$REPAIR_BACKUP_DIR/panel.db" "$db_rollback_tmp" && mv "$db_rollback_tmp" "$DB_PATH"; then
+        if atomic_install_managed_file "$REPAIR_BACKUP_DIR/panel.db" "$DB_PATH" 0600; then
             rm -f "${DB_PATH}-wal" "${DB_PATH}-shm"
         else
-            rm -f "$db_rollback_tmp"
             log_warn "严重：repair前的面板数据库恢复失败，旧面板不会重新启动，请联系开发者处理"
             db_rollback_ok=false
         fi
@@ -287,7 +979,10 @@ repair_rollback() {
     fi
 
     if $REPAIR_BIN_EXISTED; then
-        install -m 0755 "$REPAIR_BACKUP_DIR/yub-wpanel" "$BIN_PATH"
+		if ! atomic_install_managed_file "$REPAIR_BACKUP_DIR/yub-wpanel" "$BIN_PATH" 0755; then
+			log_warn "严重：repair前的面板二进制原子恢复失败，旧面板不会重新启动，请联系开发者处理"
+			db_rollback_ok=false
+		fi
     else
         rm -f "$BIN_PATH"
     fi
@@ -411,7 +1106,7 @@ debian_packages_available() {
 configure_debian_source() {
     local source_id="$1"
     local codename="$2"
-    local apt_log="/tmp/yub-wpanel-debian-apt-update.log"
+    local apt_log="$INSTALL_WORKDIR/debian-apt-update.log"
 
     set_debian_source_meta "$source_id" || return 1
     log_info "尝试 Debian 源: ${DEBIAN_SOURCE_LABEL}"
@@ -462,13 +1157,36 @@ configure_php_source() {
     local source_id="$1"
     local codename="$2"
     local keyring_file="/usr/share/keyrings/debsuryorg-archive-keyring.gpg"
-    local tmp_key="/tmp/debsuryorg-archive-keyring.deb"
-    local apt_log="/tmp/yub-wpanel-apt-update.log"
+    local tmp_key="$INSTALL_WORKDIR/debsuryorg-archive-keyring.deb"
+    local apt_log="$INSTALL_WORKDIR/php-apt-update.log"
+    local actual_sha=""
+    local package_name=""
+    local package_version=""
+    local package_arch=""
 
     set_php_source_meta "$source_id" || return 1
     log_info "尝试 PHP 源: ${PHP_SOURCE_LABEL}"
 
-    if download_file "$PHP_KEY_URL" "$tmp_key" 20; then
+    rm -f "$tmp_key"
+    if download_file "$PHP_KEY_URL" "$tmp_key" 20 "$PHP_KEYRING_MAX_BYTES"; then
+        actual_sha=$(sha256sum "$tmp_key" 2>/dev/null | awk '{print $1}') || actual_sha=""
+        if [[ "$actual_sha" != "$DEBSURY_KEYRING_SHA256" ]]; then
+            rm -f "$tmp_key"
+            log_warn "${PHP_SOURCE_LABEL} keyring SHA-256 不匹配，拒绝执行下载的安装包"
+            return 1
+        fi
+
+        package_name=$(dpkg-deb -f "$tmp_key" Package 2>/dev/null || true)
+        package_version=$(dpkg-deb -f "$tmp_key" Version 2>/dev/null || true)
+        package_arch=$(dpkg-deb -f "$tmp_key" Architecture 2>/dev/null || true)
+        if [[ "$package_name" != "$DEBSURY_KEYRING_PACKAGE" ]] || \
+            [[ "$package_version" != "$DEBSURY_KEYRING_VERSION" ]] || \
+            [[ "$package_arch" != "all" ]]; then
+            rm -f "$tmp_key"
+            log_warn "${PHP_SOURCE_LABEL} keyring 包元数据不匹配，拒绝执行"
+            return 1
+        fi
+
         if ! dpkg -i "$tmp_key" >/dev/null 2>&1; then
             rm -f "$tmp_key"
             log_warn "${PHP_SOURCE_LABEL} GPG key 安装失败"
@@ -476,13 +1194,15 @@ configure_php_source() {
         fi
         rm -f "$tmp_key"
     else
-        if [[ -f "$keyring_file" ]]; then
-            log_warn "${PHP_SOURCE_LABEL} GPG key 下载失败，将复用本机已有 keyring"
-        else
-            log_warn "${PHP_SOURCE_LABEL} GPG key 下载失败"
-            return 1
-        fi
+        rm -f "$tmp_key"
+        log_warn "${PHP_SOURCE_LABEL} GPG key 下载失败；不会复用未由本次安装验证的 keyring"
+        return 1
     fi
+
+    [[ -f "$keyring_file" ]] && [[ ! -L "$keyring_file" ]] || {
+        log_warn "${PHP_SOURCE_LABEL} 未生成预期的常规 keyring 文件"
+        return 1
+    }
 
     cat > /etc/apt/sources.list.d/php.sources << PHPSOURCESEOF
 Types: deb
@@ -542,15 +1262,98 @@ select_php_source() {
 # 卸载函数（定义在前，兼容管道执行）
 # ============================================================
 
+is_exact_purge_confirmation() {
+    [[ "${1:-}" == "PURGE" ]]
+}
+
+cleanup_yub_runtime_integrations() {
+    local jail=""
+    local logrotate_file=""
+
+    # Stop only fixed YUB units and jails. Every operation is best-effort so a
+    # stale or partially installed integration cannot prevent uninstallation.
+    systemctl stop yubwpanel-whitelist.timer 2>/dev/null || true
+    systemctl stop yubwpanel-whitelist.service 2>/dev/null || true
+    systemctl disable yub-wpanel 2>/dev/null || true
+    systemctl disable yubwpanel-whitelist.timer 2>/dev/null || true
+    systemctl disable yubwpanel-whitelist.service 2>/dev/null || true
+
+    if command -v fail2ban-client >/dev/null 2>&1; then
+        for jail in yubwpanel yubwpanel-404 yubwpanel-login yubwpanel-sshd yubwpanel-sqli; do
+            fail2ban-client stop "$jail" >/dev/null 2>&1 || true
+        done
+    fi
+
+    rm -f -- \
+        /etc/cron.d/yub_wpanel_cron \
+        /etc/systemd/system/yub-wpanel.service \
+        /etc/systemd/system/multi-user.target.wants/yub-wpanel.service \
+        /run/systemd/transient/yub-wpanel.service \
+        /etc/systemd/system/yubwpanel-whitelist.timer \
+        /etc/systemd/system/yubwpanel-whitelist.service \
+        /etc/systemd/system/timers.target.wants/yubwpanel-whitelist.timer \
+        /etc/systemd/system/nginx.service.d/yub-wpanel.conf \
+        /etc/systemd/system/php8.3-fpm.service.d/yub-wpanel.conf \
+        /etc/systemd/system/mariadb.service.d/yub-wpanel.conf \
+        /etc/systemd/system/redis-server.service.d/yub-wpanel.conf \
+        /etc/fail2ban/jail.d/yubwpanel.conf \
+        /etc/fail2ban/action.d/yubwpanel-nginx.conf \
+        /etc/fail2ban/action.d/yubwpanel-record.conf \
+        /etc/fail2ban/filter.d/yubwpanel.conf \
+        /etc/fail2ban/filter.d/yubwpanel-404.conf \
+        /etc/fail2ban/filter.d/yubwpanel-login.conf \
+        /etc/fail2ban/filter.d/yubwpanel-sqli.conf \
+        /etc/nginx/conf.d/yubwpanel.conf \
+        /etc/nginx/conf.d/yubwpanel-cache-bypass.conf \
+        /etc/nginx/conf.d/yubwpanel-ssl-default.conf \
+        /etc/nginx/conf.d/yubwpanel-ratelimit.conf \
+        /etc/nginx/conf.d/yubwpanel-botlimit.conf \
+        /etc/nginx/conf.d/yubwpanel-limit-status.conf \
+        /etc/nginx/conf.d/yubwpanel-cache.conf \
+        /etc/nginx/conf.d/yubwpanel-log.conf \
+        /etc/nginx/conf.d/yubwpanel-realip.conf \
+        /etc/nginx/conf.d/yubwpanel-banned-ips.conf \
+        2>/dev/null || true
+
+    # Remove only unit-specific overrides owned by this panel. Hierarchical or
+    # global drop-ins are never deleted automatically; the installer detects
+    # and rejects them before it changes the host.
+    rm -rf -- \
+        /etc/systemd/system/yub-wpanel.service.d \
+        /run/systemd/system/yub-wpanel.service.d \
+        /etc/systemd/system.control/yub-wpanel.service.d \
+        /run/systemd/system.control/yub-wpanel.service.d \
+        2>/dev/null || true
+
+    # Site logrotate names are dynamic. Delete only regular files in the fixed
+    # directory whose first line carries YUB WPanel's ownership marker.
+    while IFS= read -r -d '' logrotate_file; do
+        [[ -f "$logrotate_file" ]] && [[ ! -L "$logrotate_file" ]] || continue
+        if head -n 1 -- "$logrotate_file" 2>/dev/null | \
+            grep -Eq '^# YUB WPanel Generated - [A-Za-z0-9._-]+$'; then
+            rm -f -- "$logrotate_file" 2>/dev/null || true
+        fi
+    done < <(find /etc/logrotate.d -maxdepth 1 -type f -name 'yubwpanel-*' -print0 2>/dev/null)
+
+    systemctl daemon-reload 2>/dev/null || true
+}
+
 do_uninstall() {
+    echo ""
+    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${YELLOW}  普通卸载将永久删除 /www/server/panel 全部内容，包括：${NC}"
+    echo -e "  - 面板数据库 panel.db 与 config.json"
+    echo -e "  - 面板自身 TLS 证书和私钥"
+    echo -e "  - 面板本地备份、共享安装包缓存与该目录内的登录凭据/密钥"
+    echo -e "${GREEN}  普通卸载保留站点文件、站点日志、站点证书、站点 Nginx/PHP 配置、MariaDB 数据库和共享系统软件。${NC}"
+    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
     echo -e "${BOLD}正在卸载面板，请稍候...${NC}"
 
     echo -e "  → 停止面板服务..."
     systemctl stop yub-wpanel 2>/dev/null || true
     systemctl disable yub-wpanel 2>/dev/null || true
-    rm -f /etc/systemd/system/yub-wpanel.service
-    systemctl daemon-reload
+    cleanup_yub_runtime_integrations
     echo -e "  ${GREEN}✓${NC} 面板服务已停止"
 
     echo -e "  → 删除面板文件..."
@@ -558,22 +1361,20 @@ do_uninstall() {
     rm -f /usr/local/bin/yubw
     grep -qx '# YUB WPanel CLI — wp' /usr/local/bin/wp 2>/dev/null && rm -f /usr/local/bin/wp
     rm -rf "$INSTALL_DIR"
+    rm -rf -- "$LICENSE_DOC_DIR"
     echo -e "  ${GREEN}✓${NC} 面板文件已删除"
 
-    echo -e "  → 清理 Nginx 面板配置..."
-    rm -f /etc/nginx/conf.d/yubwpanel-ratelimit.conf
-    rm -f /etc/nginx/conf.d/yubwpanel-botlimit.conf
-    rm -f /etc/nginx/conf.d/yubwpanel-limit-status.conf
-    rm -f /etc/nginx/conf.d/yubwpanel-cache.conf
-    rm -f /etc/nginx/conf.d/yubwpanel-log.conf
+    echo -e "  → 重新加载 Nginx..."
     nginx -s reload 2>/dev/null || true
-    echo -e "  ${GREEN}✓${NC} Nginx 配置已清理"
+    echo -e "  ${GREEN}✓${NC} YUB Nginx 配置已清理"
 
     echo ""
     log_info "面板已卸载。以下内容已保留："
     log_info "  - /www/wwwroot（网站文件）"
     log_info "  - /www/wwwlogs（网站日志）"
-    log_info "  - /www/server/certificates（SSL 证书）"
+    log_info "  - /www/server/certificates（站点 SSL 证书，不包括已删除的面板 TLS 身份）"
+    log_info "  - /etc/nginx/sites-available 与 sites-enabled（站点 Nginx 配置）"
+    log_info "  - /etc/php/8.3/fpm/pool.d（站点 PHP-FPM pools）"
     log_info "  - MariaDB 数据库"
     log_info "  - 系统软件包（nginx/php/mariadb/redis/fail2ban）"
 }
@@ -581,16 +1382,23 @@ do_uninstall() {
 do_purge() {
     echo ""
     echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${RED}  警告：将删除所有网站数据和系统软件！${NC}"
-    echo -e "${RED}  此操作不可逆，请谨慎选择。${NC}"
+    echo -e "${RED}  高风险警告：彻底清空会删除下列数据和配置：${NC}"
+    echo -e "  - /etc/nginx/sites-enabled/* 和 sites-available/*（全部 Nginx site 配置）"
+    echo -e "  - /etc/php/8.3/fpm/pool.d/*.conf（全部 PHP-FPM pools）"
+    echo -e "  - /www/wwwroot、/www/wwwlogs、/www/server/certificates"
+    echo -e "  - /www/server/panel（面板状态、凭据、备份和共享安装包缓存）"
+    echo -e "  - 共享系统软件：Nginx、PHP 8.3、MariaDB、Redis、Fail2ban"
+    echo -e "${RED}  这些目录和软件可能同时被非 YUB 工作负载使用；操作可能使其停机或永久丢失数据。${NC}"
+    echo -e "${RED}  此操作不可逆。${NC}"
     echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
-    echo -e "  输入 ${BOLD}yes${NC} 确认，直接回车取消。"
+    echo -e "  这是选择“彻底清空”后的第二次确认。"
+    echo -e "  请输入精确的 ${BOLD}PURGE${NC} 继续，其他任何输入（含直接回车）都会取消。"
 
-    confirm=""
-    read -p "  > " confirm < /dev/tty 2>/dev/null || true
-    if [[ "$confirm" != "yes" ]]; then
-        log_info "已取消"
+    local purge_confirmation=""
+    read -r -p "  > " purge_confirmation < /dev/tty 2>/dev/null || purge_confirmation=""
+    if ! is_exact_purge_confirmation "$purge_confirmation"; then
+        log_info "未输入精确的 PURGE，已取消彻底清空"
         return 0
     fi
 
@@ -606,6 +1414,10 @@ do_purge() {
     systemctl stop fail2ban 2>/dev/null || true
     echo -e "  ${GREEN}✓${NC} 服务已停止"
 
+    echo -e "  → 清理 YUB 定时任务、systemd、Fail2ban 和 logrotate 集成..."
+    cleanup_yub_runtime_integrations
+    echo -e "  ${GREEN}✓${NC} YUB 运行时集成已清理"
+
     echo -e "  → 清理网站 Nginx 和 PHP-FPM 配置..."
     rm -f /etc/nginx/sites-enabled/*
     rm -f /etc/nginx/sites-available/*
@@ -617,31 +1429,22 @@ do_purge() {
     DEBIAN_FRONTEND=noninteractive apt-get autoremove -y 2>/dev/null || true
     echo -e "  ${GREEN}✓${NC} 软件包已卸载"
 
-    echo -e "  → 清理 systemd 配置..."
-    systemctl disable yub-wpanel 2>/dev/null || true
-    rm -f /etc/systemd/system/yub-wpanel.service
-    for svc in nginx php8.3-fpm mariadb redis-server; do
-        rm -rf "/etc/systemd/system/${svc}.service.d/yub-wpanel.conf"
-    done
-    systemctl daemon-reload
-    echo -e "  ${GREEN}✓${NC} systemd 已清理"
-
-    echo -e "  → 恢复系统内核参数..."
+    echo -e "  → 移除 YUB 系统调优配置..."
     rm -f /etc/sysctl.d/99-yub-wpanel.conf
     sysctl --system >/dev/null 2>&1
     sed -i '/nofile 65535/d' /etc/security/limits.conf 2>/dev/null || true
-    echo -e "  ${GREEN}✓${NC} 内核参数已恢复"
+    echo -e "  ${GREEN}✓${NC} YUB 系统调优配置已移除"
 
     echo -e "  → 删除面板文件..."
     rm -f "$BIN_PATH"
     rm -f /usr/local/bin/yubw
     grep -qx '# YUB WPanel CLI — wp' /usr/local/bin/wp 2>/dev/null && rm -f /usr/local/bin/wp
     rm -rf "$INSTALL_DIR"
+    rm -rf -- "$LICENSE_DOC_DIR"
     echo -e "  ${GREEN}✓${NC} 面板文件已删除"
 
     echo -e "  → 删除网站数据..."
     rm -rf /www/wwwroot /www/wwwlogs /www/server/certificates
-    rm -f /etc/nginx/conf.d/yubwpanel-*.conf
     rm -rf /var/cache/nginx/fastcgi
     echo -e "  ${GREEN}✓${NC} 网站数据已删除"
 
@@ -654,18 +1457,21 @@ do_purge() {
     fi
 
     echo ""
-    log_info "全部清除完成，系统已恢复安装前状态"
+    log_info "彻底清理流程已完成；仅执行了上方明确列出的删除和卸载，不承诺恢复其他系统变更。"
 }
 
 # ============================================================
-# 权限检查
+# 权限、平台与发布包安全预检
 # ============================================================
 if [[ $EUID -ne 0 ]]; then
     log_error "请使用 root 权限运行此脚本"
 fi
+assert_supported_platform
+init_install_workdir
+prepare_panel_candidate
 exec 9>/run/lock/yub-wpanel-install.lock
 flock -n 9 || log_error "另一个 YUB WPanel 安装或 repair 进程正在运行"
-log_info "权限检查通过"
+log_info "权限、Debian 13 amd64 平台与发布包安全预检通过"
 
 # ============================================================
 # 重复安装/残留安装检测
@@ -677,7 +1483,16 @@ if [[ -f "$CONFIG_FILE" ]] && [[ -s "$BIN_PATH" ]] && [[ -x "$BIN_PATH" ]]; then
     INSTALL_COMPLETE=true
 fi
 
-if [[ -e "$CONFIG_FILE" ]] || [[ -e "$BIN_PATH" ]] || [[ -d "$INSTALL_DIR" ]] || [[ -f "$SERVICE_PATH" ]]; then
+if [[ -e "$CONFIG_FILE" ]] || [[ -L "$CONFIG_FILE" ]] || \
+   [[ -e "$BIN_PATH" ]] || [[ -L "$BIN_PATH" ]] || \
+   [[ -d "$INSTALL_DIR" ]] || \
+   [[ -e "$SERVICE_PATH" ]] || [[ -L "$SERVICE_PATH" ]] || \
+   [[ -e "$CRON_PATH" ]] || [[ -L "$CRON_PATH" ]] || \
+   [[ -e /etc/systemd/system/yub-wpanel.service.d ]] || [[ -L /etc/systemd/system/yub-wpanel.service.d ]] || \
+   [[ -e /run/systemd/system/yub-wpanel.service.d ]] || [[ -L /run/systemd/system/yub-wpanel.service.d ]] || \
+   [[ -e /etc/systemd/system.control/yub-wpanel.service.d ]] || [[ -L /etc/systemd/system.control/yub-wpanel.service.d ]] || \
+   [[ -e /run/systemd/system.control/yub-wpanel.service.d ]] || [[ -L /run/systemd/system.control/yub-wpanel.service.d ]] || \
+   [[ -e /run/systemd/transient/yub-wpanel.service ]] || [[ -L /run/systemd/transient/yub-wpanel.service ]]; then
     INSTALL_TRACES=true
 fi
 
@@ -689,13 +1504,13 @@ if $INSTALL_COMPLETE; then
     echo ""
     echo -e "  1) 继续/修复安装（${GREEN}保留面板配置、凭据和TLS身份${NC}）"
     echo -e "  2) 卸载后重新安装（${YELLOW}重建面板身份和状态${NC}）"
-    echo -e "  3) 仅卸载面板（${GREEN}保留网站/数据库/SSL/软件${NC}）"
-    echo -e "  4) 彻底清空（${RED}删除所有数据并卸载软件${NC}）"
+    echo -e "  3) 仅卸载面板（${GREEN}删除面板状态；保留站点数据/数据库/软件${NC}）"
+    echo -e "  4) 彻底清空（${RED}高风险：删除站点目录/配置并卸载共享软件${NC}）"
     echo -e "  5) 退出"
     echo ""
     echo -e "  输入数字后回车进行选择。"
 
-    read -p "  > " choice < /dev/tty 2>/dev/null || read choice
+    read -r -p "  > " choice < /dev/tty 2>/dev/null || read -r choice
 
     case "${choice:-5}" in
         1)
@@ -728,20 +1543,20 @@ elif $INSTALL_TRACES; then
     if [[ -f "$CONFIG_FILE" ]]; then
         echo -e "  1) 继续/修复安装（${GREEN}保留面板配置、凭据和TLS身份${NC}）"
         echo -e "  2) 清理面板残留后重新安装（${YELLOW}重建面板身份和状态${NC}）"
-        echo -e "  3) 仅卸载面板残留（${GREEN}保留网站/数据库/SSL/软件${NC}）"
-        echo -e "  4) 彻底清空（${RED}删除所有数据并卸载软件${NC}）"
+        echo -e "  3) 仅卸载面板残留（${GREEN}删除面板状态；保留站点数据/数据库/软件${NC}）"
+        echo -e "  4) 彻底清空（${RED}高风险：删除站点目录/配置并卸载共享软件${NC}）"
         echo -e "  5) 退出"
         echo ""
         echo -e "  直接回车将继续/修复安装。"
     else
         echo -e "${RED}  检测到面板状态但缺少config.json，无法安全repair。${NC}"
         echo -e "  1) 清理面板残留后重新安装（${YELLOW}重建面板身份和状态${NC}）"
-        echo -e "  2) 仅卸载面板残留（${GREEN}保留网站/数据库/SSL/软件${NC}）"
-        echo -e "  3) 彻底清空（${RED}删除所有数据并卸载软件${NC}）"
+        echo -e "  2) 仅卸载面板残留（${GREEN}删除面板状态；保留站点数据/数据库/软件${NC}）"
+        echo -e "  3) 彻底清空（${RED}高风险：删除站点目录/配置并卸载共享软件${NC}）"
         echo -e "  4) 退出"
     fi
 
-    read -p "  > " choice < /dev/tty 2>/dev/null || read choice
+    read -r -p "  > " choice < /dev/tty 2>/dev/null || read -r choice
 
     if [[ -f "$CONFIG_FILE" ]]; then
         case "${choice:-1}" in
@@ -762,12 +1577,17 @@ elif $INSTALL_TRACES; then
 fi
 
 if $REPAIR_MODE; then
-    for required_cmd in openssl systemctl sha256sum; do
-        command -v "$required_cmd" >/dev/null 2>&1 || log_error "repair缺少必要命令: ${required_cmd}"
-    done
     prepare_panel_candidate
+    verify_complete_release_bundle || \
+        log_error "repair执行前面板与许可发布包完整性复核失败"
     repair_check=$($PANEL_CANDIDATE --repair-config-check --config "$CONFIG_FILE") || \
         log_error "现有config.json未通过repair安全校验，未修改服务器状态"
+    validate_existing_panel_binary || \
+        log_error "现有面板二进制不是root持有的单链接常规0755文件；未修改服务器状态"
+    validate_repair_service_unit || \
+        log_error "现有systemd unit不是YUB WPanel生成的精确安全版本，或存在drop-in；未修改服务器状态"
+    validate_existing_panel_cron_file || \
+        log_error "现有cron文件不是root安全持有的YUB WPanel受管文件；未修改服务器状态"
     case "$repair_check" in
         *'"tls_action":"preserve"'*) REPAIR_TLS_ACTION="preserve" ;;
         *'"tls_action":"generate"'*) REPAIR_TLS_ACTION="generate" ;;
@@ -789,15 +1609,22 @@ if $REPAIR_MODE; then
     fi
     create_repair_backup
     log_info "repair预检与备份完成"
+else
+    if [[ -e "$SERVICE_PATH" ]] || [[ -L "$SERVICE_PATH" ]]; then
+        log_error "fresh安装前仍存在systemd unit或链接，拒绝继续"
+    fi
+	validate_fresh_panel_cron_location || \
+		log_error "fresh安装前cron父目录或现有cron文件身份不安全，拒绝继续"
+    if [[ -e "$CRON_PATH" ]] || [[ -L "$CRON_PATH" ]]; then
+        log_error "fresh安装前仍存在cron文件或链接，拒绝继续"
+    fi
+    validate_no_panel_service_dropins || \
+        log_error "检测到会影响yub-wpanel.service的遗留、层级或全局systemd drop-in；未修改服务器状态"
 fi
 
 # ============================================================
 # 系统检测与Swap配置
 # ============================================================
-if ! grep -qi "debian" /etc/os-release 2>/dev/null; then
-    log_error "此脚本仅支持 Debian 系统"
-fi
-
 TOTAL_MEM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
 TOTAL_MEM_MB=$((TOTAL_MEM_KB / 1024))
 log_info "物理内存: ${TOTAL_MEM_MB}MB"
@@ -914,6 +1741,11 @@ apt-get install -y \
 log_info "基础组件安装完成"
 else
     log_info "repair模式保留APT源和现有软件包，不执行安装或升级"
+fi
+
+if ! $REPAIR_MODE; then
+	validate_existing_panel_cron_file || \
+		log_error "cron安装后 /etc/cron.d 身份不安全，拒绝继续"
 fi
 
 # ============================================================
@@ -1073,7 +1905,8 @@ KEY_FILE="$CERT_DIR/panel.key"
 if $REPAIR_MODE && [[ "$REPAIR_TLS_ACTION" == "preserve" ]]; then
     log_info "repair模式保留现有TLS证书与私钥"
 else
-    TLS_TMP_DIR=$(mktemp -d "$CERT_DIR/.repair-tls.XXXXXX")
+    TLS_TMP_DIR="$INSTALL_WORKDIR/tls"
+    install -d -m 0700 "$TLS_TMP_DIR"
     openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
         -keyout "$TLS_TMP_DIR/panel.key" \
         -out "$TLS_TMP_DIR/panel.crt" \
@@ -1096,12 +1929,16 @@ fi
 # ============================================================
 log_info "检查 WordPress 备用包..."
 WP_ZIP="$INSTALL_DIR/packages/wordpress.zip"
-WP_ZIP_TMP="${WP_ZIP}.download"
-if $REPAIR_MODE && [[ -s "$WP_ZIP" ]]; then
+WP_ZIP_TMP="$INSTALL_WORKDIR/wordpress.zip"
+if $REPAIR_MODE && file_size_within_limit "$WP_ZIP" "$WORDPRESS_ZIP_MAX_BYTES"; then
     log_info "repair模式保留现有WordPress备用包"
 else
+    if [[ -e "$WP_ZIP" ]] || [[ -L "$WP_ZIP" ]]; then
+        log_warn "现有WordPress备用包不是安全常规文件或超过大小上限，正在替换"
+        rm -f -- "$WP_ZIP"
+    fi
     for i in 1 2 3; do
-        if download_file "https://wordpress.org/latest.zip" "$WP_ZIP_TMP" 60; then
+        if download_file "https://wordpress.org/latest.zip" "$WP_ZIP_TMP" 60 "$WORDPRESS_ZIP_MAX_BYTES"; then
             mv "$WP_ZIP_TMP" "$WP_ZIP"
             log_info "WordPress 下载完成"
             break
@@ -1141,7 +1978,10 @@ if [[ -z "$BASIC_HASH" ]] && command -v python3 &>/dev/null; then
 fi
 if [[ -z "$BASIC_HASH" ]]; then
     log_warn "无法生成 bcrypt 哈希，面板首次启动时将自动重置密码"
+    # Literal invalid bcrypt fallbacks: dollar signs must not expand.
+    # shellcheck disable=SC2016
     BASIC_HASH='$2a$12$00000000000000000000000000000000000000000000000000000'
+    # shellcheck disable=SC2016
     WEB_HASH='$2a$12$00000000000000000000000000000000000000000000000000000'
 fi
 else
@@ -1223,11 +2063,15 @@ fi
 log_info "部署面板二进制..."
 
 prepare_panel_candidate
-BIN_TMP="${BIN_PATH}.repair.$$"
-install -m 0755 "$PANEL_CANDIDATE" "$BIN_TMP"
+verify_complete_release_bundle || \
+    log_error "部署前面板与许可发布包完整性复核失败"
 if $REPAIR_MODE; then REPAIR_MUTATED=true; fi
-mv "$BIN_TMP" "$BIN_PATH"
+atomic_install_managed_file "$PANEL_CANDIDATE" "$BIN_PATH" 0755 || \
+	log_error "面板二进制同目录原子部署失败"
 log_info "面板二进制已原子部署"
+install_release_license_documentation || \
+    log_error "无法安全安装已验签的 YUB WPanel 许可文档"
+log_info "许可文档已安装到 $LICENSE_DOC_DIR"
 
 # ============================================================
 # 创建 systemd 服务
@@ -1236,31 +2080,16 @@ log_info "检查 systemd 服务..."
 
 if ! $REPAIR_MODE || [[ ! -f "$SERVICE_PATH" ]]; then
 if $REPAIR_MODE; then REPAIR_MUTATED=true; fi
-cat > "$SERVICE_PATH" << SYSTEMDEOF
-[Unit]
-Description=WordPress Server Management Panel
-After=network.target mariadb.service redis-server.service
-
-[Service]
-Type=simple
-User=root
-Group=root
-ExecStart=$BIN_PATH --config=$CONFIG_FILE
-Restart=always
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=yub-wpanel
-LimitNOFILE=65536
-
-[Install]
-WantedBy=multi-user.target
-SYSTEMDEOF
+[[ ! -e "$SERVICE_PATH" ]] && [[ ! -L "$SERVICE_PATH" ]] || \
+    log_error "写入systemd unit前目标已存在或为链接"
+write_panel_service_unit "$SERVICE_PATH" 0644 || log_error "写入yub-wpanel systemd unit失败"
 else
     log_info "repair模式保留现有systemd unit"
 fi
 
 systemctl daemon-reload
+validate_effective_panel_service_unit || \
+    log_error "systemd实际加载的unit、drop-in或ExecStart与YUB WPanel不一致"
 if $REPAIR_MODE; then
     if $REPAIR_SERVICE_WAS_ACTIVE; then
         systemctl restart yub-wpanel || log_error "yub-wpanel重启失败"
@@ -1270,6 +2099,8 @@ if $REPAIR_MODE; then
 else
     systemctl_enable_best_effort yub-wpanel
     systemctl_start_required yub-wpanel
+    validate_running_panel_service_identity || \
+        log_error "yub-wpanel MainPID未运行已部署的YUB WPanel二进制"
     apply_system_tuning
 fi
 
@@ -1300,6 +2131,8 @@ fi
 if $REPAIR_MODE; then
     if $REPAIR_SERVICE_WAS_ACTIVE; then
         systemctl is-active --quiet yub-wpanel || log_error "repair后面板服务未运行"
+        validate_running_panel_service_identity || \
+            log_error "repair后yub-wpanel MainPID未运行已部署的YUB WPanel二进制"
     elif systemctl is-active --quiet yub-wpanel; then
         log_error "repair改变了面板服务原始inactive状态"
     fi
@@ -1311,7 +2144,16 @@ fi
 LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 [[ -z "$LOCAL_IP" ]] && LOCAL_IP="<未知>"
 
-PUBLIC_IP=$(curl -s --connect-timeout 5 ip.sb 2>/dev/null || curl -s --connect-timeout 5 ifconfig.me 2>/dev/null)
+PUBLIC_IP_FILE="$INSTALL_WORKDIR/public-ip.txt"
+if download_file "https://ip.sb" "$PUBLIC_IP_FILE" 15 "$PUBLIC_IP_MAX_BYTES" || \
+   download_file "https://ifconfig.me/ip" "$PUBLIC_IP_FILE" 15 "$PUBLIC_IP_MAX_BYTES"; then
+    PUBLIC_IP=$(tr -d '\r\n' < "$PUBLIC_IP_FILE")
+else
+    PUBLIC_IP=""
+fi
+if [[ ${#PUBLIC_IP} -gt 45 ]] || [[ ! "$PUBLIC_IP" =~ ^[0-9A-Fa-f:.]+$ ]]; then
+    PUBLIC_IP=""
+fi
 [[ -z "$PUBLIC_IP" ]] && PUBLIC_IP="<未知>"
 
 echo ""
@@ -1368,10 +2210,14 @@ if ! $REPAIR_MODE; then
     echo -e "  3. 进入控制台 / Enter the dashboard"
 fi
 echo ""
-echo -e "${YELLOW}⚠ 当前使用自签名证书，浏览器会提示「不安全」${NC}"
-echo -e "${YELLOW}  A self-signed certificate is used, so your browser may show a warning.${NC}"
-echo -e "${YELLOW}  请点击「高级」→「继续访问」即可进入面板${NC}"
-echo -e "${YELLOW}  Click Advanced, then continue to the site to open the panel.${NC}"
+echo -e "${YELLOW}⚠ 安装器默认生成自签名证书；如浏览器显示证书警告，不要盲目点击继续。${NC}"
+echo -e "${YELLOW}  The installer creates a self-signed certificate by default. Do not bypass a browser warning without verifying it.${NC}"
+echo -e "${YELLOW}  请先通过 SSH 在服务器执行下列命令，再与浏览器显示的 SHA-256 证书指纹逐字比对：${NC}"
+echo -e "  ${BOLD}openssl x509 -in ${CERT_FILE} -noout -fingerprint -sha256${NC}"
+echo -e "${YELLOW}  指纹不一致时立即停止，不要输入任何凭据。${NC}"
+echo -e "${YELLOW}  Verify the SHA-256 fingerprint over SSH against the browser. Stop immediately if it differs.${NC}"
+echo -e "${YELLOW}  长期公网使用请替换为由受信任 CA 签发、且与访问域名匹配的证书。${NC}"
+echo -e "${YELLOW}  For long-term public access, replace it with a trusted CA certificate matching the panel hostname.${NC}"
 echo -e "${YELLOW}  面板使用 8443 端口（HTTPS），与 Nginx 网站 443 端口不冲突${NC}"
 echo -e "${YELLOW}  The panel uses HTTPS port 8443 and does not conflict with Nginx port 443.${NC}"
 echo ""
@@ -1402,7 +2248,7 @@ if ! $REPAIR_MODE; then
     echo -e "${YELLOW}Save these credentials now. They are shown only once.${NC}"
 fi
 echo ""
-echo -e "${BOLD}匿名安装统计 / Anonymous Install Telemetry${NC}"
-echo -e "  YUB WPanel 默认关闭匿名安装统计。"
-echo -e "  Anonymous install telemetry is disabled by default in YUB WPanel."
+echo -e "${BOLD}可选运行统计 / Optional Runtime Telemetry${NC}"
+echo -e "  YUB WPanel 默认关闭可选运行统计。"
+echo -e "  Optional runtime telemetry is disabled by default in YUB WPanel."
 echo ""

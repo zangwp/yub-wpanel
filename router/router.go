@@ -576,6 +576,7 @@ var i18nKeys = []string{
 	"security.googlebot_source_unknown",
 	"security.telemetry_disable_confirm",
 	"security.telemetry_disabled",
+	"security.telemetry_url_required",
 	"security.sqli_protection",
 	"security.sqli_protection_help",
 	"security.sqli_block_enabled",

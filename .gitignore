@@ -44,9 +44,6 @@ setup.sh
 stats-worker/.wrangler/
 stats-worker/wrangler.toml
 
-# Docs（本地参考，不提交）
-docs/
-
 # Scratch
 scratch/
 

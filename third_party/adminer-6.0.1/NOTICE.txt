@@ -1,0 +1,9 @@
+Adminer 6.0.1
+https://www.adminer.org/
+
+Copyright 2007 Jakub Vrana
+
+The embedded Adminer source offers a choice of the Apache License, Version 2.0,
+or the GNU General Public License, version 2. YUB WPanel distributes this copy
+under the Apache License, Version 2.0. The complete Apache-2.0 terms are in
+LICENSE-APACHE-2.0.txt in this directory.

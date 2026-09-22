@@ -107,10 +107,10 @@ var upgrades = []Upgrade{
 	},
 	{
 		Version:     "1.0.8",
-		Description: "新增匿名安装统计开关",
+		Description: "新增可选运行统计开关",
 		SQL: []string{
-			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('telemetry_enabled', 'false', '匿名安装统计（自有统计服务配置前默认关闭）')`,
-			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('telemetry_url', '', '自定义统计上报地址（留空使用默认）')`,
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('telemetry_enabled', 'false', '可选运行统计（自有统计服务配置前默认关闭）')`,
+			`INSERT OR IGNORE INTO security_settings (skey, svalue, description) VALUES ('telemetry_url', '', '自定义统计上报地址（留空停用）')`,
 		},
 	},
 	{

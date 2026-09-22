@@ -2,28 +2,82 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
 
 permissions:
   contents: read
 
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
-      - uses: actions/setup-go@v5
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  GOFLAGS: -mod=readonly
+  GOPROXY: https://proxy.golang.org
+  GOSUMDB: sum.golang.org
+  GOVCS: '*:off'
+  GOTOOLCHAIN: local
+
+jobs:
+  verify:
+    name: Test, vet, and build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Go
+        # actions/setup-go v7.0.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
           go-version-file: go.mod
+          check-latest: false
           cache: true
 
-      - name: Test
+      - name: Check installer syntax
+        shell: bash
         run: |
-          packages=$(go list ./... | grep -v '/scratch$')
-          go test $packages
+          set -euo pipefail
+          bash -n install.sh
+          bash -n install-cn.sh
+
+      - name: Download and verify Go modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          go mod download
+          go mod verify
+
+      - name: Test
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages_file="$RUNNER_TEMP/ci-packages"
+          go list ./... | grep -v '/scratch$' > "$packages_file"
+          mapfile -t packages < "$packages_file"
+          test "${#packages[@]}" -gt 0
+          go test -trimpath "${packages[@]}"
 
       - name: Vet
+        shell: bash
         run: |
-          packages=$(go list ./... | grep -v '/scratch$')
-          go vet $packages
+          set -euo pipefail
+          packages_file="$RUNNER_TEMP/ci-packages"
+          go list ./... | grep -v '/scratch$' > "$packages_file"
+          mapfile -t packages < "$packages_file"
+          test "${#packages[@]}" -gt 0
+          go vet "${packages[@]}"
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 go build -trimpath -buildvcs=true ./

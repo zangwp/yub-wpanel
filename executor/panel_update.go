@@ -3,12 +3,15 @@ package executor
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/zangwp/yub-wpanel/config"
 )
+
+const githubReleaseMetadataMaxBytes int64 = 1 << 20
 
 type GithubRelease struct {
 	TagName string `json:"tag_name"`
@@ -35,9 +38,19 @@ func FetchLatestPanelRelease(proxy string) (*GithubRelease, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GitHub API 返回 %d", resp.StatusCode)
 	}
+	if resp.ContentLength > githubReleaseMetadataMaxBytes {
+		return nil, fmt.Errorf("GitHub Release 元数据超过 %d 字节上限", githubReleaseMetadataMaxBytes)
+	}
 
+	data, err := io.ReadAll(io.LimitReader(resp.Body, githubReleaseMetadataMaxBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("读取版本信息失败: %w", err)
+	}
+	if int64(len(data)) > githubReleaseMetadataMaxBytes {
+		return nil, fmt.Errorf("GitHub Release 元数据超过 %d 字节上限", githubReleaseMetadataMaxBytes)
+	}
 	var release GithubRelease
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+	if err := json.Unmarshal(data, &release); err != nil {
 		return nil, fmt.Errorf("解析版本信息失败: %w", err)
 	}
 	return &release, nil

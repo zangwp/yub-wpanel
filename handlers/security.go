@@ -21,6 +21,7 @@ import (
 type SecurityHandler struct{}
 
 var securitySettingsApplyMu sync.Mutex
+var errInvalidTelemetrySettings = errors.New("启用遥测时必须配置有效的公网 HTTPS 地址")
 
 var (
 	applyFail2banSettings             = executor.ApplyFail2banSettings
@@ -81,8 +82,17 @@ func (h *SecurityHandler) UpdateSettings(c *gin.Context) {
 	}
 
 	if err := applySecuritySettings(db, normalized); err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResponse(err.Error()))
+		status := http.StatusInternalServerError
+		if errors.Is(err, errInvalidTelemetrySettings) {
+			status = http.StatusBadRequest
+		}
+		c.JSON(status, models.ErrorResponse(err.Error()))
 		return
+	}
+	if _, enabledChanged := normalized["telemetry_enabled"]; enabledChanged {
+		executor.NotifyTelemetrySettingsChanged()
+	} else if _, endpointChanged := normalized["telemetry_url"]; endpointChanged {
+		executor.NotifyTelemetrySettingsChanged()
 	}
 
 	c.JSON(http.StatusOK, models.SuccessResponse(gin.H{"message": "安全设置已更新"}))
@@ -108,6 +118,9 @@ func applySecuritySettings(db *sql.DB, settings map[string]string) error {
 	}
 	securitySettingsApplyMu.Lock()
 	defer securitySettingsApplyMu.Unlock()
+	if err := validateTelemetrySettingsUpdate(db, settings); err != nil {
+		return err
+	}
 
 	old := make(map[string]string, len(settings))
 	for key := range settings {
@@ -131,6 +144,38 @@ func applySecuritySettings(db *sql.DB, settings map[string]string) error {
 		return fmt.Errorf("安全设置应用失败，设置已回滚但服务器配置恢复不完整: %v；原始错误: %v", rollbackRuntimeErr, applyErr)
 	}
 	return fmt.Errorf("安全设置应用失败，已恢复修改前设置: %v", applyErr)
+}
+
+func validateTelemetrySettingsUpdate(db *sql.DB, settings map[string]string) error {
+	enabled, enabledChanged := settings["telemetry_enabled"]
+	endpoint, endpointChanged := settings["telemetry_url"]
+	if !enabledChanged && !endpointChanged {
+		return nil
+	}
+
+	if !enabledChanged {
+		if err := db.QueryRow(`SELECT svalue FROM security_settings WHERE skey='telemetry_enabled'`).Scan(&enabled); err != nil {
+			return fmt.Errorf("读取安全设置失败")
+		}
+	}
+	if enabled != "true" {
+		return nil
+	}
+
+	if !endpointChanged {
+		if err := db.QueryRow(`SELECT svalue FROM security_settings WHERE skey='telemetry_url'`).Scan(&endpoint); err != nil {
+			return fmt.Errorf("读取安全设置失败")
+		}
+	}
+	if endpoint == "" {
+		return errInvalidTelemetrySettings
+	}
+	// Revalidate the complete effective state while holding the save lock. This
+	// also protects direct internal callers and legacy stored values.
+	if _, err := executor.NormalizeTelemetryURL(endpoint); err != nil {
+		return errInvalidTelemetrySettings
+	}
+	return nil
 }
 
 func restoreSecuritySettingsRuntime(settings map[string]string) error {
@@ -504,8 +549,11 @@ func normalizeSecuritySetting(key string, val interface{}) (string, bool, error)
 		return normalizeRange(key, val, 1, 50)
 	case "wp_sqli_ban_window_seconds":
 		return normalizeRange(key, val, 60, 3600)
-	case "auto_whitelist_enabled", "rate_limit_enabled", "bot_limit_enabled", "wp_sqli_block_enabled", "wp_sqli_autoban_enabled":
+	case "auto_whitelist_enabled", "rate_limit_enabled", "bot_limit_enabled", "telemetry_enabled", "wp_sqli_block_enabled", "wp_sqli_autoban_enabled":
 		v, err := normalizeBool(val)
+		return v, true, err
+	case "telemetry_url":
+		v, err := normalizeTelemetryURL(val)
 		return v, true, err
 	case "whitelist_ips":
 		v, ok := val.(string)
@@ -530,6 +578,22 @@ func normalizeSecuritySetting(key string, val interface{}) (string, bool, error)
 	default:
 		return "", false, nil
 	}
+}
+
+func normalizeTelemetryURL(val interface{}) (string, error) {
+	v, err := normalizePlainString(val, 2048, "telemetry_url")
+	if err != nil {
+		return "", fmt.Errorf("遥测地址格式不正确")
+	}
+	if v == "" {
+		return "", nil
+	}
+
+	normalized, err := executor.NormalizeTelemetryURL(v)
+	if err != nil {
+		return "", fmt.Errorf("遥测地址必须是使用公网主机的有效 HTTPS URL")
+	}
+	return normalized, nil
 }
 
 func normalizeRange(key string, val interface{}, min int, max int) (string, bool, error) {

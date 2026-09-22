@@ -2,7 +2,7 @@ name = "yub-wpanel-stats"
 main = "index.js"
 compatibility_date = "2025-01-01"
 
-# Worker 接收面板匿名心跳上报，并提供公开统计 API。
+# Worker 接收面板伪匿名心跳上报，并提供公开统计 API。
 # 部署前需要先创建 KV namespace：
 #   npx wrangler kv namespace create "STATS_KV"
 # 然后把输出的 id 填入下方双引号内。

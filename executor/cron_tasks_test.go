@@ -347,6 +347,92 @@ func TestRenderCronReportsRestartFailureAndKeepsRenderedTarget(t *testing.T) {
 	}
 }
 
+func TestWriteManagedCronFileRejectsForeignTarget(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "yub-wpanel")
+	if err := os.WriteFile(path, []byte("* * * * * root /opt/foreign\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := writeManagedCronFile(path, []byte(managedCronHeader+"\nSHELL=/bin/bash\n"))
+	if err == nil {
+		t.Fatal("foreign cron target was overwritten")
+	}
+	content, readErr := os.ReadFile(path)
+	if readErr != nil || string(content) != "* * * * * root /opt/foreign\n" {
+		t.Fatalf("foreign cron target changed: content=%q err=%v", content, readErr)
+	}
+}
+
+func TestWriteManagedCronFileRejectsSymlinkWithoutTouchingTarget(t *testing.T) {
+	root := t.TempDir()
+	victim := filepath.Join(root, "victim")
+	path := filepath.Join(root, "yub-wpanel")
+	if err := os.WriteFile(victim, []byte("do-not-touch"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, path); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if err := writeManagedCronFile(path, []byte(managedCronHeader+"\nSHELL=/bin/bash\n")); err == nil {
+		t.Fatal("cron symlink was accepted")
+	}
+	content, err := os.ReadFile(victim)
+	if err != nil || string(content) != "do-not-touch" {
+		t.Fatalf("symlink target changed: content=%q err=%v", content, err)
+	}
+	if info, err := os.Lstat(path); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("cron symlink was replaced: info=%v err=%v", info, err)
+	}
+}
+
+func TestWriteManagedCronFileAtomicallyReplacesOwnedTarget(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "yub-wpanel")
+	oldContent := managedCronHeader + "\nSHELL=/bin/sh\n"
+	newContent := managedCronHeader + "\nSHELL=/bin/bash\n"
+	if err := os.WriteFile(path, []byte(oldContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeManagedCronFile(path, []byte(newContent)); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil || string(content) != newContent {
+		t.Fatalf("managed cron content=%q err=%v", content, err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o644 {
+		t.Fatalf("managed cron mode=%v err=%v", info, err)
+	}
+	temps, err := filepath.Glob(filepath.Join(root, ".yub-wpanel.tmp-*"))
+	if err != nil || len(temps) != 0 {
+		t.Fatalf("cron temporary files=%v err=%v", temps, err)
+	}
+}
+
+func TestManagedCronIdentityRejectsHardLinksAndUnsafePermissions(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	hardlink := filepath.Join(root, "hardlink")
+	if err := os.WriteFile(source, []byte(managedCronHeader+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(source, hardlink); err != nil {
+		t.Skipf("hard links unavailable: %v", err)
+	}
+	if err := ValidateManagedCronFileIdentity(hardlink); err == nil {
+		t.Fatal("hard-linked cron target was accepted")
+	}
+	if err := os.Remove(hardlink); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(source, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateManagedCronFileIdentity(source); err == nil {
+		t.Fatal("group/world-writable cron target was accepted")
+	}
+}
+
 func TestScheduledRemoteMaintenanceRowsExcludePausedSites(t *testing.T) {
 	db := setupCronGateTest(t)
 	mustExec(t, db, `INSERT INTO db_backups(site_id,filename,file_size,db_name,auto) VALUES(1,'paused.sql.gz',10,'db1',1)`)

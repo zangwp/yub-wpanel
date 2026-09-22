@@ -319,11 +319,21 @@
         <h3 class="text-lg font-semibold text-white mb-4">{{t .Lang "security.telemetry"}}</h3>
         <div class="mb-4">
             <label class="flex items-center space-x-2 cursor-pointer">
-                <input type="checkbox" x-model="settings.telemetry_enabled" @change="saveTelemetry" class="w-4 h-4 rounded border-gray-600 bg-gray-700 text-blue-600">
+                <input type="checkbox" x-model="settings.telemetry_enabled" class="w-4 h-4 rounded border-gray-600 bg-gray-700 text-blue-600">
                 <span class="text-gray-300">{{t .Lang "security.enable_telemetry"}}</span>
             </label>
             <p class="text-xs text-gray-500 mt-2">{{t .Lang "security.telemetry_help"}}</p>
         </div>
+        <div class="mb-4">
+            <label class="block text-sm text-gray-300 mb-2">{{t .Lang "security.telemetry_url"}}</label>
+            <input type="url" x-model.trim="settings.telemetry_url" :disabled="telemetrySaving"
+                   placeholder="https://telemetry.example.com"
+                   class="w-full rounded border border-gray-600 bg-gray-800 px-3 py-2 text-gray-100 disabled:opacity-60">
+            <p class="text-xs text-gray-500 mt-2">{{t .Lang "security.telemetry_url_help"}}</p>
+        </div>
+        <button @click="saveTelemetry" :disabled="telemetrySaving" class="btn-primary text-sm disabled:opacity-60">
+            <span x-text="telemetrySaving ? t('common.saving') : t('security.save_settings')"></span>
+        </button>
     </div>
 </div>
 
@@ -335,6 +345,8 @@ function securitySettings() {
         cdnGroups: [],
         cdnGroupSaving: false,
         sqliSaving: false,
+        telemetrySaving: false,
+        telemetryOriginalEnabled: false,
         cdnGroupForm: { id: null, name: '', header_name: 'X-Forwarded-For', ip_ranges: '', enabled: true, description: '' },
         async fetchSettings() {
             try {
@@ -351,6 +363,7 @@ function securitySettings() {
                     if (typeof map.bot_limit_rpm === 'undefined') map.bot_limit_rpm = 30;
                     if (typeof map.bot_limit_burst === 'undefined') map.bot_limit_burst = 20;
                     this.settings = map;
+                    this.telemetryOriginalEnabled = !!map.telemetry_enabled;
                 }
             } catch(e) {}
         },
@@ -448,21 +461,33 @@ function securitySettings() {
             } catch(e) { showToast(e.message, 'error'); }
         },
         async saveTelemetry() {
-            if (!this.settings.telemetry_enabled) {
+            if (this.settings.telemetry_enabled && !(this.settings.telemetry_url || '').trim()) {
+                showToast(t('security.telemetry_url_required'), 'error');
+                return;
+            }
+            if (this.telemetryOriginalEnabled && !this.settings.telemetry_enabled) {
                 const confirmed = await confirmModal(
                     t('security.telemetry_disable_confirm')
                 );
                 if (!confirmed) {
-                    this.settings.telemetry_enabled = true;
+                    this.settings.telemetry_enabled = this.telemetryOriginalEnabled;
                     return;
                 }
             }
+            this.telemetrySaving = true;
             try {
                 await api('/security/settings', { method: 'PUT', body: {
                     telemetry_enabled: this.settings.telemetry_enabled ? 'true' : 'false',
+                    telemetry_url: (this.settings.telemetry_url || '').trim(),
                 } });
                 showToast(this.settings.telemetry_enabled ? t('security.telemetry_enabled') : t('security.telemetry_disabled'), 'success');
-            } catch(e) { showToast(e.message, 'error'); }
+                await this.fetchSettings();
+            } catch(e) {
+                showToast(e.message, 'error');
+                await this.fetchSettings();
+            } finally {
+                this.telemetrySaving = false;
+            }
         },
         async saveWhitelist() {
             try {
