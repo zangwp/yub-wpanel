@@ -571,7 +571,7 @@ jobs:
           fi
           release_notes="See [CHANGELOG.md](https://github.com/$GITHUB_REPOSITORY/blob/$RELEASE_COMMIT/CHANGELOG.md) and [the verified upgrade guide](https://github.com/$GITHUB_REPOSITORY/blob/$RELEASE_COMMIT/docs/verified-install.md)."
           if [[ "$RELEASE_TAG" == 'v2.0.1' ]]; then
-            release_notes="IMPORTANT for v2.0.0: do not use its built-in online updater for the first hop. Download all nine fixed v2.0.1 installer, panel, and license-archive assets, verify the Ed25519-signed SHA-256 manifests, then run install.sh and select repair. The protected online updater applies from v2.0.1 onward. $release_notes"
+            release_notes="IMPORTANT for v2.0.0: do not use its built-in online updater for the first hop. Download all 12 fixed v2.0.1 assets (the panel binary, two installers, the license archive, and their signed SHA-256 manifests), verify the Ed25519 signatures, then run install.sh and select repair. The protected online updater applies from v2.0.1 onward. $release_notes"
           fi
           gh release create "$RELEASE_TAG" "${assets[@]}" \
             --verify-tag \
