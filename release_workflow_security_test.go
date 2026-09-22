@@ -56,6 +56,7 @@ func TestReleaseWorkflowSupplyChainBoundaries(t *testing.T) {
 		"tailwindcss/releases/download",
 		"softprops/action-gh-release",
 		"--clobber",
+		"go-version-file:",
 	} {
 		if strings.Contains(workflow, forbidden) {
 			t.Errorf("release workflow contains forbidden network build input or action %q", forbidden)
@@ -142,8 +143,19 @@ func TestReleaseWorkflowSupplyChainBoundaries(t *testing.T) {
 		t.Fatal("only the release job may receive contents: write")
 	}
 	for _, required := range []string{
+		"workflow_dispatch:",
+		"go-version: '1.26.8'",
+		`RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}`,
+		`RELEASE_COMMIT: ${{ github.event_name == 'workflow_dispatch' && inputs.release_commit || github.sha }}`,
+		`group: release-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}`,
+		`ref: ${{ env.RELEASE_COMMIT }}`,
 		`=~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`,
+		`test "$(git rev-list -n 1 "refs/tags/$RELEASE_TAG")" = "$RELEASE_COMMIT"`,
+		`test "$GITHUB_REF" = "refs/tags/$RELEASE_TAG"`,
+		`test "$(git rev-parse refs/remotes/origin/main)" = "$RELEASE_COMMIT"`,
+		`test "$GITHUB_REF" = 'refs/heads/main'`,
 		`test "$(git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA"`,
+		`git merge-base --is-ancestor "$RELEASE_COMMIT" refs/remotes/origin/main`,
 		"bash -n install.sh install-cn.sh",
 		"go mod verify",
 		`./dist/yub-wpanel --info --config "$preflight_dir/config.json"`,
@@ -171,9 +183,10 @@ func TestReleaseWorkflowSupplyChainBoundaries(t *testing.T) {
 		`"$gomodcache_real"/*) ;;`,
 		`No top-level license or notice found for $module_path@$module_version`,
 		`test "$(find . -mindepth 1 -maxdepth 1 | wc -l)" -eq 12`,
-		`gh api "/repos/$GH_REPO/git/ref/tags/$GITHUB_REF_NAME"`,
-		`if [[ "$resolved_tag_commit" != "$GITHUB_SHA" ]]`,
+		`gh api "/repos/$GH_REPO/git/ref/tags/$RELEASE_TAG"`,
+		`if [[ "$resolved_tag_commit" != "$RELEASE_COMMIT" ]]`,
 		"refusing to replace published assets",
+		`if [[ "$RELEASE_TAG" == 'v2.0.1' ]]`,
 		"IMPORTANT for v2.0.0: do not use its built-in online updater",
 	} {
 		if !strings.Contains(workflow, required) {
@@ -187,6 +200,23 @@ func TestReleaseWorkflowSupplyChainBoundaries(t *testing.T) {
 	archiveOffset := strings.Index(buildJob, `gzip -n -9 > dist/yub-wpanel-third-party-licenses.tar.gz`)
 	if markerOffset < 0 || archiveOffset < 0 || markerOffset >= archiveOffset {
 		t.Fatalf("license RELEASE_VERSION marker must be created before archive assembly: marker=%d archive=%d", markerOffset, archiveOffset)
+	}
+}
+
+func TestCIWorkflowUsesExactPinnedGoToolchain(t *testing.T) {
+	workflowBytes, err := os.ReadFile(".github/workflows/ci.yml")
+	if err != nil {
+		t.Fatalf("read CI workflow: %v", err)
+	}
+	workflow := string(workflowBytes)
+	if strings.Contains(workflow, "go-version-file:") {
+		t.Fatal("CI workflow must not let setup-go ignore the go.mod toolchain directive")
+	}
+	if strings.Count(workflow, "go-version: '1.26.8'") != 1 {
+		t.Fatal("CI workflow must install exactly Go 1.26.8")
+	}
+	if !strings.Contains(workflow, "GOTOOLCHAIN: local") {
+		t.Fatal("CI workflow must forbid implicit toolchain downloads")
 	}
 }
 
