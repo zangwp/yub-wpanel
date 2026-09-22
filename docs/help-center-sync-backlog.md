@@ -1,8 +1,8 @@
 # Help Center 同步待办清单（跨项目契约）
 
-本文件是 WP Panel（Go 后端）与 wp-panel-theme（官网主题）之间帮助中心内容的**唯一同步接口**。
+本文件是 YUB WPanel（Go 后端）与配套官网主题之间帮助中心内容的**唯一同步接口**。
 
-主题项目位置：`/home/luanc/Projects/wp-themes/wp-panel-theme`。Help Center 内容是真实 WordPress 页面（存数据库，`/help/` 及其子页面），无主题文件副本、无自动同步层。
+主题项目位置由维护者在本地单独配置。Help Center 内容是真实 WordPress 页面（存数据库，`/help/` 及其子页面），无主题文件副本、无自动同步层。
 
 ## 规则
 
@@ -38,7 +38,7 @@
 | 2026-09-14 | backups | 面板数据库恢复增加停机替换、健康检查与自动回退 | 恢复面板数据库时会短暂重启面板；恢复前自动保存当前面板数据库，恢复文件来自更高版本时拒绝。新数据库无法正常启动时自动回退，设置页重新连接后显示成功、已回退或需要人工处理；网站文件和服务器实际配置不会随面板数据库回退 | `docs/features/backup-and-restore.md`、ADR-0040 | 待同步 |
 | 2026-09-14 | websites | 删除网站失败时保留“删除中”状态 | 删除真实资源前先保存“删除中”；若面板状态保存失败则不会开始删除，最终记录清理失败或进程中断时不会继续把残缺网站显示成正常网站，排除故障后可再次点击删除完成收尾。备份文件保留规则不变 | `docs/features/website-runtime-and-cdn.md` | 待同步 |
 | 2026-09-14 | backups | 数据库恢复明示失败后果 | 从已有备份恢复或上传数据库文件时，确认框会说明恢复先清空当前数据库，失败可能留下空库或不完整数据，并建议先备份；面板不强制备份、不自动回滚 | `docs/features/backup-and-restore.md` | 待同步 |
-| 2026-09-14 | security | 面板无法确认封禁状态时临时拒绝访问 | 面板入口查询封禁数据库失败时返回 503“暂时无法确认访问权限”，不会继续认证或错误显示成 IP 已封禁；数据库恢复后自动恢复访问。托管网站及 `wppanel-login` 管理员例外不变 | `docs/features/security-protection.md`、ADR-0039 | 待同步 |
+| 2026-09-14 | security | 面板无法确认封禁状态时临时拒绝访问 | 面板入口查询封禁数据库失败时返回 503“暂时无法确认访问权限”，不会继续认证或错误显示成 IP 已封禁；数据库恢复后自动恢复访问。托管网站及面板登录入口的管理员例外不变 | `docs/features/security-protection.md`、ADR-0039 | 待同步 |
 | 2026-09-14 | getting-started | 修改管理员凭据后所有设备需重新登录 | Web 管理员用户名或密码确实修改成功后，当前浏览器和其他浏览器的既有登录会话全部失效；未变化、保存失败以及单独修改 BasicAuth 或其它设置不触发 | `docs/features/getting-started-and-panel-update.md`、ADR-0038 | 待同步 |
 | 2026-09-14 | getting-started | 登录接口补齐 CSRF 校验 | 正常从登录页登录不变；直接调用登录 API 时必须先取得登录页生成的 CSRF Cookie，并在请求头携带相同 token，缺失或不匹配会返回 403 | `docs/features/getting-started-and-panel-update.md`、ADR-0037 | 待同步 |
 | 2026-09-14 | websites | 网站列表增加整行悬停高亮 | 鼠标经过网站列表中的某个网站时整行高亮，便于网站较多时沿行查看监控、SSL、备份和操作等列；表格布局与功能不变 | `docs/features/website-runtime-and-cdn.md` | 待同步 |
@@ -63,10 +63,10 @@
 | 2026-09-14 | site-migration | 搬家期间补齐危险操作互斥 | 开始搬家前仍须关闭 AI 开发访问；搬家期间不能重装 WordPress、修改域名、开启或轮换 AI 连接包，关闭 AI 访问仍允许 | `docs/features/site-migration.md`、`docs/ai-development-access-design.md` | 待同步 |
 | 2026-09-14 | backups | 清空数据库增加并发保护 | 清空数据库与同站维护、AI 开发访问或网站搬家冲突时会拒绝；继续使用现有不可逆二次确认，不自动创建备份 | `docs/features/backup-and-restore.md` | 待同步 |
 | 2026-09-14 | files-databases | 文件删除与重命名后端保护 | 后端拒绝删除网站根和数据库备份根；重命名不能携带路径或覆盖已有对象。正常文件管理页面原本就没有根目录删除按钮 | `docs/features/files-and-databases.md` | 待同步 |
-| 2026-09-14 | websites | AI 开发连接后的 WP Panel 能力上下文 | AI Home 新增按需读取的 `WP-PANEL-CAPABILITIES.md`；15 类公开能力现在带稳定能力 ID 并由脱敏目录生成。连接 AI 在涉及服务器配置、优化、排障、安全、备份、SSL、更新、迁移、日志、PHP/Nginx、数据库管理或计划任务时，应先读取该文档并引导管理员使用准确入口。能力存在不代表当前站点已启用或配置；不得套用其它面板或通用 LEMP 路径，未知需求可向 WP Panel 项目反馈 | `docs/features/website-runtime-and-cdn.md` | 待同步 |
+| 2026-09-14 | websites | AI 开发连接后的 YUB WPanel 能力上下文 | AI Home 新增按需读取的 `YUB-WPANEL-CAPABILITIES.md`；15 类公开能力现在带稳定能力 ID 并由脱敏目录生成。连接 AI 在涉及服务器配置、优化、排障、安全、备份、SSL、更新、迁移、日志、PHP/Nginx、数据库管理或计划任务时，应先读取该文档并引导管理员使用准确入口。能力存在不代表当前站点已启用或配置；不得套用其它面板或通用 LEMP 路径，未知需求可向 YUB WPanel 项目反馈 | `docs/features/website-runtime-and-cdn.md` | 待同步 |
 | 2026-09-13 | backups | 数据库恢复过程反馈 | 数据库恢复界面区分上传、等待与执行状态，显示已用时间和大数据库耗时提示；恢复期间禁用重复恢复、备份、删除备份和清空数据库等冲突操作。不显示可能误导的百分比进度 | `docs/features/backup-and-restore.md` | 待同步 |
 | 2026-09-13 | security | 日志分析说明服务器流量统计口径与请求构成 | 日志分析首屏将“访问请求/独立 IP”明确为“总请求数/来源 IP 数”，展示 HTTP 444 拒绝与已识别机器人请求及占比；新报告将普通请求互斥拆为安全拒绝、已识别自动流量、HTTP 错误、WordPress 系统端点、静态资源、页面类请求候选和其他请求，展示占比、类内来源 IP 并支持下钻。页面类请求候选仍可能包含未识别自动化，不是页面浏览量、访客或 GA 活跃用户；旧报告需重新分析后查看构成 | `docs/features/ai-and-log-analysis.md` | 待同步 |
-| 2026-09-12 | wordpress | 配套插件发现并请求面板更新 | 插件 1.1.22 会显示面板提供的新版本并允许管理员在插件设置页点击“立即更新”；更新文件来自 WP Panel 内嵌副本，保持插件启停状态。AI 开发访问、临时维护和文件锁不阻止已有配套插件更新；直接修改该托管目录会被覆盖。已删除插件不会自动装回，首次安装仍从面板完成 | `docs/features/wordpress-management.md`、ADR-0033 | 已同步（2026-09-13） |
+| 2026-09-12 | wordpress | 配套插件发现并请求面板更新 | 插件 1.1.22 会显示面板提供的新版本并允许管理员在插件设置页点击“立即更新”；更新文件来自 YUB WPanel 内嵌副本，保持插件启停状态。AI 开发访问、临时维护和文件锁不阻止已有配套插件更新；直接修改该托管目录会被覆盖。已删除插件不会自动装回，首次安装仍从面板完成 | `docs/features/wordpress-management.md`、ADR-0033 | 已同步（2026-09-13） |
 | 2026-09-12 | wordpress | 文件保护期间的配套插件设置范围 | 插件 1.1.23 按实际写入范围开放功能：缓存、预加载、图片上传策略和历史图片优化可继续使用；仅需改写 `wp-config.php` 的更新检测、文件编辑、调试、修订数和 WordPress 内存上限为只读，临时解锁后可修改 | `docs/features/wordpress-management.md` | 已同步（2026-09-13） |
 | 2026-09-13 | wordpress | 临时维护密码的 30 分钟复用边界 | 重新锁定和当前 30 分钟验证期限内的加时无需重复输入密码；跨越期限时由面板服务端强制再次验证。插件按边界显示密码框，并在隐藏、关闭或提交后清空；不额外判断键盘、粘贴或密码管理器输入来源 | `docs/features/wordpress-maintenance.md` | 已同步（2026-09-13） |
 | 2026-09-13 | wordpress | 合并连续首页内容变化通知 | 同一静态首页首次内容变化立即通知；只要相邻两次变化间隔不足 6 小时，就在面板累计次数并保留 info 历史，不重复发送邮件/Webhook；连续 6 小时无变化后的下一次变化重新通知。首页指向改变或原首页删除、回收、取消发布仍即时提醒；文案改为“WordPress 内容变化”，不增加人工确认或长期无人维护判断 | `docs/features/wordpress-anomaly-monitoring.md`、ADR-0034 | 已同步（2026-09-13） |
@@ -94,8 +94,8 @@
 | 2026-09-11 | wordpress | 临时维护复审修复与存量插件交付 | 已锁定站点可直接更新内嵌配套插件，仍保持只读；首次安装/配置重建须解锁；legacy 须先应用标准或严格模式；相同失败请求重放不重复计数 | `docs/features/wordpress-maintenance.md`、ADR-0020 | 已同步（2026-09-13） |
 | 2026-09-11 | wordpress | Admin Bar 与临时维护窗口 | 网站详情默认关闭的维护密码设置；后台解锁与 1/3/5 分钟加时、跨 30 分钟验证；到期/重启强制回锁可能打断更新；5 次密码失败冻结 10 分钟；失败至少 60 秒重试；不含轻量监控 | `docs/features/wordpress-maintenance.md`、ADR-0019 | 已同步（2026-09-13） |
 | 2026-08-18 | wordpress | 新增图片优化功能（内容并入 wordpress 页面的「图片优化」小节） | 插件设置页「图片优化」标签；WebP 模式删除原图、exif 扩展依赖等风险提示 | `docs/features/image-optimization.md` | 已同步（2026-09-03） |
-| 2026-08-23 | site-migration | 新增网站搬家功能（同版本 WP Panel 间迁移） | 网站管理 → 网站搬家；配对/迁移/维护窗口/完成删除流程；远程备份重配提醒 | `docs/features/site-migration.md` | 已同步（2026-09-03） |
-| 2026-09-03 | websites | 修复 AI 开发连接包的跨平台本地权限恢复 | Linux、macOS、WSL 标准入口改为 `bash .wp-panel-ai/connect.sh`；脚本自动收紧私钥为 `0600`，并说明不保留 ZIP mode 的解压工具兼容方式 | `docs/features/website-runtime-and-cdn.md` | 已同步（2026-09-03） |
+| 2026-08-23 | site-migration | 新增网站搬家功能（同版本 YUB WPanel 间迁移） | 网站管理 → 网站搬家；配对/迁移/维护窗口/完成删除流程；远程备份重配提醒 | `docs/features/site-migration.md` | 已同步（2026-09-03） |
+| 2026-09-03 | websites | 修复 AI 开发连接包的跨平台本地权限恢复 | Linux、macOS、WSL 标准入口改为 `bash .yub-wpanel-ai/connect.sh`；脚本自动收紧私钥为 `0600`，并说明不保留 ZIP mode 的解压工具兼容方式 | `docs/features/website-runtime-and-cdn.md` | 已同步（2026-09-03） |
 | 2026-09-10 | websites | 网站暂停联动站点自动任务 | 暂停后自动备份、WP Cron 和站点用户命令暂缓；已运行任务完成，启用后自然恢复；SSL、安全维护和库存刷新继续 | `docs/features/website-runtime-and-cdn.md` | 已同步（2026-09-13） |
 | 2026-09-10 | backups | 暂停网站的备份运行语义 | 自动数据库/文件备份及远程后台维护暂缓，策略不关闭；手动维护保留；暂停或迁移冻结期间不触发备份失败误报 | `docs/features/backup-and-restore.md` | 已同步（2026-09-13） |
 | 2026-09-10 | operations | 计划任务增加站点运行门禁 | 计划任务页显示“随网站暂停”或“迁移期间暂缓”；暂停网站手动执行需二次确认，正常跳过不覆盖最后执行结果 | `docs/features/operations-and-settings.md` | 已同步（2026-09-13） |
