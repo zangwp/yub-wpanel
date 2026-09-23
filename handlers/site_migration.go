@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/zangwp/yub-wpanel/executor"
 	"github.com/zangwp/yub-wpanel/i18n"
+	"github.com/zangwp/yub-wpanel/middleware"
 	"github.com/zangwp/yub-wpanel/models"
 )
 
@@ -621,14 +623,24 @@ func decodeSiteMigrationJSONLimit(c *gin.Context, target any, limit int64) bool 
 	decoder := json.NewDecoder(c.Request.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
-		siteMigrationError(c, http.StatusBadRequest, "common.invalid_params")
+		siteMigrationDecodeError(c, err)
 		return false
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		siteMigrationError(c, http.StatusBadRequest, "common.invalid_params")
+		siteMigrationDecodeError(c, err)
 		return false
 	}
 	return true
+}
+
+func siteMigrationDecodeError(c *gin.Context, err error) {
+	middleware.AbortSiteMigrationRequestBody(c)
+	status := http.StatusBadRequest
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		status = http.StatusRequestTimeout
+	}
+	siteMigrationError(c, status, "common.invalid_params")
 }
 
 func siteMigrationError(c *gin.Context, status int, key string) {

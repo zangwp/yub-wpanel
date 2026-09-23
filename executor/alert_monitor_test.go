@@ -3,8 +3,11 @@ package executor
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -52,6 +55,116 @@ func TestAlertRuleSustainedFiringResets(t *testing.T) {
 	}
 	if r.sustainedFiring(true, start.Add(6*time.Minute)) {
 		t.Fatal("new high period should restart the timer")
+	}
+}
+
+func TestUnknownAlertCheckPreservesFiringAndPendingState(t *testing.T) {
+	previousReporter := reportAlertStateError
+	reportAlertStateError = func(string, ...any) {}
+	t.Cleanup(func() { reportAlertStateError = previousReporter })
+
+	pending := time.Date(2026, 9, 1, 1, 2, 3, 0, time.UTC)
+	fired := pending.Add(-time.Hour)
+	rule := &alertRule{
+		key:          "alert_backup",
+		firing:       true,
+		pendingSince: pending,
+		lastFired:    fired,
+		lastAlertMsg: "backup is stale",
+	}
+	processAlertCheckResult(rule, unknownAlertCheck(errors.New("database locked")), pending.Add(time.Minute), false, false)
+
+	if !rule.firing || !rule.pendingSince.Equal(pending) || !rule.lastFired.Equal(fired) || rule.lastAlertMsg != "backup is stale" {
+		t.Fatalf("unknown check changed alert state: %+v", rule)
+	}
+}
+
+func TestDatabaseAlertChecksReportUnknownOnQueryFailure(t *testing.T) {
+	openAlertTestDB(t) // Deliberately leave all checker tables absent.
+	tests := []struct {
+		name  string
+		check func() alertCheckResult
+	}{
+		{name: "cpu", check: checkCPUState},
+		{name: "memory", check: checkMemoryState},
+		{name: "ssl", check: checkSSLState},
+		{name: "backup", check: checkBackupState},
+		{name: "remote backup", check: checkRemoteBackupState},
+		{name: "cron", check: checkCronFailState},
+		{name: "sites", check: checkSitesState},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.check()
+			if result.state != alertCheckUnknown || result.err == nil {
+				t.Fatalf("result=%+v, want unknown with error", result)
+			}
+		})
+	}
+}
+
+func TestMetricAlertChecksReportUnknownWithoutSamples(t *testing.T) {
+	db := openAlertTestDB(t)
+	mustExec(t, db, `CREATE TABLE monitoring_metrics (
+		id INTEGER PRIMARY KEY, cpu_percent TEXT, memory_percent TEXT, recorded_at TEXT)`)
+	for _, check := range []struct {
+		name string
+		fn   func() alertCheckResult
+	}{{name: "cpu", fn: checkCPUState}, {name: "memory", fn: checkMemoryState}} {
+		t.Run(check.name, func(t *testing.T) {
+			result := check.fn()
+			if result.state != alertCheckUnknown || result.err == nil {
+				t.Fatalf("result=%+v, want unknown with an explanatory error", result)
+			}
+		})
+	}
+}
+
+func TestMetricAlertChecksReportUnknownForStaleSamples(t *testing.T) {
+	db := openAlertTestDB(t)
+	mustExec(t, db, `CREATE TABLE monitoring_metrics (
+		id INTEGER PRIMARY KEY, cpu_percent TEXT, memory_percent TEXT, recorded_at TEXT)`)
+	staleAt := time.Now().UTC().Add(-monitoringMetricMaxAge - time.Minute).Format("2006-01-02 15:04:05")
+	if _, err := db.Exec(`INSERT INTO monitoring_metrics (cpu_percent, memory_percent, recorded_at)
+		VALUES ('10', '20', ?)`, staleAt); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, check := range []struct {
+		name string
+		fn   func() alertCheckResult
+	}{{name: "cpu", fn: checkCPUState}, {name: "memory", fn: checkMemoryState}} {
+		t.Run(check.name, func(t *testing.T) {
+			result := check.fn()
+			if result.state != alertCheckUnknown || result.err == nil || !strings.Contains(result.err.Error(), "stale") {
+				t.Fatalf("result=%+v, want unknown stale sample", result)
+			}
+		})
+	}
+}
+
+func TestServiceAlertUsesLiveStateAndReportsUnknownWhenUnreadable(t *testing.T) {
+	previousGuard := guard
+	previousCommand := guardCommand
+	guard = &ProcessGuard{services: []*GuardService{{Name: "Nginx", ServiceName: "nginx"}}}
+	t.Cleanup(func() {
+		guard = previousGuard
+		guardCommand = previousCommand
+	})
+
+	guardCommand = func(string, ...string) ([]byte, error) {
+		return nil, errors.New("systemd unavailable")
+	}
+	if result := checkServiceState(); result.state != alertCheckUnknown || result.err == nil {
+		t.Fatalf("unreadable service state=%+v, want unknown", result)
+	}
+
+	guardCommand = func(string, ...string) ([]byte, error) {
+		return []byte("ActiveState=failed\nNRestarts=0\nResult=exit-code\n"), nil
+	}
+	result := checkServiceState()
+	if result.state != alertCheckFiring || !strings.Contains(result.message, "服务未运行") {
+		t.Fatalf("down service with no in-memory restart history=%+v, want firing", result)
 	}
 }
 
@@ -117,6 +230,89 @@ func TestAlertRuntimeStateRetriesAfterDatabaseRecovers(t *testing.T) {
 	}
 }
 
+func TestAlertResolutionRetriesAfterDatabaseRecovers(t *testing.T) {
+	db := openAlertTestDB(t)
+	mustExec(t, db, `CREATE TABLE alert_runtime_state (
+		alert_type TEXT PRIMARY KEY, status TEXT, pending_since TEXT,
+		last_fired_at TEXT, last_message TEXT, updated_at DATETIME)`)
+	previousReporter := reportAlertStateError
+	reportAlertStateError = func(string, ...any) {}
+	t.Cleanup(func() { reportAlertStateError = previousReporter })
+
+	rule := &alertRule{key: "alert_ssl"}
+	if err := resolveOpenAlertRows(rule); err == nil || !rule.resolutionDirty {
+		t.Fatalf("missing alert_log table should leave resolution dirty: err=%v rule=%+v", err, rule)
+	}
+	if err := persistAlertRuntimeState(rule); err == nil || !rule.runtimeStateDirty {
+		t.Fatalf("normal runtime state must wait for alert resolution: err=%v rule=%+v", err, rule)
+	}
+	var runtimeRows int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM alert_runtime_state`).Scan(&runtimeRows); err != nil {
+		t.Fatal(err)
+	}
+	if runtimeRows != 0 {
+		t.Fatalf("persisted normal state before alert resolution: rows=%d", runtimeRows)
+	}
+	mustExec(t, db, `CREATE TABLE alert_log (
+		id INTEGER PRIMARY KEY, alert_type TEXT, resolved INTEGER DEFAULT 0)`)
+	mustExec(t, db, `INSERT INTO alert_log (alert_type, resolved) VALUES ('alert_ssl', 0)`)
+	retryDirtyAlertRuntimeState(rule)
+	if rule.resolutionDirty {
+		t.Fatalf("resolution retry should converge: rule=%+v", rule)
+	}
+	var resolved int
+	if err := db.QueryRow(`SELECT resolved FROM alert_log WHERE alert_type='alert_ssl'`).Scan(&resolved); err != nil {
+		t.Fatal(err)
+	}
+	if resolved != 1 {
+		t.Fatalf("resolved=%d, want 1", resolved)
+	}
+	var status string
+	if err := db.QueryRow(`SELECT status FROM alert_runtime_state WHERE alert_type='alert_ssl'`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "normal" {
+		t.Fatalf("runtime status=%q, want normal", status)
+	}
+}
+
+func TestAlertResolutionRetryDoesNotResolveRefiredIncident(t *testing.T) {
+	db := openAlertTestDB(t)
+	mustExec(t, db, `CREATE TABLE alert_log (
+		id INTEGER PRIMARY KEY, alert_type TEXT, resolved INTEGER DEFAULT 0)`)
+	mustExec(t, db, `INSERT INTO alert_log (alert_type, resolved) VALUES ('alert_ssl', 0)`)
+
+	rule := &alertRule{key: "alert_ssl", firing: true, resolutionDirty: true}
+	retryDirtyAlertRuntimeState(rule)
+
+	var resolved int
+	if err := db.QueryRow(`SELECT resolved FROM alert_log WHERE alert_type='alert_ssl'`).Scan(&resolved); err != nil {
+		t.Fatal(err)
+	}
+	if resolved != 0 {
+		t.Fatalf("refired incident resolved=%d, want unresolved", resolved)
+	}
+	if !rule.resolutionDirty {
+		t.Fatal("deferred resolution must remain dirty until the firing incident recovers")
+	}
+}
+
+func TestPersistAlertRuntimeStateMarksNilDatabaseDirty(t *testing.T) {
+	previousDB := database.DB
+	database.DB = nil
+	previousReporter := reportAlertStateError
+	reportAlertStateError = func(string, ...any) {}
+	t.Cleanup(func() {
+		database.DB = previousDB
+		reportAlertStateError = previousReporter
+	})
+
+	rule := &alertRule{key: "alert_ssl", firing: true}
+	if err := persistAlertRuntimeState(rule); err == nil || !rule.runtimeStateDirty {
+		t.Fatalf("nil database should leave runtime state dirty: err=%v rule=%+v", err, rule)
+	}
+}
+
 func TestLoadAlertRuntimeStateDistinguishesMissingRowFromReadFailure(t *testing.T) {
 	db := openAlertTestDB(t)
 	mustExec(t, db, `CREATE TABLE alert_runtime_state (
@@ -129,14 +325,65 @@ func TestLoadAlertRuntimeStateDistinguishesMissingRowFromReadFailure(t *testing.
 	}
 	t.Cleanup(func() { reportAlertStateError = previousReporter })
 
-	loadAlertRuntimeState([]*alertRule{{key: "alert_ssl"}})
+	missingRule := &alertRule{key: "alert_ssl"}
+	loadAlertRuntimeState([]*alertRule{missingRule})
 	if len(reports) != 0 {
 		t.Fatalf("missing row should be normal, reports=%v", reports)
 	}
+	if !missingRule.runtimeStateLoaded {
+		t.Fatal("a confirmed missing runtime row should mark the rule ready")
+	}
 	mustExec(t, db, `DROP TABLE alert_runtime_state`)
-	loadAlertRuntimeState([]*alertRule{{key: "alert_ssl"}})
+	failedRule := &alertRule{key: "alert_ssl"}
+	loadAlertRuntimeState([]*alertRule{failedRule})
 	if len(reports) != 1 || !strings.Contains(reports[0], "读取告警运行状态失败") {
 		t.Fatalf("read failure should be reported once, reports=%v", reports)
+	}
+	if failedRule.runtimeStateLoaded {
+		t.Fatal("a failed runtime read must keep the rule blocked")
+	}
+}
+
+func TestAlertRuntimeStateLoadRetriesAfterDatabaseRecovers(t *testing.T) {
+	db := openAlertTestDB(t)
+	previousReporter := reportAlertStateError
+	reportAlertStateError = func(string, ...any) {}
+	t.Cleanup(func() { reportAlertStateError = previousReporter })
+
+	rule := &alertRule{key: "alert_ssl"}
+	if ensureAlertRuntimeStateLoaded(rule) {
+		t.Fatal("rule became ready while the runtime-state table was unavailable")
+	}
+	if rule.runtimeStateLoaded {
+		t.Fatal("failed load must remain retryable")
+	}
+
+	mustExec(t, db, `CREATE TABLE alert_runtime_state (
+		alert_type TEXT PRIMARY KEY, status TEXT, pending_since TEXT,
+		last_fired_at TEXT, last_message TEXT, updated_at DATETIME)`)
+	firedAt := time.Date(2026, 9, 23, 1, 2, 3, 0, time.UTC)
+	if _, err := db.Exec(`INSERT INTO alert_runtime_state
+		(alert_type,status,pending_since,last_fired_at,last_message)
+		VALUES ('alert_ssl','firing','',?,'certificate expiring')`, formatAlertStateTime(firedAt)); err != nil {
+		t.Fatal(err)
+	}
+
+	if !ensureAlertRuntimeStateLoaded(rule) {
+		t.Fatal("rule did not become ready after the database recovered")
+	}
+	if !rule.firing || !rule.lastFired.Equal(firedAt) || rule.lastAlertMsg != "certificate expiring" {
+		t.Fatalf("persisted firing state was not restored: %+v", rule)
+	}
+}
+
+func TestRemoteBackupMissingSingletonIsUnknown(t *testing.T) {
+	db := openAlertTestDB(t)
+	mustExec(t, db, `CREATE TABLE remote_backup_settings (
+		id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0)`)
+
+	result := checkRemoteBackupState()
+	if result.state != alertCheckUnknown || result.err == nil {
+		t.Fatalf("result=%+v, want unknown for missing singleton settings", result)
 	}
 }
 
@@ -206,6 +453,61 @@ func TestCheckSSLRunsCloudflareDetectionsConcurrently(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("checkSSL did not finish after concurrent detections were released")
+	}
+}
+
+func TestCheckSSLLimitsCloudflareDetectionWorkers(t *testing.T) {
+	db := openAlertTestDB(t)
+	mustExec(t, db, `CREATE TABLE websites (
+		domain TEXT, ssl_enabled INTEGER, ssl_expires_at DATETIME, ssl_last_error TEXT)`)
+	total := maxSSLCloudflareDetectionWorkers + 5
+	for i := 0; i < total; i++ {
+		if _, err := db.Exec(`INSERT INTO websites VALUES (?, 1, datetime('now', '+5 days'), 'failed')`, fmt.Sprintf("site-%d.example", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	previousDetector := cloudflareProxyDetector
+	started := make(chan struct{}, total)
+	release := make(chan struct{})
+	cloudflareProxyDetector = func(string) bool {
+		started <- struct{}{}
+		<-release
+		return false
+	}
+	t.Cleanup(func() { cloudflareProxyDetector = previousDetector })
+
+	done := make(chan alertCheckResult, 1)
+	go func() { done <- checkSSLState() }()
+	for i := 0; i < maxSSLCloudflareDetectionWorkers; i++ {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			close(release)
+			t.Fatal("SSL detection worker pool did not fill")
+		}
+	}
+
+	overLimit := false
+	select {
+	case <-started:
+		overLimit = true
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case result := <-done:
+		if result.state != alertCheckFiring {
+			t.Fatalf("result=%+v, want firing SSL alert", result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("checkSSLState did not finish after workers were released")
+	}
+	if overLimit {
+		t.Fatalf("more than %d Cloudflare detections ran concurrently", maxSSLCloudflareDetectionWorkers)
+	}
+	if got := maxSSLCloudflareDetectionWorkers + len(started); got != total {
+		t.Fatalf("Cloudflare detection calls=%d, want %d", got, total)
 	}
 }
 
@@ -405,6 +707,150 @@ func TestCheckPanelUpdateUsesCachedMessage(t *testing.T) {
 	}
 }
 
+func TestSystemUpdateCommandRunsAptDirectly(t *testing.T) {
+	cmd := newSystemUpdateCommand(context.Background())
+	want := "apt list --upgradable"
+	if got := strings.Join(cmd.Args, " "); got != want {
+		t.Fatalf("system update command=%q, want %q", got, want)
+	}
+}
+
+func TestSystemUpdateCommandFailureIsUnknown(t *testing.T) {
+	previousCommand := runSystemUpdateCommand
+	sysUpdateCache.mu.Lock()
+	previousLastAt := sysUpdateCache.lastAt
+	previousNames := sysUpdateCache.names
+	sysUpdateCache.lastAt = time.Time{}
+	sysUpdateCache.names = nil
+	sysUpdateCache.mu.Unlock()
+	runSystemUpdateCommand = func() ([]byte, error) {
+		return nil, errors.New("apt unavailable")
+	}
+	t.Cleanup(func() {
+		runSystemUpdateCommand = previousCommand
+		sysUpdateCache.mu.Lock()
+		sysUpdateCache.lastAt = previousLastAt
+		sysUpdateCache.names = previousNames
+		sysUpdateCache.mu.Unlock()
+	})
+
+	result := checkSystemUpdateState()
+	if result.state != alertCheckUnknown || result.err == nil {
+		t.Fatalf("result=%+v, want unknown when update command fails", result)
+	}
+}
+
+func TestPanelUpdateFetchFailuresAreUnknown(t *testing.T) {
+	previousFetch := fetchLatestPanelReleaseForAlert
+	previousCurrent := panelCurrentVersion
+	panelUpdateCache.mu.Lock()
+	previousLastAt := panelUpdateCache.lastAt
+	previousLatest := panelUpdateCache.latest
+	previousMessage := panelUpdateCache.message
+	panelUpdateCache.lastAt = time.Time{}
+	panelUpdateCache.latest = ""
+	panelUpdateCache.message = ""
+	panelUpdateCache.mu.Unlock()
+	panelCurrentVersion = "v2.0.1"
+	t.Cleanup(func() {
+		fetchLatestPanelReleaseForAlert = previousFetch
+		panelCurrentVersion = previousCurrent
+		panelUpdateCache.mu.Lock()
+		panelUpdateCache.lastAt = previousLastAt
+		panelUpdateCache.latest = previousLatest
+		panelUpdateCache.message = previousMessage
+		panelUpdateCache.mu.Unlock()
+	})
+
+	t.Run("request failure", func(t *testing.T) {
+		fetchLatestPanelReleaseForAlert = func(string) (*GithubRelease, error) {
+			return nil, errors.New("GitHub unavailable")
+		}
+		result := checkPanelUpdateState()
+		if result.state != alertCheckUnknown || result.err == nil {
+			t.Fatalf("result=%+v, want unknown", result)
+		}
+	})
+	t.Run("empty release", func(t *testing.T) {
+		fetchLatestPanelReleaseForAlert = func(string) (*GithubRelease, error) {
+			return &GithubRelease{}, nil
+		}
+		result := checkPanelUpdateState()
+		if result.state != alertCheckUnknown || result.err == nil {
+			t.Fatalf("result=%+v, want unknown", result)
+		}
+	})
+}
+
+func TestWPFakeSearchBotFailuresAreUnknown(t *testing.T) {
+	t.Run("configuration query", func(t *testing.T) {
+		openAlertTestDB(t)
+		result := checkWPFakeSearchBotThresholdState()
+		if result.state != alertCheckUnknown || result.err == nil {
+			t.Fatalf("result=%+v, want unknown", result)
+		}
+	})
+
+	t.Run("event query", func(t *testing.T) {
+		db := openAlertTestDB(t)
+		seedWPSecurityAlertSettings(t, db, 1, 24)
+		result := checkWPFakeSearchBotThresholdState()
+		if result.state != alertCheckUnknown || result.err == nil {
+			t.Fatalf("result=%+v, want unknown", result)
+		}
+	})
+
+	t.Run("event row scan", func(t *testing.T) {
+		db := openAlertTestDB(t)
+		seedWPSecurityAlertSettings(t, db, 1, 24)
+		mustExec(t, db, `CREATE TABLE wp_security_events (
+			ip_address TEXT, event_type TEXT, occurred_at TEXT, path TEXT)`)
+		mustExec(t, db, `INSERT INTO wp_security_events
+			(ip_address, event_type, occurred_at, path)
+			VALUES (NULL, 'fake_search_bot', datetime('now'), '/wp-login.php')`)
+		result := checkWPFakeSearchBotThresholdState()
+		if result.state != alertCheckUnknown || result.err == nil || !strings.Contains(result.err.Error(), "scan") {
+			t.Fatalf("result=%+v, want unknown scan failure", result)
+		}
+	})
+}
+
+func TestWPSecurityAlertQueryBoundsOffendersBeforeLoadingPaths(t *testing.T) {
+	db := openAlertTestDB(t)
+	mustExec(t, db, `CREATE TABLE wp_security_events (
+		ip_address TEXT NOT NULL, event_type TEXT NOT NULL,
+		occurred_at TEXT NOT NULL, path TEXT NOT NULL)`)
+	recent := time.Now().UTC().Add(-time.Hour).Format("2006-01-02 15:04:05")
+	for index, count := range []int{2, 4, 3} {
+		ip := fmt.Sprintf("192.0.2.%d", index+1)
+		for hit := 0; hit < count; hit++ {
+			if _, err := db.Exec(`INSERT INTO wp_security_events
+				(ip_address, event_type, occurred_at, path) VALUES (?, ?, ?, ?)`,
+				ip, SecurityEventFakeSearchBot, recent, fmt.Sprintf("/path-%d", hit)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	offenders, omitted, err := queryWPSecurityOffendersForAlert(
+		SecurityEventFakeSearchBot, time.Now().UTC().Add(-24*time.Hour), 1, 3, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(offenders) != 2 || omitted != 1 {
+		t.Fatalf("offenders=%+v omitted=%d, want two retained and one omitted", offenders, omitted)
+	}
+	if offenders[0].IP != "192.0.2.2" || offenders[0].Count != 4 ||
+		offenders[1].IP != "192.0.2.3" || offenders[1].Count != 3 {
+		t.Fatalf("unexpected bounded offender order: %+v", offenders)
+	}
+	for _, offender := range offenders {
+		if len(offender.Paths) == 0 || len(offender.Paths) > 3 {
+			t.Fatalf("unexpected bounded paths for %+v", offender)
+		}
+	}
+}
+
 func TestCheckBackupReportsOnlyStaleEnabledSites(t *testing.T) {
 	db := openAlertTestDB(t)
 	mustExec(t, db, `CREATE TABLE websites (id INTEGER PRIMARY KEY, domain TEXT, status TEXT)`)
@@ -469,7 +915,7 @@ func TestCheckSitesKeepsCachedFailureWhenCheckIsSkipped(t *testing.T) {
 	}
 }
 
-func TestCheckSitesDoesNotAlertOnUnconfirmedCachedFailure(t *testing.T) {
+func TestCheckSitesReportsUnknownOnUnconfirmedCachedFailure(t *testing.T) {
 	db := openAlertTestDB(t)
 	mustExec(t, db, `CREATE TABLE websites (
 		id INTEGER PRIMARY KEY,
@@ -487,12 +933,40 @@ func TestCheckSitesDoesNotAlertOnUnconfirmedCachedFailure(t *testing.T) {
 	siteFailureMessages["1"] = "slow.example timeout"
 	siteFailureCounts["1"] = siteFailureAlertThreshold - 1
 
-	firing, msg := checkSites()
-	if firing {
-		t.Fatalf("unconfirmed cached failure should not alert, got %q", msg)
+	result := checkSitesState()
+	if result.state != alertCheckUnknown || result.err == nil {
+		t.Fatalf("unconfirmed cached failure=%+v, want unknown", result)
 	}
-	if msg != "" {
-		t.Fatalf("unconfirmed cached failure should have empty message, got %q", msg)
+}
+
+func TestCheckSitesReportsUnknownOnFirstFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	db := openAlertTestDB(t)
+	mustExec(t, db, `CREATE TABLE websites (
+		id INTEGER PRIMARY KEY,
+		domain TEXT,
+		status TEXT,
+		ssl_enabled INTEGER,
+		monitoring_enabled INTEGER,
+		monitoring_interval INTEGER
+	)`)
+	domain := strings.TrimPrefix(server.URL, "http://")
+	if _, err := db.Exec(`INSERT INTO websites
+		(id, domain, status, ssl_enabled, monitoring_enabled, monitoring_interval)
+		VALUES (1, ?, 'active', 0, 1, 5)`, domain); err != nil {
+		t.Fatal(err)
+	}
+
+	result := checkSitesState()
+	if result.state != alertCheckUnknown || result.err == nil {
+		t.Fatalf("first failed check=%+v, want unknown until threshold is reached", result)
+	}
+	if siteFailureCounts["1"] != 1 {
+		t.Fatalf("failure count=%d, want 1", siteFailureCounts["1"])
 	}
 }
 
@@ -528,5 +1002,15 @@ func mustExec(t *testing.T, db *sql.DB, query string) {
 	t.Helper()
 	if _, err := db.Exec(query); err != nil {
 		t.Fatalf("exec failed: %v\nSQL: %s", err, query)
+	}
+}
+
+func seedWPSecurityAlertSettings(t *testing.T, db *sql.DB, threshold, windowHours int) {
+	t.Helper()
+	mustExec(t, db, `CREATE TABLE security_settings (skey TEXT PRIMARY KEY, svalue TEXT)`)
+	if _, err := db.Exec(`INSERT INTO security_settings (skey, svalue) VALUES
+		('alert_wp_security_threshold', ?),
+		('alert_wp_security_window_hours', ?)`, threshold, windowHours); err != nil {
+		t.Fatalf("seed WordPress security alert settings: %v", err)
 	}
 }

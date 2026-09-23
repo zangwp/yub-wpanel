@@ -177,6 +177,9 @@ func TestSaveBackupPolicyRollsBackWhenCronRenderFails(t *testing.T) {
 	renderBackupPolicyCron = func() error {
 		calls++
 		if calls == 1 {
+			if _, err := db.Exec(`UPDATE cron_jobs SET running=1,last_status='running',last_output='new runtime output' WHERE id=42`); err != nil {
+				t.Fatalf("update runtime state during render: %v", err)
+			}
 			return errors.New("render failed")
 		}
 		return nil
@@ -195,12 +198,43 @@ func TestSaveBackupPolicyRollsBackWhenCronRenderFails(t *testing.T) {
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
 	}
-	var enabled, keep, jobID int
+	var enabled, keep, jobID, running int
 	var expression, output string
 	_ = db.QueryRow(`SELECT enabled,keep_count FROM backup_settings WHERE site_id=1`).Scan(&enabled, &keep)
-	_ = db.QueryRow(`SELECT id,cron_expression,last_output FROM cron_jobs WHERE site_id=1 AND task_type='file_backup'`).Scan(&jobID, &expression, &output)
-	if enabled != 0 || keep != 5 || jobID != 42 || expression != "0 2 2 * *" || output != "old output" || calls != 2 {
-		t.Fatalf("rollback setting=%d/%d job=%d/%q/%q render calls=%d", enabled, keep, jobID, expression, output, calls)
+	_ = db.QueryRow(`SELECT id,cron_expression,running,last_output FROM cron_jobs WHERE site_id=1 AND task_type='file_backup'`).Scan(&jobID, &expression, &running, &output)
+	if enabled != 0 || keep != 5 || jobID != 42 || expression != "0 2 2 * *" || running != 1 || output != "new runtime output" || calls != 2 {
+		t.Fatalf("rollback setting=%d/%d job=%d/%q runtime=%d/%q render calls=%d", enabled, keep, jobID, expression, running, output, calls)
+	}
+}
+
+func TestSaveBackupPolicyRejectsRunningFileBackupWithoutDeletingIt(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setupBackupOverviewTestDB(t)
+	insertBackupPolicySite(t, 1, "running.example.com")
+	db := database.GetDB()
+	if _, err := db.Exec(`INSERT INTO cron_jobs(id,name,cron_expression,command,task_type,backup_mode,site_id,enabled,running)
+		VALUES(43,'running task','0 2 2 * *',?,'file_backup','incremental',1,1,1)`, backupPolicyCommand); err != nil {
+		t.Fatal(err)
+	}
+
+	body, _ := json.Marshal(backupPolicyRequest{Sites: []backupPolicySiteRequest{{
+		SiteID: 1, DBKeepCount: 7, IncrementalEnabled: false,
+	}}})
+	router := gin.New()
+	router.PUT("/api/backups/policy", SaveBackupPolicy)
+	req := httptest.NewRequest(http.MethodPut, "/api/backups/policy", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var count, running int
+	if err := db.QueryRow(`SELECT COUNT(*),COALESCE(MAX(running),0) FROM cron_jobs WHERE id=43`).Scan(&count, &running); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 || running != 1 {
+		t.Fatalf("running task changed during rejected policy update: count=%d running=%d", count, running)
 	}
 }
 

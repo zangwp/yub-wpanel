@@ -32,6 +32,29 @@ const pairingPeerTestSchema = `CREATE TABLE site_migration_peers (
 	created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 )`
 
+func TestPinnedMigrationClientsDoNotRetainPerRequestIdleConnections(t *testing.T) {
+	fingerprint := strings.Repeat("a", 64)
+	clients := []struct {
+		name string
+		new  func() (*http.Client, error)
+	}{
+		{name: "bounded", new: func() (*http.Client, error) { return pinnedMigrationClient(fingerprint, time.Minute) }},
+		{name: "streaming", new: func() (*http.Client, error) { return pinnedMigrationStreamingClient(fingerprint) }},
+	}
+	for _, tc := range clients {
+		t.Run(tc.name, func(t *testing.T) {
+			client, err := tc.new()
+			if err != nil {
+				t.Fatal(err)
+			}
+			transport, ok := client.Transport.(*http.Transport)
+			if !ok || !transport.DisableKeepAlives {
+				t.Fatalf("transport=%T disable_keep_alives=%v", client.Transport, ok && transport.DisableKeepAlives)
+			}
+		})
+	}
+}
+
 func TestSiteMigrationPairingBidirectionalPinnedTLS(t *testing.T) {
 	dbA := newPairingTestDB(t)
 	dbB := newPairingTestDB(t)
@@ -176,6 +199,51 @@ func TestSiteMigrationPairingRejectsExpiredAndFiveFailures(t *testing.T) {
 	}
 	if attempts != siteMigrationPairMaxFails {
 		t.Fatalf("pair_attempts=%d, want %d", attempts, siteMigrationPairMaxFails)
+	}
+}
+
+func TestSiteMigrationMachineBearerPreauthorizationHonorsPeerState(t *testing.T) {
+	db := newPairingTestDB(t)
+	certPath, _ := newPairingTestCertificate(t, "panel-auth")
+	service, err := NewSiteMigrationPairingService(db, "1.2.3", certPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := randomMigrationValue("", 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO site_migration_peers
+		(id,inbound_credential_hash,protocol_version,status) VALUES (?,?,?,'pending')`,
+		"peer_00000000000000000001", hashMigrationSecret(credential), siteMigrationProtocolVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.AuthorizeMachineBearer(context.Background(), credential, false); err == nil {
+		t.Fatal("pending credential authorized for a paired-only machine endpoint")
+	}
+	if err := service.AuthorizeMachineBearer(context.Background(), credential, true); err != nil {
+		t.Fatalf("pending challenge credential rejected: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE site_migration_peers SET status='paired'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.AuthorizeMachineBearer(context.Background(), credential, false); err != nil {
+		t.Fatalf("paired credential rejected: %v", err)
+	}
+	wrong, err := randomMigrationValue("", 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{"", "not-a-generated-credential", wrong} {
+		if err := service.AuthorizeMachineBearer(context.Background(), value, true); err == nil {
+			t.Fatalf("invalid credential %q unexpectedly authorized", value)
+		}
+	}
+	if _, err := db.Exec(`UPDATE site_migration_peers SET protocol_version=1`); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.AuthorizeMachineBearer(context.Background(), credential, true); err == nil {
+		t.Fatal("legacy protocol credential unexpectedly authorized")
 	}
 }
 

@@ -56,7 +56,7 @@ func TestMaintenanceStartupPrecedesSiteWriters(t *testing.T) {
 			}
 			return true
 		})
-		guarded = flags["resetAdmin"] && flags["resetPass"] && flags["refreshWhitelist"] && flags["unbanAll"] && flags["fileBackup"] && flags["runAutoBackup"]
+		guarded = flags["resetAdmin"] && flags["refreshWhitelist"] && flags["unbanAll"] && flags["fileBackup"] && flags["runAutoBackup"]
 		return true
 	})
 	if !guarded {

@@ -530,7 +530,10 @@ func (h *WebsiteHandler) Create(c *gin.Context) {
 		InstallPlugins:     req.InstallPlugins,
 	}
 
-	task := executor.GlobalQueue.Enqueue(executor.TaskCreateSite, payload)
+	task, queued := enqueueTask(c, executor.TaskCreateSite, payload)
+	if !queued {
+		return
+	}
 	result := <-task.ResultCh
 	if result.Success {
 		c.JSON(http.StatusOK, models.SuccessResponse(result.Data))
@@ -573,9 +576,12 @@ func (h *WebsiteHandler) SetDocumentRoot(c *gin.Context) {
 		return
 	}
 
-	task := executor.GlobalQueue.Enqueue(executor.TaskSetDocumentRoot, &executor.SetDocumentRootPayload{
+	task, queued := enqueueTask(c, executor.TaskSetDocumentRoot, &executor.SetDocumentRootPayload{
 		Site: site, DocumentRootSubdir: documentRootSubdir,
 	})
+	if !queued {
+		return
+	}
 	result := <-task.ResultCh
 	if result.Success {
 		c.JSON(http.StatusOK, models.SuccessResponse(gin.H{"message": result.Message}))
@@ -608,7 +614,10 @@ func (h *WebsiteHandler) Delete(c *gin.Context) {
 	}
 
 	payload := &executor.DeleteSitePayload{Site: site}
-	task := executor.GlobalQueue.Enqueue(executor.TaskDeleteSite, payload)
+	task, queued := enqueueTask(c, executor.TaskDeleteSite, payload)
+	if !queued {
+		return
+	}
 	result := <-task.ResultCh
 	if result.Success {
 		c.JSON(http.StatusOK, models.SuccessResponse(gin.H{"message": result.Message}))
@@ -725,7 +734,10 @@ func (h *WebsiteHandler) ToggleStatus(c *gin.Context) {
 		payload = &executor.EnableSitePayload{Site: site}
 	}
 
-	task := executor.GlobalQueue.Enqueue(taskType, payload)
+	task, queued := enqueueTask(c, taskType, payload)
+	if !queued {
+		return
+	}
 	result := <-task.ResultCh
 	if result.Success {
 		c.JSON(http.StatusOK, models.SuccessResponse(gin.H{"message": result.Message}))
@@ -762,9 +774,12 @@ func (h *WebsiteHandler) EnableSSL(c *gin.Context) {
 		return
 	}
 
-	task := executor.GlobalQueue.Enqueue(executor.TaskEnableSSL, &executor.EnableSSLPayload{
+	task, queued := enqueueTask(c, executor.TaskEnableSSL, &executor.EnableSSLPayload{
 		Site: site, Mode: req.Mode, Certificate: req.Certificate, PrivateKey: req.PrivateKey,
 	})
+	if !queued {
+		return
+	}
 	result := <-task.ResultCh
 	if result.Success {
 		c.JSON(http.StatusOK, models.SuccessResponse(gin.H{"message": result.Message}))
@@ -796,7 +811,10 @@ func (h *WebsiteHandler) RemoveSSL(c *gin.Context) {
 	}
 	defer executor.ReleaseSiteOpLock(site.ID)
 
-	task := executor.GlobalQueue.Enqueue(executor.TaskRemoveSSL, &executor.RemoveSSLPayload{Site: site})
+	task, queued := enqueueTask(c, executor.TaskRemoveSSL, &executor.RemoveSSLPayload{Site: site})
+	if !queued {
+		return
+	}
 	result := <-task.ResultCh
 	if result.Success {
 		c.JSON(http.StatusOK, models.SuccessResponse(gin.H{"message": result.Message}))
@@ -1151,7 +1169,10 @@ func (h *WebsiteHandler) UpdateDomains(c *gin.Context) {
 		payload.NewWPHomeURL = newHomeURL
 	}
 
-	task := executor.GlobalQueue.Enqueue(executor.TaskUpdateDomains, payload)
+	task, queued := enqueueTask(c, executor.TaskUpdateDomains, payload)
+	if !queued {
+		return
+	}
 	result := <-task.ResultCh
 	if result.Success {
 		c.JSON(http.StatusOK, models.SuccessResponse(gin.H{"message": result.Message}))
@@ -1190,9 +1211,12 @@ func (h *WebsiteHandler) ChangeDBPassword(c *gin.Context) {
 		return
 	}
 
-	task := executor.GlobalQueue.Enqueue(executor.TaskChangeDBPassword, &executor.ChangeDBPasswordPayload{
+	task, queued := enqueueTask(c, executor.TaskChangeDBPassword, &executor.ChangeDBPasswordPayload{
 		Site: site, NewPassword: req.NewPassword,
 	})
+	if !queued {
+		return
+	}
 	result := <-task.ResultCh
 	if result.Success {
 		c.JSON(http.StatusOK, models.SuccessResponse(result.Data))
@@ -1438,7 +1462,10 @@ func (h *WebsiteHandler) UpdateWPSiteURLs(c *gin.Context) {
 			OldWPSiteURL: oldSiteURL, OldWPHomeURL: oldHomeURL,
 			NewWPSiteURL: newSiteURL, NewWPHomeURL: newHomeURL,
 		}
-		task := executor.GlobalQueue.Enqueue(executor.TaskUpdateDomains, payload)
+		task, queued := enqueueTask(c, executor.TaskUpdateDomains, payload)
+		if !queued {
+			return
+		}
 		result := <-task.ResultCh
 		if result.Success {
 			c.JSON(http.StatusOK, models.SuccessResponse(gin.H{"message": result.Message}))
@@ -1633,7 +1660,10 @@ func (h *WebsiteHandler) UpdateWPAdministrator(c *gin.Context) {
 		return
 	}
 
-	backupTask := executor.GlobalQueue.Enqueue(executor.TaskCreateBackup, &executor.CreateBackupPayload{Site: site, Auto: false})
+	backupTask, queued := enqueueTask(c, executor.TaskCreateBackup, &executor.CreateBackupPayload{Site: site, Auto: false})
+	if !queued {
+		return
+	}
 	var backupResult executor.TaskResult
 	select {
 	case backupResult = <-backupTask.ResultCh:
@@ -2061,9 +2091,12 @@ func (h *WebsiteHandler) SaveNginxCustom(c *gin.Context) {
 		return
 	}
 
-	task := executor.GlobalQueue.Enqueue(executor.TaskSaveNginxCustom, &executor.SaveNginxCustomPayload{
+	task, queued := enqueueTask(c, executor.TaskSaveNginxCustom, &executor.SaveNginxCustomPayload{
 		Site: site, PreContent: req.PreContent, Content: req.Content,
 	})
+	if !queued {
+		return
+	}
 	result := <-task.ResultCh
 	if result.Success {
 		c.JSON(http.StatusOK, models.SuccessResponse(gin.H{"message": result.Message}))
@@ -2097,9 +2130,12 @@ func (h *WebsiteHandler) SetAccessLogMode(c *gin.Context) {
 		return
 	}
 
-	task := executor.GlobalQueue.Enqueue(executor.TaskSetAccessLogMode, &executor.SetAccessLogModePayload{
+	task, queued := enqueueTask(c, executor.TaskSetAccessLogMode, &executor.SetAccessLogModePayload{
 		Site: site, Mode: req.Mode,
 	})
+	if !queued {
+		return
+	}
 	result := <-task.ResultCh
 	if result.Success {
 		c.JSON(http.StatusOK, models.SuccessResponse(gin.H{"message": result.Message}))
@@ -2133,9 +2169,12 @@ func (h *WebsiteHandler) SetCDNRealIP(c *gin.Context) {
 		return
 	}
 
-	task := executor.GlobalQueue.Enqueue(executor.TaskSetCDNRealIP, &executor.SetCDNRealIPPayload{
+	task, queued := enqueueTask(c, executor.TaskSetCDNRealIP, &executor.SetCDNRealIPPayload{
 		Site: site, Enabled: req.Enabled, GroupIDs: req.GroupIDs,
 	})
+	if !queued {
+		return
+	}
 	result := <-task.ResultCh
 	if result.Success {
 		c.JSON(http.StatusOK, models.SuccessResponse(gin.H{"message": result.Message}))
@@ -2678,11 +2717,14 @@ func (h *WebsiteHandler) SetFileLock(c *gin.Context) {
 		return
 	}
 
-	task := executor.GlobalQueue.Enqueue(executor.TaskSetFileLock, &executor.SetFileLockPayload{
+	task, queued := enqueueTask(c, executor.TaskSetFileLock, &executor.SetFileLockPayload{
 		Site:    site,
 		Enabled: req.Enabled,
 		Mode:    mode,
 	})
+	if !queued {
+		return
+	}
 	result := <-task.ResultCh
 	if result.Success {
 		c.JSON(http.StatusOK, models.SuccessResponse(result.Data))

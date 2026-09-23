@@ -29,7 +29,7 @@ apt-get install -y wget ca-certificates openssl
   trap 'rm -rf -- "$workdir"' EXIT
   cd "$workdir"
 
-  version='v2.0.1'
+  version='v2.0.2'
   base="https://github.com/zangwp/yub-wpanel/releases/download/$version"
   wget --no-config --https-only --no-hsts "$base/install.sh"
   wget --no-config --https-only --no-hsts "$base/install.sh.sha256"
@@ -82,9 +82,61 @@ yub-wpanel-third-party-licenses.tar.gz.sha256.sig
 
 All six files must come from the same fixed release as `install.sh`. Before copying or hashing them, the installer applies hard byte limits and requires exactly one license-archive `RELEASE_VERSION` equal to the installer's pinned version. This only avoids downloading the panel and license assets; APT packages, repository keys, and WordPress packages may still require network access, so a fully offline installation is not currently supported.
 
+## v2.0.1 升级到 v2.0.2 / Upgrade from v2.0.1 to v2.0.2
+
+这次升级必须使用固定 `v2.0.2` Release 的 installer repair，因为只替换二进制的面板在线更新器不会同步 `/usr/share/doc/yub-wpanel`。先创建服务器快照和面板备份，再以 root 执行以下命令；三个资产包都必须验签和校验哈希，然后运行本地安装器并选择“继续/修复安装”：
+
+Use the fixed `v2.0.2` Release installer repair for this upgrade because the panel's binary-only online updater does not synchronize `/usr/share/doc/yub-wpanel`. Take a server snapshot and panel backup first, then run the following as root. Verify the signature and checksum of all three bundles, run the local installer, and select repair:
+
+```bash
+apt-get update
+apt-get install -y wget ca-certificates openssl
+
+(
+  set -euo pipefail
+  umask 077
+  workdir="$(mktemp -d)"
+  trap 'rm -rf -- "$workdir"' EXIT
+  cd "$workdir"
+
+  version='v2.0.2'
+  base="https://github.com/zangwp/yub-wpanel/releases/download/$version"
+  for asset in \
+    install.sh install.sh.sha256 install.sh.sha256.sig \
+    yub-wpanel yub-wpanel.sha256 yub-wpanel.sha256.sig \
+    yub-wpanel-third-party-licenses.tar.gz \
+    yub-wpanel-third-party-licenses.tar.gz.sha256 \
+    yub-wpanel-third-party-licenses.tar.gz.sha256.sig; do
+    wget --no-config --https-only --no-hsts -O "$asset" "$base/$asset"
+  done
+
+  printf '%s\n' \
+    '-----BEGIN PUBLIC KEY-----' \
+    'MCowBQYDK2VwAyEAc1EJlyDurxR/SJS8MTpUVsAbvSmtfUAatoabx/f5KvU=' \
+    '-----END PUBLIC KEY-----' > release-public-key.pem
+
+  for checksum in \
+    install.sh.sha256 \
+    yub-wpanel.sha256 \
+    yub-wpanel-third-party-licenses.tar.gz.sha256; do
+    openssl pkeyutl -verify -rawin -pubin \
+      -inkey release-public-key.pem \
+      -in "$checksum" \
+      -sigfile "$checksum.sig"
+    sha256sum --check --strict "$checksum"
+  done
+
+  bash install.sh
+)
+```
+
+repair 会在紧邻快照前停止原本 active 的面板，并保持停服直到候选版本部署完毕；成功后恢复原 active 状态，失败时恢复二进制、数据库和许可文档快照。原本 inactive 的面板只会临时启动做健康验证，随后恢复 inactive。完成后确认 `yubw info` 显示 `v2.0.2`、服务健康，且 `/usr/share/doc/yub-wpanel/RELEASE_VERSION` 内容为 `v2.0.2`。
+
+Repair stops an originally active panel immediately before taking its snapshot and keeps it stopped until candidate deployment is complete. It restores the original active state on success and restores the binary, database, and license-document snapshot on failure. An originally inactive panel is started only temporarily for the health check and then returned to inactive. Afterwards, confirm `v2.0.2` with `yubw info`, verify service health, and check that `/usr/share/doc/yub-wpanel/RELEASE_VERSION` contains `v2.0.2`.
+
 ## v2.0.0 升级桥接 / v2.0.0 upgrade bridge
 
-从 `v2.0.0` 升级到 `v2.0.1` 时，必须同时把固定 `v2.0.1` Release 的安装器、面板二进制和许可归档三组签名资产（共九个文件）放在同一私有目录。不要使用 `v2.0.0` 内置在线更新器，也不要把下面的固定版本 URL 改成 `latest`。以 root 执行以下命令，先验证安装器与面板；安装器会再次验证面板与许可归档，然后在菜单中选择“继续/修复安装”：
+从 `v2.0.0` 升级到 `v2.0.1` 时，必须同时把固定 `v2.0.1` Release 的安装器、面板二进制和许可归档三组签名资产（共九个文件）放在同一私有目录。不要使用 `v2.0.0` 内置在线更新器，也不要把下面的固定版本 URL 改成 `latest`。以 root 执行以下命令，逐组验证三个资产；安装器会再次验证面板与许可归档，然后在菜单中选择“继续/修复安装”：
 
 ```bash
 apt-get update
@@ -113,7 +165,10 @@ apt-get install -y wget ca-certificates openssl
     'MCowBQYDK2VwAyEAc1EJlyDurxR/SJS8MTpUVsAbvSmtfUAatoabx/f5KvU=' \
     '-----END PUBLIC KEY-----' > release-public-key.pem
 
-  for checksum in install.sh.sha256 yub-wpanel.sha256; do
+  for checksum in \
+    install.sh.sha256 \
+    yub-wpanel.sha256 \
+    yub-wpanel-third-party-licenses.tar.gz.sha256; do
     openssl pkeyutl -verify -rawin -pubin \
       -inkey release-public-key.pem \
       -in "$checksum" \
@@ -127,4 +182,4 @@ apt-get install -y wget ca-certificates openssl
 
 详细原因和升级边界见[升级兼容性说明](upgrade-compatibility.md)。
 
-For the `v2.0.0` to `v2.0.1` upgrade, use the fixed-version command above to place all nine installer, panel, and license-archive assets in one private directory, then select the repair option. The installer re-verifies both the panel and license archive before deployment. Do not use the updater built into `v2.0.0` or replace the fixed URL with `latest`. See the [upgrade compatibility note](upgrade-compatibility.md) for the rationale and boundaries.
+For the `v2.0.0` to `v2.0.1` upgrade, use the fixed-version command above to place all nine installer, panel, and license-archive assets in one private directory, verify all three bundles, and then select the repair option. The installer re-verifies both the panel and license archive before deployment. Do not use the updater built into `v2.0.0` or replace the fixed URL with `latest`. See the [upgrade compatibility note](upgrade-compatibility.md) for the rationale and boundaries.

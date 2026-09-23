@@ -7,6 +7,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -19,6 +20,8 @@ import (
 	"github.com/zangwp/yub-wpanel/config"
 	"github.com/zangwp/yub-wpanel/database"
 )
+
+const databaseBackupCommandTimeout = 6 * time.Hour
 
 func executeCreateBackup(task *Task) TaskResult {
 	payload, ok := task.Payload.(*CreateBackupPayload)
@@ -211,7 +214,9 @@ func restoreFromZip(filePath, dbName, dbPass string) TaskResult {
 }
 
 func restoreSQLReader(r io.Reader, dbName, dbPass string) TaskResult {
-	cmd := exec.Command("mysql", "-u", "root", dbName)
+	ctx, cancel := context.WithTimeout(context.Background(), databaseBackupCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "mysql", "-u", "root", dbName)
 	cmd.Env = append(os.Environ(), "MYSQL_PWD="+dbPass)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -260,6 +265,9 @@ func restoreSQLReader(r io.Reader, dbName, dbPass string) TaskResult {
 		return TaskResult{Success: false, Message: "恢复失败，写入 mysql 失败: " + closeErr.Error()}
 	}
 	if err := cmd.Wait(); err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return TaskResult{Success: false, Message: "恢复失败，mysql 导入超时"}
+		}
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			msg = err.Error()
@@ -663,7 +671,9 @@ func ClearDatabaseTables(siteID int64, dbName, dbPass string) error {
 		return fmt.Errorf("无法读取数据库密码")
 	}
 
-	cmd := exec.Command("mysql", "-u", "root", "-B", "-N", "-e",
+	ctx, cancel := context.WithTimeout(context.Background(), databaseBackupCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "mysql", "-u", "root", "-B", "-N", "-e",
 		fmt.Sprintf("SELECT CONCAT('DROP TABLE IF EXISTS `', REPLACE(TABLE_NAME, '`', '``'), '`;') FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '%s' AND TABLE_TYPE = 'BASE TABLE'", dbName))
 	cmd.Env = append(os.Environ(), "MYSQL_PWD="+dbPass)
 	dropSQL, err := cmd.CombinedOutput()
@@ -671,7 +681,7 @@ func ClearDatabaseTables(siteID int64, dbName, dbPass string) error {
 		return fmt.Errorf("获取表列表失败: %s", string(dropSQL))
 	}
 
-	mysqlCmd := exec.Command("mysql", "-u", "root", dbName)
+	mysqlCmd := exec.CommandContext(ctx, "mysql", "-u", "root", dbName)
 	mysqlCmd.Env = append(os.Environ(), "MYSQL_PWD="+dbPass)
 	stdin, err := mysqlCmd.StdinPipe()
 	if err != nil {
@@ -807,7 +817,9 @@ func dumpDatabaseToGzip(dbName, dbPass, filePath string) error {
 		}
 	}()
 
-	cmd := exec.Command("mysqldump", "-u", "root", dbName)
+	ctx, cancel := context.WithTimeout(context.Background(), databaseBackupCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "mysqldump", "-u", "root", dbName)
 	cmd.Env = append(os.Environ(), "MYSQL_PWD="+dbPass)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -840,6 +852,9 @@ func dumpDatabaseToGzip(dbName, dbPass, filePath string) error {
 		return fmt.Errorf("保存备份文件失败: %w", closeFileErr)
 	}
 	if waitErr != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("mysqldump 执行超时")
+		}
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			msg = waitErr.Error()

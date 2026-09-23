@@ -1331,8 +1331,12 @@ func SetupRouter(cfg *config.Config, tmplFS embed.FS, staticFS embed.FS, version
 		log.Printf("网站搬家操作服务未启用: %v", preparationErr)
 	}
 	siteMigrationHandler := &handlers.SiteMigrationHandler{Service: siteMigrationPairing, Source: siteMigrationSource, Planner: siteMigrationPlanner, Workflow: siteMigrationWorkflow, Control: siteMigrationControl, DB: db, Version: version}
+	// Install the body/authentication guard globally (it is a no-op outside the
+	// machine API namespace) so Gin's 404/405 paths cannot bypass slow-body
+	// deadlines by using an unknown endpoint or the wrong HTTP method.
+	r.Use(middleware.SiteMigrationFailureLimit())
+	r.Use(middleware.SiteMigrationRequestGuard(siteMigrationPairing))
 	migrationMachine := r.Group("/api/site-migration/v1")
-	migrationMachine.Use(middleware.SiteMigrationFailureLimit())
 	migrationMachine.POST("/pair/redeem", siteMigrationHandler.Redeem)
 	migrationMachine.POST("/pair/challenge", siteMigrationHandler.Challenge)
 	migrationMachine.POST("/peer/revoke", siteMigrationHandler.MachineRevokePeer)

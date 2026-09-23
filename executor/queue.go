@@ -1,10 +1,13 @@
 package executor
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,64 +19,277 @@ import (
 )
 
 type TaskQueue struct {
-	queue     chan *Task
-	running   atomic.Bool
-	mu        sync.Mutex
-	taskCount int
-	tasks     map[string]*Task
+	queue           chan *Task
+	running         atomic.Bool
+	mu              sync.Mutex
+	taskCount       int
+	tasks           map[string]*Task
+	cleanupStop     chan struct{}
+	cleanupDone     chan struct{}
+	cleanupStopOnce sync.Once
+	admissionOnce   sync.Once
+	admissionSlots  chan struct{}
+	enqueueTimeout  time.Duration
 }
+
+const (
+	taskQueueCapacity       = 100
+	taskEnqueueTimeout      = 500 * time.Millisecond
+	completedTaskTTL        = 30 * time.Minute
+	taskCleanupInterval     = time.Minute
+	maxTaskAdmissionWaiters = 16
+	maxCompletedTaskRecords = 256
+	maxTaskResultMessageLen = 4096
+)
+
+var (
+	ErrTaskQueueFull        = errors.New("task queue is full")
+	ErrTaskQueueUnavailable = errors.New("task queue is unavailable")
+)
 
 var GlobalQueue *TaskQueue
 
 func InitQueue(cfg *config.Config) *TaskQueue {
 	q := &TaskQueue{
-		queue: make(chan *Task, 100),
+		queue: make(chan *Task, taskQueueCapacity),
 		tasks: make(map[string]*Task),
 	}
 	GlobalQueue = q
 	go q.worker()
+	q.startCleanup(taskCleanupInterval)
 	log.Println("任务队列已启动(单线程串行模式)")
 	return q
+}
+
+func (q *TaskQueue) startCleanup(interval time.Duration) {
+	if q == nil || interval <= 0 {
+		return
+	}
+	q.cleanupStop = make(chan struct{})
+	q.cleanupDone = make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		defer close(q.cleanupDone)
+		for {
+			select {
+			case now := <-ticker.C:
+				q.mu.Lock()
+				q.pruneCompletedLocked(now)
+				q.mu.Unlock()
+			case <-q.cleanupStop:
+				return
+			}
+		}
+	}()
+}
+
+// StopCleanup stops the retention janitor. It is primarily useful for clean
+// process shutdown and deterministic tests; task execution continues.
+func (q *TaskQueue) StopCleanup() {
+	if q == nil || q.cleanupStop == nil {
+		return
+	}
+	q.cleanupStopOnce.Do(func() { close(q.cleanupStop) })
+	<-q.cleanupDone
 }
 
 // Enqueue 把任务交给单 worker 串行执行。
 // 注意：任务执行函数内部不要 Enqueue 另一个任务后同步等待 ResultCh；
 // 单 worker 无法继续处理后续任务，会造成队列自等待死锁。需要复用逻辑时应抽成普通函数直接调用。
-func (q *TaskQueue) Enqueue(taskType TaskType, payload interface{}) *Task {
-	task := &Task{
+func newTask(taskType TaskType, payload interface{}) *Task {
+	now := time.Now()
+	return &Task{
 		ID:        uuid.New().String(),
 		Type:      taskType,
+		SiteID:    taskSiteID(payload),
 		Payload:   payload,
 		Status:    TaskStatusWaiting,
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
+		CreatedAt: now,
+		UpdatedAt: now,
 		ResultCh:  make(chan TaskResult, 1),
 	}
+}
 
+func (q *TaskQueue) admissionSemaphore() chan struct{} {
+	q.admissionOnce.Do(func() {
+		if q.admissionSlots == nil {
+			q.admissionSlots = make(chan struct{}, maxTaskAdmissionWaiters)
+		}
+	})
+	return q.admissionSlots
+}
+
+// EnqueueContext waits for at most taskEnqueueTimeout for queue admission. The
+// returned Task is an immutable caller handle: worker state must be read through
+// GetTask, which avoids races with Status updates.
+func (q *TaskQueue) EnqueueContext(ctx context.Context, taskType TaskType, payload interface{}) (*Task, error) {
+	if q == nil || q.queue == nil {
+		return nil, ErrTaskQueueUnavailable
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	task := newTask(taskType, payload)
+	handle := *task
+	handle.Payload = nil
+	handle.Result = nil
+
+	// Keep the uncongested path independent from the waiter semaphore. A burst
+	// that still fits in the queue must not be rejected merely because other
+	// goroutines are between their capacity check and send. Registration and
+	// the non-blocking send happen while holding q.mu so the worker cannot
+	// observe the task before its polling record exists.
+	if q.tryAdmitTask(task) {
+		return &handle, nil
+	}
+
+	// Queue capacity bounds admitted work; this separate semaphore bounds only
+	// callers that actually have to wait for capacity. Do not retain the task or
+	// its payload until this slot has been acquired, otherwise a concurrent
+	// request spike could briefly create an unbounded task map even though only
+	// a bounded number of callers are allowed to wait.
+	admissionSlots := q.admissionSemaphore()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case admissionSlots <- struct{}{}:
+		defer func() { <-admissionSlots }()
+	default:
+		// Capacity may have opened after the first fast-path attempt. Give it one
+		// final chance before rejecting the request because all waiter slots are
+		// occupied.
+		if q.tryAdmitTask(task) {
+			return &handle, nil
+		}
+		return nil, ErrTaskQueueFull
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	q.mu.Lock()
+	q.pruneCompletedLocked(time.Now())
 	q.taskCount++
 	q.tasks[task.ID] = task
 	q.mu.Unlock()
 
-	q.queue <- task
+	enqueueTimeout := q.enqueueTimeout
+	if enqueueTimeout <= 0 {
+		enqueueTimeout = taskEnqueueTimeout
+	}
+	timer := time.NewTimer(enqueueTimeout)
+	defer timer.Stop()
+	select {
+	case q.queue <- task:
+	case <-ctx.Done():
+		q.removeUnqueuedTask(task.ID)
+		return nil, ctx.Err()
+	case <-timer.C:
+		q.removeUnqueuedTask(task.ID)
+		return nil, ErrTaskQueueFull
+	}
 
-	return task
+	return &handle, nil
+}
+
+func (q *TaskQueue) tryAdmitTask(task *Task) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.pruneCompletedLocked(time.Now())
+	q.taskCount++
+	q.tasks[task.ID] = task
+	select {
+	case q.queue <- task:
+		return true
+	default:
+		delete(q.tasks, task.ID)
+		q.taskCount--
+		return false
+	}
+}
+
+func (q *TaskQueue) removeUnqueuedTask(id string) {
+	q.mu.Lock()
+	if _, ok := q.tasks[id]; ok {
+		delete(q.tasks, id)
+		if q.taskCount > 0 {
+			q.taskCount--
+		}
+	}
+	q.mu.Unlock()
+}
+
+// Enqueue preserves the existing API for background jobs. HTTP handlers should
+// use EnqueueContext so admission failures can be returned as 503 responses.
+func (q *TaskQueue) Enqueue(taskType TaskType, payload interface{}) *Task {
+	task, err := q.EnqueueContext(context.Background(), taskType, payload)
+	if err == nil {
+		return task
+	}
+	result := TaskResult{Success: false, Message: "任务队列繁忙，请稍后重试"}
+	failedTask := &Task{
+		ID:        uuid.New().String(),
+		Type:      taskType,
+		SiteID:    taskSiteID(payload),
+		Status:    TaskStatusFailed,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		Result:    &result,
+		ResultCh:  make(chan TaskResult, 1),
+	}
+	failedTask.ResultCh <- result
+	close(failedTask.ResultCh)
+	return failedTask
 }
 
 func (q *TaskQueue) GetTask(id string) (*Task, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	q.pruneCompletedLocked(time.Now())
 	task, ok := q.tasks[id]
 	if !ok {
 		return nil, false
 	}
 	copyTask := *task
+	copyTask.Payload = nil
 	if task.Result != nil {
 		result := *task.Result
 		copyTask.Result = &result
 	}
 	copyTask.ResultCh = nil
 	return &copyTask, true
+}
+
+func (q *TaskQueue) pruneCompletedLocked(now time.Time) {
+	type completedTask struct {
+		id        string
+		updatedAt time.Time
+	}
+	completed := make([]completedTask, 0)
+	for id, task := range q.tasks {
+		if task.Status != TaskStatusSuccess && task.Status != TaskStatusFailed {
+			continue
+		}
+		if now.Sub(task.UpdatedAt) >= completedTaskTTL {
+			delete(q.tasks, id)
+			continue
+		}
+		completed = append(completed, completedTask{id: id, updatedAt: task.UpdatedAt})
+	}
+	if len(completed) <= maxCompletedTaskRecords {
+		return
+	}
+	sort.Slice(completed, func(i, j int) bool { return completed[i].updatedAt.Before(completed[j].updatedAt) })
+	for _, item := range completed[:len(completed)-maxCompletedTaskRecords] {
+		delete(q.tasks, item.id)
+	}
 }
 
 func (q *TaskQueue) QueueLength() int {
@@ -104,18 +320,7 @@ func (q *TaskQueue) worker() {
 						return
 					}
 					result = TaskResult{Success: false, Message: fmt.Sprintf("task execution panic: %v", r)}
-					q.mu.Lock()
-					task.Status = TaskStatusFailed
-					task.UpdatedAt = time.Now()
-					task.Result = &result
-					q.mu.Unlock()
-					task.ResultCh <- result
-					close(task.ResultCh)
-					safeLogOp(task, result)
-					q.mu.Lock()
-					q.taskCount--
-					q.mu.Unlock()
-					q.running.Store(false)
+					q.finalizeTask(task, result)
 				}
 			}()
 			switch task.Type {
@@ -165,30 +370,103 @@ func (q *TaskQueue) worker() {
 				result = TaskResult{Success: false, Message: "未知任务类型: " + string(task.Type)}
 			}
 
-			if result.Success {
-				q.mu.Lock()
-				task.Status = TaskStatusSuccess
-			} else {
-				q.mu.Lock()
-				task.Status = TaskStatusFailed
-			}
-			task.UpdatedAt = time.Now()
-			task.Result = &result
-			q.mu.Unlock()
-
-			safeLogOp(task, result)
-
-			task.ResultCh <- result
-			close(task.ResultCh)
 			finalized = true
-
-			q.mu.Lock()
-			q.taskCount--
-			q.mu.Unlock()
-
-			q.running.Store(false)
+			q.finalizeTask(task, result)
 		}()
 	}
+}
+
+func (q *TaskQueue) finalizeTask(task *Task, result TaskResult) {
+	defer q.running.Store(false)
+
+	// Logging still needs the payload to identify the target, so do it before
+	// clearing sensitive execution state.
+	safeResult := sanitizedTaskResult(task.Payload, result)
+	safeLogOp(task, safeResult)
+
+	q.mu.Lock()
+	resultCh := task.ResultCh
+	if result.Success {
+		task.Status = TaskStatusSuccess
+	} else {
+		task.Status = TaskStatusFailed
+	}
+	task.UpdatedAt = time.Now()
+	task.Result = &safeResult
+	task.Payload = nil
+	task.ResultCh = nil
+	if q.taskCount > 0 {
+		q.taskCount--
+	}
+	q.pruneCompletedLocked(task.UpdatedAt)
+	q.mu.Unlock()
+
+	deliverTaskResult(task.ID, resultCh, result)
+}
+
+func deliverTaskResult(taskID string, resultCh chan TaskResult, result TaskResult) {
+	if resultCh == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("deliver result for task %s skipped: %v", taskID, r)
+		}
+	}()
+	select {
+	case resultCh <- result:
+	default:
+		log.Printf("deliver result for task %s skipped: result channel is full", taskID)
+	}
+	close(resultCh)
+}
+
+func sanitizedTaskResult(payload interface{}, result TaskResult) TaskResult {
+	message := result.Message
+	for _, secret := range taskSecrets(payload) {
+		if secret != "" {
+			message = strings.ReplaceAll(message, secret, "[REDACTED]")
+		}
+	}
+	if len(message) > maxTaskResultMessageLen {
+		message = message[:maxTaskResultMessageLen] + "…"
+	}
+	return TaskResult{Success: result.Success, Message: message}
+}
+
+func taskSecrets(payload interface{}) []string {
+	switch p := payload.(type) {
+	case *CreateSitePayload:
+		if p == nil {
+			return nil
+		}
+		return []string{p.DBPassword}
+	case *EnableSSLPayload:
+		if p == nil {
+			return nil
+		}
+		return []string{p.PrivateKey}
+	case *ChangeDBPasswordPayload:
+		if p == nil {
+			return nil
+		}
+		return []string{p.NewPassword}
+	}
+	return nil
+}
+
+func taskSiteID(payload interface{}) int {
+	switch p := payload.(type) {
+	case *RestoreBackupPayload:
+		if p != nil && p.Site != nil {
+			return p.Site.ID
+		}
+	case *CreateBackupPayload:
+		if p != nil && p.Site != nil {
+			return p.Site.ID
+		}
+	}
+	return 0
 }
 
 func safeLogOp(task *Task, result TaskResult) {

@@ -171,3 +171,19 @@ func TestPrivilegedCLIModesPassRuntimeIdentityGate(t *testing.T) {
 		}
 	}
 }
+
+func TestPasswordResetDoesNotAcceptPlaintextInProcessArguments(t *testing.T) {
+	sourceBytes, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(sourceBytes)
+	for _, forbidden := range []string{`flag.String("passwd"`, `--passwd`, `resetAdminPassword`} {
+		if strings.Contains(source, forbidden) {
+			t.Fatalf("main.go still exposes plaintext password CLI path %q", forbidden)
+		}
+	}
+	if !strings.Contains(source, `flag.Bool("reset-admin"`) {
+		t.Fatal("safe random administrator reset mode is missing")
+	}
+}

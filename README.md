@@ -4,7 +4,7 @@
 
 WordPress 专用服务器管理面板。一行命令，纯净 Debian 13 变身 WordPress 托管平台。
 
-YUB WPanel 遵循 GPL-3.0 许可证。源码、安装脚本和已签名发行版位于 [zangwp/yub-wpanel](https://github.com/zangwp/yub-wpanel)。
+YUB WPanel 遵循 GNU GPL v3.0 only（SPDX：`GPL-3.0-only`）。源码、安装脚本和已签名发行版位于 [zangwp/yub-wpanel](https://github.com/zangwp/yub-wpanel)。
 
 WordPress server management panel for Debian 13 VPS environments, focused on site isolation, SSL, backups, security, and day-to-day WordPress hosting operations.
 
@@ -12,7 +12,7 @@ WordPress server management panel for Debian 13 VPS environments, focused on sit
 
 The full English project guide is available here: [README.en.md](README.en.md).
 
-[![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](LICENSE)
 [![Go](https://img.shields.io/badge/Go-1.26-00ADD8.svg)](https://go.dev/)
 
 ---
@@ -55,7 +55,7 @@ YUB WPanel 只做一件事：**在 VPS 上高效管理 WordPress 网站**。不�
 
 完整可复制命令、公钥与本地发布包说明见 **[验签安装指南](docs/verified-install.md)**。
 
-> **v2.0.0 升级提示：** 不要使用 v2.0.0 自带的在线更新器直接升级到 v2.0.1。请从固定的 v2.0.1 Release 下载 `install.sh`、`yub-wpanel`、第三方许可归档及各自的 SHA-256 清单和 Ed25519 签名（共九个文件），验签后运行本地 `install.sh` 并选择 repair。v2.0.1 及后续版本才使用新的版本绑定和独立安全看门狗。详见[升级兼容性说明](docs/upgrade-compatibility.md)。
+> **升级提示：** v2.0.0 到 v2.0.1，以及 v2.0.1 到 v2.0.2，都必须从目标版本的固定 Release 下载 `install.sh`、`yub-wpanel`、第三方许可归档及各自的 SHA-256 清单和 Ed25519 签名（共九个文件），逐组验签后运行本地 `install.sh` 并选择 repair。v2.0.2 此路径还会同步 `/usr/share/doc/yub-wpanel`；不要使用只替换二进制的面板在线更新器完成这次升级。详见[升级兼容性说明](docs/upgrade-compatibility.md)。
 
 安装完成后输出面板地址和两层登录凭据（BasicAuth + Web 登录）。
 
@@ -118,7 +118,7 @@ YUB WPanel 支持在两台相同版本的面板之间搬迁 WordPress 或通用 
 - 替换前会备份当前二进制和面板数据库；健康检查失败时会尝试回滚，但回滚并非整机快照，也可能失败
 
 **代码透明**
-- 100% 开源（GPL-3.0），代码可审查
+- 100% 开源（`GPL-3.0-only`），代码可审查
 - 运行时遥测默认关闭且没有预设端点；启用自定义端点后发送稳定伪匿名 ID 与版本，不发送业务内容
 - 面板自身版本元数据默认来自 GitHub；WordPress 更新及管理员启用的外部功能会连接各自上游
 - 无 Web Shell、无在线代码编辑功能
@@ -278,10 +278,10 @@ systemctl start yub-wpanel
 └── yub-wpanel-optimizer/   # WordPress 配套插件
 ```
 
-## License
+## YUB WPanel 开源许可
 
-GPL-3.0
+GNU GPL v3.0 only（SPDX：`GPL-3.0-only`）
 
-YUB WPanel 依据 GPL-3.0 发布，由 zangwp 维护。完整许可条款见
+YUB WPanel 依据 GNU GPL v3.0 only 发布，由 zangwp 维护。完整许可条款见
 [`LICENSE`](LICENSE)，项目声明见 [`NOTICE.md`](NOTICE.md)，第三方组件许可见
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) 及每个 Release 附带的签名许可归档。

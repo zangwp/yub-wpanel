@@ -2647,11 +2647,14 @@ func (h *FileHandler) FixPermissions(c *gin.Context) {
 		return
 	}
 	if site.FileLockEnabled {
-		task := executor.GlobalQueue.Enqueue(executor.TaskSetFileLock, &executor.SetFileLockPayload{
+		task, queued := enqueueTask(c, executor.TaskSetFileLock, &executor.SetFileLockPayload{
 			Site:    site,
 			Enabled: true,
 			Mode:    executor.EffectiveFileLockMode(site),
 		})
+		if !queued {
+			return
+		}
 		result := <-task.ResultCh
 		if !result.Success {
 			log.Printf("文件锁定权限重应用失败 root=%s: %s", site.WebRoot, result.Message)

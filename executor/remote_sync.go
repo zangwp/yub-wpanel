@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -41,11 +42,15 @@ const (
 	s3ObjectMaxSize    = 5 * 1024 * 1024 * 1024 * 1024 * int64(1)
 	s3MaxPartCount     = 10000
 	s3UploadTimeout    = 6 * time.Hour
+	s3AbortTimeout     = 30 * time.Second
+	s3CompleteBodyMax  = 1024 * 1024
+	rsyncUploadTimeout = 6 * time.Hour
 )
 
 var (
 	s3MultipartThreshold = 100 * 1024 * 1024 * int64(1)
 	s3DefaultPartSize    = 64 * 1024 * 1024 * int64(1)
+	putFileToS3ForSync   = putFileToS3
 )
 
 var (
@@ -189,37 +194,97 @@ func validateRemoteRelativePath(relPath string) (string, error) {
 	return clean, nil
 }
 
+// remoteBackupTarget is an immutable snapshot of the singleton remote backup
+// configuration. A file-backup generation uses one snapshot for upload and
+// old-chain deletion so an administrator changing settings mid-run cannot
+// cause deletion from a different destination.
+type remoteBackupTarget struct {
+	Enabled    bool
+	backupType string
+	host       string
+	port       int
+	username   string
+	authType   string
+	password   string
+	remotePath string
+	keepLocal  int
+
+	s3Endpoint    string
+	s3Bucket      string
+	s3Region      string
+	s3AccessKeyID string
+	s3SecretKey   string
+	s3PathPrefix  string
+}
+
+func loadRemoteBackupTarget(ctx context.Context) (remoteBackupTarget, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var target remoteBackupTarget
+	var enabled int
+	err := database.GetDB().QueryRowContext(ctx, `SELECT enabled, backup_type, host, port, username, auth_type, password, remote_path, keep_local,
+			s3_endpoint, s3_bucket, s3_region, s3_access_key_id, s3_secret_key, s3_path_prefix
+		FROM remote_backup_settings WHERE id = 1`).Scan(
+		&enabled, &target.backupType, &target.host, &target.port, &target.username, &target.authType, &target.password, &target.remotePath, &target.keepLocal,
+		&target.s3Endpoint, &target.s3Bucket, &target.s3Region, &target.s3AccessKeyID, &target.s3SecretKey, &target.s3PathPrefix)
+	if err != nil {
+		return remoteBackupTarget{}, err
+	}
+	target.Enabled = enabled == 1
+	if !target.Enabled {
+		return target, nil
+	}
+	if target.backupType == "" {
+		target.backupType = "rsync"
+	}
+	if err := ValidateRemoteBackupType(target.backupType); err != nil {
+		return remoteBackupTarget{}, err
+	}
+	return target, nil
+}
+
 // SyncBackupToRemote 将单个备份文件同步到远程服务器，保留 domain/db/ 或 domain/files/ 目录结构。
 // 若 keep_local=0，同步成功后删除本地文件。source/siteID/filename 用于同步完成后回写对应
 // 备份记录（db_backups 或 file_backups）的 transport_status/transport_message。
 func SyncBackupToRemote(localFile string, source BackupSource, siteID int, filename string) bool {
-	db := database.GetDB()
-	var enabled, keepLocal, port int
-	var backupType, host, username, authType, password, remotePath string
-	var s3Endpoint, s3Bucket, s3Region, s3AccessKeyID, s3SecretKey, s3PathPrefix string
-	err := db.QueryRow(`SELECT enabled, backup_type, host, port, username, auth_type, password, remote_path, keep_local,
-			s3_endpoint, s3_bucket, s3_region, s3_access_key_id, s3_secret_key, s3_path_prefix
-		FROM remote_backup_settings WHERE id = 1`).Scan(
-		&enabled, &backupType, &host, &port, &username, &authType, &password, &remotePath, &keepLocal,
-		&s3Endpoint, &s3Bucket, &s3Region, &s3AccessKeyID, &s3SecretKey, &s3PathPrefix)
+	return SyncBackupToRemoteContext(context.Background(), localFile, source, siteID, filename)
+}
+
+// SyncBackupToRemoteContext is the cancellable form of SyncBackupToRemote.
+// The legacy entry point remains for callers that do not own a context.
+func SyncBackupToRemoteContext(ctx context.Context, localFile string, source BackupSource, siteID int, filename string) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return false
+	}
+	target, err := loadRemoteBackupTarget(ctx)
 	if err != nil {
 		syncLog("", fmt.Sprintf("读取远程备份设置失败: %v", err), "failed")
 		return false
 	}
-	if enabled == 0 {
+	return syncBackupToRemoteTargetContext(ctx, target, localFile, source, siteID, filename)
+}
+
+func syncBackupToRemoteTargetContext(ctx context.Context, target remoteBackupTarget, localFile string, source BackupSource, siteID int, filename string) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil || !target.Enabled {
 		return false
 	}
-	if backupType == "" {
-		backupType = "rsync"
-	}
-	if err := ValidateRemoteBackupType(backupType); err != nil {
+	if err := ValidateRemoteBackupType(target.backupType); err != nil {
 		syncLog("", err.Error(), "failed")
 		return false
 	}
-	if backupType == "s3" {
-		return syncBackupToS3(localFile, source, siteID, filename, s3Endpoint, s3Bucket, s3Region, s3AccessKeyID, s3SecretKey, s3PathPrefix, keepLocal)
+	if target.backupType == "s3" {
+		return syncBackupToS3Context(ctx, localFile, source, siteID, filename,
+			target.s3Endpoint, target.s3Bucket, target.s3Region, target.s3AccessKeyID, target.s3SecretKey, target.s3PathPrefix, target.keepLocal)
 	}
-	return syncBackupToRsync(localFile, source, siteID, filename, host, port, username, authType, password, remotePath, keepLocal)
+	return syncBackupToRsyncContext(ctx, localFile, source, siteID, filename,
+		target.host, target.port, target.username, target.authType, target.password, target.remotePath, target.keepLocal)
 }
 
 // updateBackupTransportStatus 把远程同步结果回写到对应备份记录表（db_backups 或 file_backups）。
@@ -243,33 +308,46 @@ func updateBackupTransportStatus(source BackupSource, siteID int, filename, stat
 // 避免更换远程服务器或远程数据被清空后，增量备份被同步到缺少全量基线的目标上。
 // 远程备份未启用时返回 (true, nil)，不对本地判定施加额外约束。
 func RemoteHasFullFileBackup(domain string) (bool, error) {
-	db := database.GetDB()
-	var enabled, port int
-	var backupType, host, username, authType, password, remotePath string
-	var s3Endpoint, s3Bucket, s3Region, s3AccessKeyID, s3SecretKey, s3PathPrefix string
-	err := db.QueryRow(`SELECT enabled, backup_type, host, port, username, auth_type, password, remote_path,
-			s3_endpoint, s3_bucket, s3_region, s3_access_key_id, s3_secret_key, s3_path_prefix
-		FROM remote_backup_settings WHERE id = 1`).Scan(
-		&enabled, &backupType, &host, &port, &username, &authType, &password, &remotePath,
-		&s3Endpoint, &s3Bucket, &s3Region, &s3AccessKeyID, &s3SecretKey, &s3PathPrefix)
+	return RemoteHasFullFileBackupContext(context.Background(), domain)
+}
+
+// RemoteHasFullFileBackupContext is the cancellable form of
+// RemoteHasFullFileBackup. Its per-probe 20-second cap is also bounded by the
+// caller's deadline.
+func RemoteHasFullFileBackupContext(ctx context.Context, domain string) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	target, err := loadRemoteBackupTarget(ctx)
 	if err != nil {
 		return false, fmt.Errorf("读取远程备份设置失败: %w", err)
 	}
-	if enabled == 0 {
-		return true, nil
+	return remoteTargetHasFullFileBackupContext(ctx, target, domain)
+}
+
+func remoteTargetHasFullFileBackupContext(ctx context.Context, target remoteBackupTarget, domain string) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	if backupType == "" {
-		backupType = "rsync"
-	}
-	if err := ValidateRemoteBackupType(backupType); err != nil {
+	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	if backupType == "s3" {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
-		return s3HasFullBackup(ctx, s3Endpoint, s3Bucket, s3Region, s3AccessKeyID, s3SecretKey, s3PathPrefix, domain)
+	if !target.Enabled {
+		return true, nil
 	}
-	return remoteHasFullBackup(domain, host, port, username, authType, password, remotePath)
+	if err := ValidateRemoteBackupType(target.backupType); err != nil {
+		return false, err
+	}
+	if target.backupType == "s3" {
+		probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		return s3HasFullBackup(probeCtx, target.s3Endpoint, target.s3Bucket, target.s3Region,
+			target.s3AccessKeyID, target.s3SecretKey, target.s3PathPrefix, domain)
+	}
+	return remoteHasFullBackupContext(ctx, domain, target.host, target.port, target.username, target.authType, target.password, target.remotePath)
 }
 
 // pendingTransportStatusRow 是一条需要和当前远程目标核对的备份记录。
@@ -421,6 +499,16 @@ func ReconcileBackupTransportStatus() (int, error) {
 // file_full_*.tar.gz 全量基线。命令参数沿用 syncBackupToRsync 的连接方式（已校验过的
 // host/port/username/remotePath），远程目录路径做 shell 单引号转义，不拼接未校验输入。
 func remoteHasFullBackup(domain, host string, port int, username, authType, password, remotePath string) (bool, error) {
+	return remoteHasFullBackupContext(context.Background(), domain, host, port, username, authType, password, remotePath)
+}
+
+func remoteHasFullBackupContext(ctx context.Context, domain, host string, port int, username, authType, password, remotePath string) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	if host == "" {
 		return false, fmt.Errorf("远程服务器地址为空")
 	}
@@ -449,7 +537,7 @@ func remoteHasFullBackup(domain, host string, port int, username, authType, pass
 		"-p", fmt.Sprintf("%d", port),
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
 	var cmd *exec.Cmd
@@ -460,19 +548,23 @@ func remoteHasFullBackup(domain, host string, port int, username, authType, pass
 		}
 		args := append([]string{"-i", keyPath}, commonArgs...)
 		args = append(args, username+"@"+host, findCmd)
-		cmd = exec.CommandContext(ctx, "ssh", args...)
+		cmd = exec.CommandContext(probeCtx, "ssh", args...)
 	} else {
 		if _, err := exec.LookPath("sshpass"); err != nil {
 			return false, fmt.Errorf("sshpass 未安装")
 		}
 		args := append([]string{"-e", "ssh"}, commonArgs...)
 		args = append(args, username+"@"+host, findCmd)
-		cmd = exec.CommandContext(ctx, "sshpass", args...)
+		cmd = exec.CommandContext(probeCtx, "sshpass", args...)
 		cmd.Env = append(os.Environ(), "SSHPASS="+password)
 	}
+	configureBackupCommandCancellation(cmd)
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		if contextErr := probeCtx.Err(); contextErr != nil {
+			return false, fmt.Errorf("探测远程全量备份失败: %w", contextErr)
+		}
 		return false, fmt.Errorf("探测远程全量备份失败: %s", strings.TrimSpace(string(out)))
 	}
 	return strings.TrimSpace(string(out)) != "", nil
@@ -529,6 +621,7 @@ func listRsyncRemoteFiles(host string, port int, username, authType, password, r
 		cmd = exec.CommandContext(ctx, "sshpass", args...)
 		cmd.Env = append(os.Environ(), "SSHPASS="+password)
 	}
+	configureBackupCommandCancellation(cmd)
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -646,6 +739,16 @@ func listS3ObjectKeys(ctx context.Context, endpoint, bucket, region, accessKeyID
 }
 
 func syncBackupToRsync(localFile string, source BackupSource, siteID int, filename string, host string, port int, username string, authType string, password string, remotePath string, keepLocal int) bool {
+	return syncBackupToRsyncContext(context.Background(), localFile, source, siteID, filename, host, port, username, authType, password, remotePath, keepLocal)
+}
+
+func syncBackupToRsyncContext(ctx context.Context, localFile string, source BackupSource, siteID int, filename string, host string, port int, username string, authType string, password string, remotePath string, keepLocal int) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return false
+	}
 	if host == "" {
 		syncLog("", "远程备份已启用但未填写服务器地址", "failed")
 		updateBackupTransportStatus(source, siteID, filename, "failed", "远程备份已启用但未填写服务器地址")
@@ -678,6 +781,8 @@ func syncBackupToRsync(localFile string, source BackupSource, siteID int, filena
 	dest := fmt.Sprintf("%s@%s:%s/", username, host, remotePath)
 
 	sshOpts := fmt.Sprintf("-o UserKnownHostsFile=/www/server/panel/remote_backup_known_hosts -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -p %d", port)
+	uploadCtx, cancel := context.WithTimeout(ctx, rsyncUploadTimeout)
+	defer cancel()
 	var cmd *exec.Cmd
 	if authType == "key" {
 		keyPath := "/www/server/panel/remote_backup_key"
@@ -691,7 +796,7 @@ func syncBackupToRsync(localFile string, source BackupSource, siteID int, filena
 			updateBackupTransportStatus(source, siteID, filename, "failed", fmt.Sprintf("SSH 密钥权限设置失败: %v", err))
 			return false
 		}
-		cmd = exec.Command("rsync", "-avzR",
+		cmd = exec.CommandContext(uploadCtx, "rsync", "-avzR",
 			"-e", fmt.Sprintf("ssh -i %s %s", keyPath, sshOpts),
 			src, dest)
 	} else {
@@ -700,15 +805,26 @@ func syncBackupToRsync(localFile string, source BackupSource, siteID int, filena
 			updateBackupTransportStatus(source, siteID, filename, "failed", "sshpass 未安装")
 			return false
 		}
-		cmd = exec.Command("sshpass", "-e", "rsync", "-avzR",
+		cmd = exec.CommandContext(uploadCtx, "sshpass", "-e", "rsync", "-avzR",
 			"-e", fmt.Sprintf("ssh %s", sshOpts),
 			src, dest)
 		cmd.Env = append(os.Environ(), "SSHPASS="+password)
 	}
 	domain, _, _ := strings.Cut(relPath, "/")
+	configureBackupCommandCancellation(cmd)
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		if contextErr := uploadCtx.Err(); contextErr != nil {
+			label := "已取消"
+			if errors.Is(contextErr, context.DeadlineExceeded) {
+				label = "超时"
+			}
+			msg := fmt.Sprintf("远程同步%s: %s", label, relPath)
+			syncLog(domain, msg, "failed")
+			updateBackupTransportStatus(source, siteID, filename, "failed", msg)
+			return false
+		}
 		msg := fmt.Sprintf("远程同步失败: %s — %s", relPath, strings.TrimSpace(string(out)))
 		syncLog(domain, msg, "failed")
 		updateBackupTransportStatus(source, siteID, filename, "failed", msg)
@@ -724,6 +840,16 @@ func syncBackupToRsync(localFile string, source BackupSource, siteID int, filena
 }
 
 func syncBackupToS3(localFile string, source BackupSource, siteID int, filename string, endpoint, bucket, region, accessKeyID, secretKey, pathPrefix string, keepLocal int) bool {
+	return syncBackupToS3Context(context.Background(), localFile, source, siteID, filename, endpoint, bucket, region, accessKeyID, secretKey, pathPrefix, keepLocal)
+}
+
+func syncBackupToS3Context(ctx context.Context, localFile string, source BackupSource, siteID int, filename string, endpoint, bucket, region, accessKeyID, secretKey, pathPrefix string, keepLocal int) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return false
+	}
 	if region == "" {
 		region = "auto"
 	}
@@ -744,9 +870,9 @@ func syncBackupToS3(localFile string, source BackupSource, siteID int, filename 
 		updateBackupTransportStatus(source, siteID, filename, "failed", "S3 对象路径无效")
 		return false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), s3UploadTimeout)
+	uploadCtx, cancel := context.WithTimeout(ctx, s3UploadTimeout)
 	defer cancel()
-	if err := putFileToS3(ctx, endpoint, bucket, region, accessKeyID, secretKey, objectKey, localFile); err != nil {
+	if err := putFileToS3ForSync(uploadCtx, endpoint, bucket, region, accessKeyID, secretKey, objectKey, localFile); err != nil {
 		domain, _, _ := strings.Cut(relPath, "/")
 		msg := fmt.Sprintf("S3 远程同步失败: %s — %v", relPath, err)
 		syncLog(domain, msg, "failed")
@@ -765,52 +891,57 @@ func syncBackupToS3(localFile string, source BackupSource, siteID int, filename 
 // deleteRemoteBackupFile 删除当前远程目标中的一个已校验相对路径。调用方必须传入冻结的旧链名单，
 // 不接受通配符，也不递归删除目录。
 func deleteRemoteBackupFile(relPath string) error {
+	target, err := loadRemoteBackupTarget(context.Background())
+	if err != nil {
+		return err
+	}
+	return deleteRemoteBackupFileFromTargetContext(context.Background(), target, relPath)
+}
+
+func deleteRemoteBackupFileFromTargetContext(ctx context.Context, target remoteBackupTarget, relPath string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	relPath, err := validateRemoteRelativePath(relPath)
 	if err != nil {
 		return err
 	}
-	db := database.GetDB()
-	var enabled, port int
-	var backupType, host, username, authType, password, remotePath string
-	var endpoint, bucket, region, accessKeyID, secretKey, pathPrefix string
-	if err := db.QueryRow(`SELECT enabled, backup_type, host, port, username, auth_type, password, remote_path,
-			s3_endpoint, s3_bucket, s3_region, s3_access_key_id, s3_secret_key, s3_path_prefix
-		FROM remote_backup_settings WHERE id=1`).Scan(
-		&enabled, &backupType, &host, &port, &username, &authType, &password, &remotePath,
-		&endpoint, &bucket, &region, &accessKeyID, &secretKey, &pathPrefix); err != nil {
-		return err
-	}
-	if enabled == 0 {
+	if !target.Enabled {
 		return fmt.Errorf("远程备份未启用")
 	}
-	if backupType == "" {
-		backupType = "rsync"
-	}
-	if err := ValidateRemoteBackupType(backupType); err != nil {
+	if err := ValidateRemoteBackupType(target.backupType); err != nil {
 		return err
 	}
-	if backupType == "s3" {
+	deleteCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if target.backupType == "s3" {
+		region := target.s3Region
 		if region == "" {
 			region = "auto"
 		}
-		if err := ValidateS3BackupSettings(endpoint, bucket, region, accessKeyID, secretKey, pathPrefix); err != nil {
+		if err := ValidateS3BackupSettings(target.s3Endpoint, target.s3Bucket, region, target.s3AccessKeyID, target.s3SecretKey, target.s3PathPrefix); err != nil {
 			return err
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		return deleteObjectFromS3(ctx, endpoint, bucket, region, accessKeyID, secretKey, s3ObjectKey(pathPrefix, relPath))
+		return deleteObjectFromS3(deleteCtx, target.s3Endpoint, target.s3Bucket, region,
+			target.s3AccessKeyID, target.s3SecretKey, s3ObjectKey(target.s3PathPrefix, relPath))
 	}
+	port := target.port
 	if port == 0 {
 		port = 22
 	}
+	username := target.username
 	if username == "" {
 		username = "root"
 	}
+	authType := target.authType
 	if authType == "" {
 		authType = "password"
 	}
-	remotePath = remoteBackupPath(username, remotePath)
-	if err := ValidateRemoteBackupSettings(host, port, username, authType, remotePath); err != nil {
+	remotePath := remoteBackupPath(username, target.remotePath)
+	if err := ValidateRemoteBackupSettings(target.host, port, username, authType, remotePath); err != nil {
 		return err
 	}
 	remoteFile := remotePath + "/" + relPath
@@ -821,8 +952,6 @@ func deleteRemoteBackupFile(relPath string) error {
 		"-o", "ConnectTimeout=10",
 		"-p", fmt.Sprintf("%d", port),
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 	var cmd *exec.Cmd
 	if authType == "key" {
 		keyPath := "/www/server/panel/remote_backup_key"
@@ -830,18 +959,22 @@ func deleteRemoteBackupFile(relPath string) error {
 			return fmt.Errorf("SSH 密钥不存在: %s", keyPath)
 		}
 		args := append([]string{"-i", keyPath}, commonArgs...)
-		args = append(args, username+"@"+host, remoteCommand)
-		cmd = exec.CommandContext(ctx, "ssh", args...)
+		args = append(args, username+"@"+target.host, remoteCommand)
+		cmd = exec.CommandContext(deleteCtx, "ssh", args...)
 	} else {
 		if _, err := exec.LookPath("sshpass"); err != nil {
 			return fmt.Errorf("sshpass 未安装")
 		}
 		args := append([]string{"-e", "ssh"}, commonArgs...)
-		args = append(args, username+"@"+host, remoteCommand)
-		cmd = exec.CommandContext(ctx, "sshpass", args...)
-		cmd.Env = append(os.Environ(), "SSHPASS="+password)
+		args = append(args, username+"@"+target.host, remoteCommand)
+		cmd = exec.CommandContext(deleteCtx, "sshpass", args...)
+		cmd.Env = append(os.Environ(), "SSHPASS="+target.password)
 	}
+	configureBackupCommandCancellation(cmd)
 	if out, err := cmd.CombinedOutput(); err != nil {
+		if deleteCtx.Err() != nil {
+			return fmt.Errorf("删除远程旧备份失败: %w", deleteCtx.Err())
+		}
 		return fmt.Errorf("删除远程旧备份失败: %s", strings.TrimSpace(string(out)))
 	}
 	return nil
@@ -892,7 +1025,7 @@ func putFileToS3(ctx context.Context, endpoint, bucket, region, accessKeyID, sec
 		return putFileToS3Multipart(ctx, endpoint, bucket, region, accessKeyID, secretKey, objectKey, file, size)
 	}
 	hash := sha256.New()
-	_, err = io.Copy(hash, file)
+	_, err = copyWithContext(ctx, hash, file)
 	if err != nil {
 		return fmt.Errorf("计算备份文件校验失败: %w", err)
 	}
@@ -970,7 +1103,12 @@ func putFileToS3Multipart(ctx context.Context, endpoint, bucket, region, accessK
 	abort := true
 	defer func() {
 		if abort {
-			_ = abortS3MultipartUpload(ctx, endpoint, bucket, region, accessKeyID, secretKey, objectKey, uploadID)
+			// The upload context is commonly already cancelled when a part fails.
+			// Give cleanup its own short deadline so multipart fragments do not
+			// remain indefinitely while still bounding shutdown time.
+			abortCtx, cancel := context.WithTimeout(context.Background(), s3AbortTimeout)
+			defer cancel()
+			_ = abortS3MultipartUpload(abortCtx, endpoint, bucket, region, accessKeyID, secretKey, objectKey, uploadID)
 		}
 	}()
 
@@ -1027,7 +1165,7 @@ func createS3MultipartUpload(ctx context.Context, endpoint, bucket, region, acce
 func uploadS3Part(ctx context.Context, endpoint, bucket, region, accessKeyID, secretKey, objectKey, uploadID string, partNumber int, file *os.File, offset, size int64) (string, error) {
 	section := io.NewSectionReader(file, offset, size)
 	hash := sha256.New()
-	if _, err := io.Copy(hash, section); err != nil {
+	if _, err := copyWithContext(ctx, hash, section); err != nil {
 		return "", fmt.Errorf("计算分片校验失败: %w", err)
 	}
 	if _, err := section.Seek(0, io.SeekStart); err != nil {
@@ -1069,8 +1207,41 @@ func completeS3MultipartUpload(ctx context.Context, endpoint, bucket, region, ac
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
-	return nil
+	responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, s3CompleteBodyMax+1))
+	closeErr := resp.Body.Close()
+	if readErr != nil {
+		return fmt.Errorf("读取 S3 完成分片上传响应失败: %w", readErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("关闭 S3 完成分片上传响应失败: %w", closeErr)
+	}
+	if len(responseBody) > s3CompleteBodyMax {
+		return fmt.Errorf("S3 完成分片上传响应超过 %d 字节限制", s3CompleteBodyMax)
+	}
+	var envelope struct {
+		XMLName xml.Name
+		Code    string `xml:"Code"`
+		Message string `xml:"Message"`
+	}
+	if err := xml.Unmarshal(responseBody, &envelope); err != nil {
+		return fmt.Errorf("解析 S3 完成分片上传响应失败: %w", err)
+	}
+	switch envelope.XMLName.Local {
+	case "CompleteMultipartUploadResult":
+		return nil
+	case "Error":
+		code := strings.TrimSpace(envelope.Code)
+		message := strings.TrimSpace(envelope.Message)
+		if code == "" {
+			code = "UnknownError"
+		}
+		if message == "" {
+			return fmt.Errorf("S3 完成分片上传失败: %s", code)
+		}
+		return fmt.Errorf("S3 完成分片上传失败: %s: %s", code, message)
+	default:
+		return fmt.Errorf("S3 完成分片上传返回未知 XML 根元素 %q", envelope.XMLName.Local)
+	}
 }
 
 func abortS3MultipartUpload(ctx context.Context, endpoint, bucket, region, accessKeyID, secretKey, objectKey, uploadID string) error {

@@ -34,9 +34,20 @@ func TestDistributionLicenseAndNoticeAreComplete(t *testing.T) {
 		t.Fatalf("read NOTICE.md: %v", err)
 	}
 	noticeText := string(notice)
-	for _, required := range []string{"YUB WPanel", "GNU General Public License", "zangwp", "Copyright (C) 2026"} {
+	for _, required := range []string{"YUB WPanel", "GNU General Public License", "GPL-3.0-only", "zangwp", "Copyright (C) 2026"} {
 		if !strings.Contains(noticeText, required) {
 			t.Errorf("NOTICE.md is missing %q", required)
+		}
+	}
+
+	thirdParty, err := os.ReadFile("THIRD_PARTY_NOTICES.md")
+	if err != nil {
+		t.Fatalf("read THIRD_PARTY_NOTICES.md: %v", err)
+	}
+	thirdPartyText := string(thirdParty)
+	for _, required := range []string{"YUB WPanel Open Source License", "GPL-3.0-only", "YUB WPanel project notice"} {
+		if !strings.Contains(thirdPartyText, required) {
+			t.Errorf("THIRD_PARTY_NOTICES.md is missing %q", required)
 		}
 	}
 }
@@ -120,22 +131,32 @@ func TestLegacyDistributionNamesDoNotReturn(t *testing.T) {
 	}
 }
 
-func TestV200UpgradeBridgeRemainsExplicit(t *testing.T) {
+func TestFixedVersionRepairUpgradeBridgesRemainExplicit(t *testing.T) {
 	checks := map[string][]string{
 		"README.md": {
-			"v2.0.0 升级提示",
-			"不要使用 v2.0.0 自带的在线更新器",
+			"v2.0.0 到 v2.0.1",
+			"v2.0.1 到 v2.0.2",
+			"不要使用只替换二进制的面板在线更新器",
 		},
 		"README.en.md": {
-			"v2.0.0 upgrade notice",
-			"Do not use the updater built into v2.0.0",
+			"v2.0.0 to v2.0.1",
+			"v2.0.1 to v2.0.2",
+			"do not use the panel's binary-only online updater",
 		},
 		"docs/upgrade-compatibility.md": {
+			"v2.0.1 到 v2.0.2",
 			"v2.0.0 到 v2.0.1 的一次性安全升级",
 			"install.sh.sha256.sig",
 			"yub-wpanel.sha256.sig",
 			"yub-wpanel-third-party-licenses.tar.gz.sha256.sig",
+			"/usr/share/doc/yub-wpanel/RELEASE_VERSION",
 			"不要使用 `latest`",
+		},
+		"docs/verified-install.md": {
+			"v2.0.1 升级到 v2.0.2",
+			"version='v2.0.2'",
+			"yub-wpanel-third-party-licenses.tar.gz.sha256.sig",
+			"binary-only online updater",
 		},
 	}
 	for path, required := range checks {
@@ -145,7 +166,7 @@ func TestV200UpgradeBridgeRemainsExplicit(t *testing.T) {
 		}
 		for _, phrase := range required {
 			if !strings.Contains(string(content), phrase) {
-				t.Errorf("%s is missing the v2.0.0 bridge warning %q", path, phrase)
+				t.Errorf("%s is missing the fixed-version repair upgrade warning %q", path, phrase)
 			}
 		}
 	}

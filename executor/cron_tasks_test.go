@@ -1,16 +1,156 @@
 package executor
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zangwp/yub-wpanel/config"
 	"github.com/zangwp/yub-wpanel/database"
 )
+
+func TestRunCronFileBackupReceivesExecutionDeadline(t *testing.T) {
+	db := setupCronGateTest(t)
+	mustExec(t, db, `UPDATE websites SET status='active' WHERE id=1`)
+	mustExec(t, db, `INSERT INTO cron_jobs
+		(id,name,cron_expression,command,task_type,backup_mode,keep_count,site_id,enabled)
+		VALUES(21,'context backup','* * * * *','yub-wpanel file backup','file_backup','full',4,1,1)`)
+
+	oldExecute := executeCronFileBackup
+	t.Cleanup(func() { executeCronFileBackup = oldExecute })
+	called := false
+	executeCronFileBackup = func(ctx context.Context, siteID int, mode string, keepCount int, scheduled bool) (string, error) {
+		called = true
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("cron file backup context has no deadline")
+		}
+		remaining := time.Until(deadline)
+		if remaining <= fileBackupCommandTimeout-time.Minute || remaining > fileBackupCommandTimeout {
+			t.Fatalf("cron file backup deadline remaining = %s", remaining)
+		}
+		if siteID != 1 || mode != "full" || keepCount != 4 || !scheduled {
+			t.Fatalf("backup args = site:%d mode:%q keep:%d scheduled:%t", siteID, mode, keepCount, scheduled)
+		}
+		return "backup complete", nil
+	}
+
+	result := runCronJob(21, true)
+	if !result.Success || !called {
+		t.Fatalf("runCronJob result = %+v, called=%t", result, called)
+	}
+}
+
+func TestRunCronJobBoundsPersistedReturnedAndLoggedOutput(t *testing.T) {
+	db := setupCronGateTest(t)
+	mustExec(t, db, `UPDATE websites SET status='active' WHERE id=1`)
+	mustExec(t, db, `INSERT INTO cron_jobs
+		(id,name,cron_expression,command,task_type,backup_mode,keep_count,site_id,enabled)
+		VALUES(22,'bounded output','* * * * *','yub-wpanel file backup','file_backup','full',4,1,1)`)
+
+	oldExecute := executeCronFileBackup
+	oldLog := cronLogFile
+	cronLogFile = filepath.Join(t.TempDir(), "cron.log")
+	t.Cleanup(func() {
+		executeCronFileBackup = oldExecute
+		cronLogFile = oldLog
+	})
+	executeCronFileBackup = func(context.Context, int, string, int, bool) (string, error) {
+		return strings.Repeat("x", cronOutputMaxBytes*2), nil
+	}
+
+	result := runCronJob(22, true)
+	if !result.Success {
+		t.Fatalf("runCronJob result = %+v", result)
+	}
+	data, ok := result.Data.(map[string]interface{})
+	if !ok {
+		t.Fatalf("result data type = %T", result.Data)
+	}
+	output, _ := data["output"].(string)
+	if len(output) > cronOutputMaxBytes || !strings.Contains(output, "output truncated") {
+		t.Fatalf("returned output length=%d", len(output))
+	}
+	var stored string
+	if err := db.QueryRow(`SELECT last_output FROM cron_jobs WHERE id=22`).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != output {
+		t.Fatalf("stored output length=%d, returned length=%d", len(stored), len(output))
+	}
+	info, err := os.Stat(cronLogFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() > cronLogMaxBytes {
+		t.Fatalf("cron log size=%d, limit=%d", info.Size(), cronLogMaxBytes)
+	}
+}
+
+func TestCronExecutionTimeoutOnlyExtendsFileBackups(t *testing.T) {
+	if got := cronExecutionTimeout("file_backup"); got != fileBackupCommandTimeout {
+		t.Fatalf("file backup timeout = %s, want %s", got, fileBackupCommandTimeout)
+	}
+	for _, taskType := range []string{"wp_cron", "shell", "database_backup", ""} {
+		if got := cronExecutionTimeout(taskType); got != cronJobExecutionTimeout {
+			t.Fatalf("%q timeout = %s, want %s", taskType, got, cronJobExecutionTimeout)
+		}
+	}
+}
+
+func TestBoundedCronOutputKeepsWritesNonBlockingAndMarksTruncation(t *testing.T) {
+	output := newBoundedCronOutput(128)
+	input := strings.Repeat("x", 1024)
+	written, err := output.Write([]byte(input))
+	if err != nil || written != len(input) {
+		t.Fatalf("Write = (%d, %v), want (%d, nil)", written, err, len(input))
+	}
+	got := output.String()
+	if len(got) > 128 || !strings.Contains(got, "output truncated") {
+		t.Fatalf("bounded output length=%d value=%q", len(got), got)
+	}
+}
+
+type failingManagedCronRows struct {
+	next       bool
+	scanErr    error
+	iterateErr error
+}
+
+func (r *failingManagedCronRows) Next() bool {
+	if r.next {
+		r.next = false
+		return true
+	}
+	return false
+}
+
+func (r *failingManagedCronRows) Scan(...any) error { return r.scanErr }
+func (r *failingManagedCronRows) Err() error        { return r.iterateErr }
+
+func TestManagedCronLinesFailsClosedOnRowErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		rows *failingManagedCronRows
+	}{
+		{name: "scan", rows: &failingManagedCronRows{next: true, scanErr: fmt.Errorf("scan failed")}},
+		{name: "iteration", rows: &failingManagedCronRows{iterateErr: fmt.Errorf("iteration failed")}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lines, err := managedCronLines(tt.rows)
+			if err == nil || lines != nil {
+				t.Fatalf("managedCronLines = (%v, %v), want nil/error", lines, err)
+			}
+		})
+	}
+}
 
 func setupCronGateTest(t *testing.T) *sql.DB {
 	t.Helper()
@@ -190,6 +330,78 @@ func TestManualCronUsesSameExecutionLockAsScheduledCron(t *testing.T) {
 	}
 }
 
+func TestAcquireCronJobMutationLocksSortsDeduplicatesAndReleases(t *testing.T) {
+	oldLockDir := cronJobLockDir
+	cronJobLockDir = t.TempDir()
+	t.Cleanup(func() { cronJobLockDir = oldLockDir })
+
+	locks, err := AcquireCronJobMutationLocks([]int{9, 3, 9, 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AcquireCronJobMutationLocks([]int{5, 1}); !errors.Is(err, ErrCronJobAlreadyRunning) {
+		_ = locks.Close()
+		t.Fatalf("overlapping acquisition error=%v, want ErrCronJobAlreadyRunning", err)
+	}
+	partial, err := AcquireCronJobMutationLocks([]int{1})
+	if err != nil {
+		_ = locks.Close()
+		t.Fatalf("partial acquisition was not released: %v", err)
+	}
+	if err := partial.Close(); err != nil {
+		_ = locks.Close()
+		t.Fatal(err)
+	}
+	if err := locks.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := locks.Close(); err != nil {
+		t.Fatalf("second close: %v", err)
+	}
+
+	reacquired, err := AcquireCronJobMutationLocks([]int{3, 5, 9})
+	if err != nil {
+		t.Fatalf("locks were not released: %v", err)
+	}
+	if err := reacquired.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCronJobLockRejectsWorldAccessibleDirectory(t *testing.T) {
+	oldLockDir := cronJobLockDir
+	cronJobLockDir = t.TempDir()
+	t.Cleanup(func() { cronJobLockDir = oldLockDir })
+	if err := os.Chmod(cronJobLockDir, 0777); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := acquireCronJobExecutionLock(7); err == nil || !strings.Contains(err.Error(), "permissions") {
+		t.Fatalf("world-accessible lock directory error=%v", err)
+	}
+}
+
+func TestCronJobLockRejectsPrecreatedUnsafeFile(t *testing.T) {
+	oldLockDir := cronJobLockDir
+	cronJobLockDir = t.TempDir()
+	t.Cleanup(func() { cronJobLockDir = oldLockDir })
+	path := filepath.Join(cronJobLockDir, "yub-wpanel-cron-8.lock")
+	if err := os.WriteFile(path, nil, 0666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0666); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := acquireCronJobExecutionLock(8); err == nil || !strings.Contains(err.Error(), "identity is unsafe") {
+		t.Fatalf("unsafe precreated lock error=%v", err)
+	}
+}
+
+func TestCanonicalCronJobLockDirectoryIsPrivateRuntimePath(t *testing.T) {
+	if canonicalCronJobLockDir != "/run/yub-wpanel/cron-locks" {
+		t.Fatalf("canonicalCronJobLockDir=%q", canonicalCronJobLockDir)
+	}
+}
+
 func TestScheduledCronDoesNotClearManualRunningClaim(t *testing.T) {
 	db := setupCronGateTest(t)
 	mustExec(t, db, `UPDATE websites SET status='active' WHERE id=1`)
@@ -250,6 +462,27 @@ func TestPruneCronLogKeepsConfiguredLineLimit(t *testing.T) {
 	got := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
 	if len(got) != cronLogKeepLines || got[0] != "line-3" || got[len(got)-1] != fmt.Sprintf("line-%d", cronLogKeepLines+2) {
 		t.Fatalf("pruned cron log: lines=%d first=%q last=%q", len(got), got[0], got[len(got)-1])
+	}
+}
+
+func TestPruneCronLogReadsAndRetainsOnlyBoundedTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cron.log")
+	line := strings.Repeat("x", 4095) + "\n"
+	var content strings.Builder
+	for content.Len() <= cronLogMaxBytes*2 {
+		content.WriteString(line)
+	}
+	if err := os.WriteFile(path, []byte(content.String()), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	pruneCronLog(path, cronLogKeepLines)
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() > cronLogMaxBytes {
+		t.Fatalf("pruned log size=%d, limit=%d", info.Size(), cronLogMaxBytes)
 	}
 }
 
@@ -392,8 +625,25 @@ func TestWriteManagedCronFileAtomicallyReplacesOwnedTarget(t *testing.T) {
 	if err := os.WriteFile(path, []byte(oldContent), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	oldSync := syncCronParentDirectory
+	syncCalled := false
+	syncCronParentDirectory = func(parent string) error {
+		syncCalled = true
+		if parent != root {
+			t.Fatalf("synced parent=%q, want %q", parent, root)
+		}
+		content, err := os.ReadFile(path)
+		if err != nil || string(content) != newContent {
+			t.Fatalf("parent synced before rename completed: content=%q err=%v", content, err)
+		}
+		return nil
+	}
+	t.Cleanup(func() { syncCronParentDirectory = oldSync })
 	if err := writeManagedCronFile(path, []byte(newContent)); err != nil {
 		t.Fatal(err)
+	}
+	if !syncCalled {
+		t.Fatal("cron parent directory was not synced")
 	}
 	content, err := os.ReadFile(path)
 	if err != nil || string(content) != newContent {
@@ -406,6 +656,24 @@ func TestWriteManagedCronFileAtomicallyReplacesOwnedTarget(t *testing.T) {
 	temps, err := filepath.Glob(filepath.Join(root, ".yub-wpanel.tmp-*"))
 	if err != nil || len(temps) != 0 {
 		t.Fatalf("cron temporary files=%v err=%v", temps, err)
+	}
+}
+
+func TestWriteManagedCronFileReportsParentSyncFailure(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "yub-wpanel")
+	content := managedCronHeader + "\nSHELL=/bin/bash\n"
+	oldSync := syncCronParentDirectory
+	syncCronParentDirectory = func(string) error { return errors.New("sync failed") }
+	t.Cleanup(func() { syncCronParentDirectory = oldSync })
+
+	err := writeManagedCronFile(path, []byte(content))
+	if err == nil || !strings.Contains(err.Error(), "sync cron parent directory") {
+		t.Fatalf("writeManagedCronFile error=%v, want parent sync failure", err)
+	}
+	written, readErr := os.ReadFile(path)
+	if readErr != nil || string(written) != content {
+		t.Fatalf("renamed target missing after sync error: content=%q err=%v", written, readErr)
 	}
 }
 

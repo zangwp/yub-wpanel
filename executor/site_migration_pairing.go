@@ -322,6 +322,26 @@ func (s *SiteMigrationPairingService) AuthorizePeer(ctx context.Context, peerID,
 	return nil
 }
 
+// AuthorizeMachineBearer performs the credential-only part of machine API
+// authentication before a request body is read. Handlers still call
+// AuthorizePeer after decoding so the credential is bound to the peer ID in
+// the request payload.
+func (s *SiteMigrationPairingService) AuthorizeMachineBearer(ctx context.Context, bearer string, allowPending bool) error {
+	if s == nil || !validMigrationCredential(bearer) {
+		return ErrSiteMigrationPairRejected
+	}
+	var status string
+	var protocol int
+	if err := s.db.QueryRowContext(ctx, `SELECT status,protocol_version FROM site_migration_peers
+		WHERE inbound_credential_hash=? LIMIT 1`, hashMigrationSecret(bearer)).Scan(&status, &protocol); err != nil || protocol != siteMigrationProtocolVersion {
+		return ErrSiteMigrationPairRejected
+	}
+	if status == "paired" || (allowPending && status == "pending") {
+		return nil
+	}
+	return ErrSiteMigrationPairRejected
+}
+
 func (s *SiteMigrationPairingService) RemotePreflight(ctx context.Context, peerID string, domains []string) (*SiteMigrationPreflightResponse, error) {
 	if !validSiteMigrationID(peerID) || len(domains) == 0 || len(domains) > 500 {
 		return nil, ErrSiteMigrationPairRejected
@@ -618,6 +638,11 @@ func hashMigrationSecret(value string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func validMigrationCredential(value string) bool {
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size && base64.RawURLEncoding.EncodeToString(decoded) == value
+}
+
 func sameMigrationSecret(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(strings.ToLower(a)), []byte(strings.ToLower(b))) == 1
 }
@@ -667,7 +692,10 @@ func pinnedMigrationClient(fingerprint string, timeout time.Duration) (*http.Cli
 	if err != nil {
 		return nil, err
 	}
-	return &http.Client{Timeout: timeout, Transport: &http.Transport{TLSClientConfig: tlsConfig}}, nil
+	return &http.Client{Timeout: timeout, Transport: &http.Transport{
+		TLSClientConfig:   tlsConfig,
+		DisableKeepAlives: true,
+	}}, nil
 }
 
 func pinnedMigrationStreamingClient(fingerprint string) (*http.Client, error) {
@@ -677,6 +705,7 @@ func pinnedMigrationStreamingClient(fingerprint string) (*http.Client, error) {
 	}
 	return &http.Client{Transport: &http.Transport{
 		TLSClientConfig:       tlsConfig,
+		DisableKeepAlives:     true,
 		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
@@ -728,6 +757,7 @@ func postPinnedJSONLimit(ctx context.Context, endpoint, fingerprint, bearer stri
 	if err != nil {
 		return err
 	}
+	defer client.CloseIdleConnections()
 	resp, err := client.Do(request)
 	if err != nil {
 		return err

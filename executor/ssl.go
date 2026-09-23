@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -737,7 +738,60 @@ func StartSSLRenewalScheduler() {
 			now := time.Now()
 			next := time.Date(now.Year(), now.Month(), now.Day()+1, 3, 0, 0, 0, now.Location())
 			time.Sleep(next.Sub(now))
-			GlobalQueue.Enqueue(TaskRenewSSL, nil)
+			if err := enqueueSSLRenewalWithRetry(context.Background()); err != nil {
+				log.Printf("SSL 自动续期任务未入队: %v", err)
+			}
 		}
 	}()
+}
+
+const sslRenewalEnqueueMaxDelay = time.Minute
+
+var (
+	sslRenewalEnqueueRetryDelay = time.Second
+	enqueueSSLRenewalTask       = func(ctx context.Context) error {
+		_, err := GlobalQueue.EnqueueContext(ctx, TaskRenewSSL, nil)
+		return err
+	}
+	waitBeforeSSLRenewalRetry = func(ctx context.Context, delay time.Duration) error {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return nil
+		}
+	}
+)
+
+func enqueueSSLRenewalWithRetry(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	delay := sslRenewalEnqueueRetryDelay
+	if delay <= 0 {
+		delay = time.Second
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := enqueueSSLRenewalTask(ctx)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, ErrTaskQueueFull) && !errors.Is(err, ErrTaskQueueUnavailable) {
+			return err
+		}
+		if err := waitBeforeSSLRenewalRetry(ctx, delay); err != nil {
+			return err
+		}
+		if delay < sslRenewalEnqueueMaxDelay {
+			delay *= 2
+			if delay > sslRenewalEnqueueMaxDelay {
+				delay = sslRenewalEnqueueMaxDelay
+			}
+		}
+	}
 }

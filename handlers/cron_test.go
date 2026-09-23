@@ -3,9 +3,16 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/zangwp/yub-wpanel/database"
@@ -14,13 +21,33 @@ import (
 
 func failCronRenderForTest(t *testing.T) {
 	t.Helper()
-	old := enqueueCronRender
-	enqueueCronRender = func() *executor.Task {
-		resultCh := make(chan executor.TaskResult, 1)
-		resultCh <- executor.TaskResult{Success: false, Message: "test restart failure"}
-		return &executor.Task{ResultCh: resultCh}
+	old := renderManagedCron
+	renderManagedCron = func() executor.TaskResult {
+		return executor.TaskResult{Success: false, Message: "test restart failure"}
 	}
-	t.Cleanup(func() { enqueueCronRender = old })
+	t.Cleanup(func() { renderManagedCron = old })
+}
+
+func succeedCronRenderForTest(t *testing.T) {
+	t.Helper()
+	old := renderManagedCron
+	renderManagedCron = func() executor.TaskResult {
+		return executor.TaskResult{Success: true, Message: "ok"}
+	}
+	t.Cleanup(func() { renderManagedCron = old })
+}
+
+func setCronTestWPConfig(t *testing.T, siteID int, content string) string {
+	t.Helper()
+	root := t.TempDir()
+	path := filepath.Join(root, "wp-config.php")
+	if err := os.WriteFile(path, []byte(content), 0640); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.GetDB().Exec(`UPDATE websites SET web_root=? WHERE id=?`, root, siteID); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func cronJSONRequest(t *testing.T, method, target, body string, params gin.Params) *httptest.ResponseRecorder {
@@ -129,7 +156,30 @@ func TestCronRunCannotConfirmPastMigrationLock(t *testing.T) {
 	}
 }
 
-func TestCronMutationsReportRenderFailureAndRetainRequestedDatabaseState(t *testing.T) {
+func TestCronRunQueueFailureRestoresRunningState(t *testing.T) {
+	setupCronHandlerRuntimeTest(t)
+	oldQueue := executor.GlobalQueue
+	executor.GlobalQueue = nil
+	t.Cleanup(func() { executor.GlobalQueue = oldQueue })
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/cron/41/run", nil)
+	ctx.Params = gin.Params{{Key: "id", Value: "41"}}
+	new(CronHandler).Run(ctx)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("queue failure status=%d, want %d; body=%s", recorder.Code, http.StatusServiceUnavailable, recorder.Body.String())
+	}
+	var running int
+	if err := database.GetDB().QueryRow(`SELECT running FROM cron_jobs WHERE id=41`).Scan(&running); err != nil {
+		t.Fatal(err)
+	}
+	if running != 0 {
+		t.Fatalf("cron running=%d after queue rejection, want 0", running)
+	}
+}
+
+func TestCronMutationsRollBackDatabaseWhenRenderFails(t *testing.T) {
 	t.Run("create", func(t *testing.T) {
 		setupBackupOverviewTestDB(t)
 		failCronRenderForTest(t)
@@ -138,7 +188,7 @@ func TestCronMutationsReportRenderFailureAndRetainRequestedDatabaseState(t *test
 			t.Fatalf("create status=%d body=%s", recorder.Code, recorder.Body.String())
 		}
 		var count int
-		if err := database.GetDB().QueryRow(`SELECT COUNT(*) FROM cron_jobs WHERE name='created'`).Scan(&count); err != nil || count != 1 {
+		if err := database.GetDB().QueryRow(`SELECT COUNT(*) FROM cron_jobs WHERE name='created'`).Scan(&count); err != nil || count != 0 {
 			t.Fatalf("created row count=%d err=%v", count, err)
 		}
 	})
@@ -154,7 +204,7 @@ func TestCronMutationsReportRenderFailureAndRetainRequestedDatabaseState(t *test
 			t.Fatalf("update status=%d body=%s", recorder.Code, recorder.Body.String())
 		}
 		var name string
-		if err := database.GetDB().QueryRow(`SELECT name FROM cron_jobs WHERE id=51`).Scan(&name); err != nil || name != "updated" {
+		if err := database.GetDB().QueryRow(`SELECT name FROM cron_jobs WHERE id=51`).Scan(&name); err != nil || name != "old" {
 			t.Fatalf("updated name=%q err=%v", name, err)
 		}
 	})
@@ -170,8 +220,330 @@ func TestCronMutationsReportRenderFailureAndRetainRequestedDatabaseState(t *test
 			t.Fatalf("delete status=%d body=%s", recorder.Code, recorder.Body.String())
 		}
 		var count int
-		if err := database.GetDB().QueryRow(`SELECT COUNT(*) FROM cron_jobs WHERE id=52`).Scan(&count); err != nil || count != 0 {
+		if err := database.GetDB().QueryRow(`SELECT COUNT(*) FROM cron_jobs WHERE id=52`).Scan(&count); err != nil || count != 1 {
 			t.Fatalf("deleted row count=%d err=%v", count, err)
 		}
 	})
+}
+
+func TestCronUpdateCanReenableDisabledTask(t *testing.T) {
+	setupBackupOverviewTestDB(t)
+	if _, err := database.GetDB().Exec(`INSERT INTO cron_jobs(id,name,cron_expression,command,task_type,enabled)
+		VALUES(61,'disabled','* * * * *','echo old','command',0)`); err != nil {
+		t.Fatal(err)
+	}
+	succeedCronRenderForTest(t)
+	recorder := cronJSONRequest(t, http.MethodPut, "/api/cron/61",
+		`{"name":"enabled","cron_expression":"10 2 * * *","command":"echo enabled","task_type":"command","enabled":true}`,
+		gin.Params{{Key: "id", Value: "61"}})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var enabled int
+	if err := database.GetDB().QueryRow(`SELECT enabled FROM cron_jobs WHERE id=61`).Scan(&enabled); err != nil {
+		t.Fatal(err)
+	}
+	if enabled != 1 {
+		t.Fatalf("enabled=%d, want 1", enabled)
+	}
+}
+
+func TestWPCronManagedMarkerLifecycle(t *testing.T) {
+	const normalConfig = "<?php\n// DISABLE_WP_CRON is documented here only.\n/* That's all, stop editing! Happy publishing. */\n"
+	setupBackupOverviewTestDB(t)
+	insertBackupPolicySite(t, 1, "cron.example.com")
+	configPath := setCronTestWPConfig(t, 1, normalConfig)
+	succeedCronRenderForTest(t)
+
+	created := cronJSONRequest(t, http.MethodPost, "/api/cron",
+		`{"name":"managed","cron_expression":"5 1 * * *","command":"cron.example.com","task_type":"wp_cron","site_id":1}`, nil)
+	if created.Code != http.StatusOK {
+		t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(data, []byte(managedWPCronLine)) || !bytes.Contains(data, []byte("documented here only")) {
+		t.Fatalf("managed marker was not inserted safely: %q", data)
+	}
+	var id int
+	if err := database.GetDB().QueryRow(`SELECT id FROM cron_jobs WHERE name='managed'`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	idText := strconv.Itoa(id)
+	deleted := cronJSONRequest(t, http.MethodDelete, "/api/cron/"+idText, "", gin.Params{{Key: "id", Value: idText}})
+	if deleted.Code != http.StatusOK {
+		t.Fatalf("delete status=%d body=%s", deleted.Code, deleted.Body.String())
+	}
+	data, err = os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte(managedWPCronLine)) || !bytes.Contains(data, []byte("DISABLE_WP_CRON is documented")) {
+		t.Fatalf("managed marker removal touched unrelated content: %q", data)
+	}
+}
+
+func TestWPCronDeleteReportsRestoreOnlyAfterLastTask(t *testing.T) {
+	const normalConfig = "<?php\n/* That's all, stop editing! Happy publishing. */\n"
+	setupBackupOverviewTestDB(t)
+	insertBackupPolicySite(t, 1, "cron.example.com")
+	configPath := setCronTestWPConfig(t, 1, normalConfig)
+	succeedCronRenderForTest(t)
+
+	for _, name := range []string{"first", "second"} {
+		recorder := cronJSONRequest(t, http.MethodPost, "/api/cron",
+			`{"name":"`+name+`","cron_expression":"5 1 * * *","command":"cron.example.com","task_type":"wp_cron","site_id":1}`, nil)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("create %s status=%d body=%s", name, recorder.Code, recorder.Body.String())
+		}
+	}
+	var firstID, secondID int
+	if err := database.GetDB().QueryRow(`SELECT id FROM cron_jobs WHERE name='first'`).Scan(&firstID); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.GetDB().QueryRow(`SELECT id FROM cron_jobs WHERE name='second'`).Scan(&secondID); err != nil {
+		t.Fatal(err)
+	}
+	firstText := strconv.Itoa(firstID)
+	firstDelete := cronJSONRequest(t, http.MethodDelete, "/api/cron/"+firstText, "", gin.Params{{Key: "id", Value: firstText}})
+	if firstDelete.Code != http.StatusOK || strings.Contains(firstDelete.Body.String(), "已恢复 WordPress 内置 Cron") {
+		t.Fatalf("first delete status=%d body=%s", firstDelete.Code, firstDelete.Body.String())
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil || !bytes.Contains(data, []byte(managedWPCronLine)) {
+		t.Fatalf("managed marker removed before last task: %q err=%v", data, err)
+	}
+
+	secondText := strconv.Itoa(secondID)
+	secondDelete := cronJSONRequest(t, http.MethodDelete, "/api/cron/"+secondText, "", gin.Params{{Key: "id", Value: secondText}})
+	if secondDelete.Code != http.StatusOK || !strings.Contains(secondDelete.Body.String(), "已恢复 WordPress 内置 Cron") {
+		t.Fatalf("last delete status=%d body=%s", secondDelete.Code, secondDelete.Body.String())
+	}
+}
+
+func TestWPCronRollbackPreservesConcurrentOwnerEdit(t *testing.T) {
+	const normalConfig = "<?php\n/* That's all, stop editing! Happy publishing. */\n"
+	setupBackupOverviewTestDB(t)
+	insertBackupPolicySite(t, 1, "cron.example.com")
+	configPath := setCronTestWPConfig(t, 1, normalConfig)
+	db := database.GetDB()
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO cron_jobs(name,cron_expression,command,task_type,site_id,enabled)
+		VALUES('temporary','5 1 * * *','cron.example.com','wp_cron',1,1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncWPCronSideEffects(tx, 1); err != nil {
+		t.Fatal(err)
+	}
+	managed, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerEdit := append(append([]byte(nil), managed...), []byte("// owner concurrent edit\n")...)
+	if err := os.WriteFile(configPath, ownerEdit, 0640); err != nil {
+		t.Fatal(err)
+	}
+	if err := rollbackCronMutation(db, tx, []int{1}, errors.New("forced mutation failure")); err == nil {
+		t.Fatal("rollbackCronMutation returned nil, want original failure")
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte(managedWPCronLine)) || !bytes.Contains(data, []byte("owner concurrent edit")) {
+		t.Fatalf("semantic rollback overwrote owner edit: %q", data)
+	}
+}
+
+func TestWriteWPConfigAtomicallyRejectsStaleExpectedContent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wp-config.php")
+	if err := os.WriteFile(path, []byte("before\n"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("owner edit\n"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeWPConfigAtomically(path, []byte("before\n"), []byte("panel edit\n")); err == nil {
+		t.Fatal("stale expected content was accepted")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != "owner edit\n" {
+		t.Fatalf("stale write changed file: %q err=%v", data, err)
+	}
+}
+
+func TestWPCronLeavesSiteOwnedDefinitionUntouched(t *testing.T) {
+	const ownedConfig = "<?php\ndefine( \"DISABLE_WP_CRON\", true ); // site owner\n/* That's all, stop editing! Happy publishing. */\n"
+	setupBackupOverviewTestDB(t)
+	insertBackupPolicySite(t, 1, "cron.example.com")
+	configPath := setCronTestWPConfig(t, 1, ownedConfig)
+	succeedCronRenderForTest(t)
+
+	created := cronJSONRequest(t, http.MethodPost, "/api/cron",
+		`{"name":"owned","cron_expression":"5 1 * * *","command":"cron.example.com","task_type":"wp_cron","site_id":1}`, nil)
+	if created.Code != http.StatusOK {
+		t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
+	}
+	var id int
+	if err := database.GetDB().QueryRow(`SELECT id FROM cron_jobs WHERE name='owned'`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	idText := strconv.Itoa(id)
+	deleted := cronJSONRequest(t, http.MethodDelete, "/api/cron/"+idText, "", gin.Params{{Key: "id", Value: idText}})
+	if deleted.Code != http.StatusOK {
+		t.Fatalf("delete status=%d body=%s", deleted.Code, deleted.Body.String())
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil || string(data) != ownedConfig {
+		t.Fatalf("site-owned definition changed: %q err=%v", data, err)
+	}
+}
+
+func TestWPCronConflictRollsBackDatabaseAndConfig(t *testing.T) {
+	const conflictingConfig = "<?php\ndefine('DISABLE_WP_CRON', false);\n/* That's all, stop editing! Happy publishing. */\n"
+	setupBackupOverviewTestDB(t)
+	insertBackupPolicySite(t, 1, "cron.example.com")
+	configPath := setCronTestWPConfig(t, 1, conflictingConfig)
+	succeedCronRenderForTest(t)
+
+	recorder := cronJSONRequest(t, http.MethodPost, "/api/cron",
+		`{"name":"conflict","cron_expression":"5 1 * * *","command":"cron.example.com","task_type":"wp_cron","site_id":1}`, nil)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("create status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var count int
+	if err := database.GetDB().QueryRow(`SELECT COUNT(*) FROM cron_jobs WHERE name='conflict'`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("conflicting create row count=%d err=%v, want rollback", count, err)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil || string(data) != conflictingConfig {
+		t.Fatalf("conflicting config changed: %q err=%v", data, err)
+	}
+}
+
+func TestWPCronRenderFailureRestoresDatabaseAndManagedMarker(t *testing.T) {
+	const normalConfig = "<?php\n/* That's all, stop editing! Happy publishing. */\n"
+	setupBackupOverviewTestDB(t)
+	insertBackupPolicySite(t, 1, "cron.example.com")
+	configPath := setCronTestWPConfig(t, 1, normalConfig)
+	failCronRenderForTest(t)
+
+	recorder := cronJSONRequest(t, http.MethodPost, "/api/cron",
+		`{"name":"render-failure","cron_expression":"5 1 * * *","command":"cron.example.com","task_type":"wp_cron","site_id":1}`, nil)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("create status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var count int
+	if err := database.GetDB().QueryRow(`SELECT COUNT(*) FROM cron_jobs WHERE name='render-failure'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("failed render retained %d Cron rows", count)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil || string(data) != normalConfig {
+		t.Fatalf("failed render retained WP-Cron marker or overwrote config: %q err=%v", data, err)
+	}
+}
+
+func TestCronMutationRenderIsSerializedWithoutTaskQueue(t *testing.T) {
+	setupBackupOverviewTestDB(t)
+	oldQueue := executor.GlobalQueue
+	executor.GlobalQueue = nil
+	t.Cleanup(func() { executor.GlobalQueue = oldQueue })
+
+	oldRender := renderManagedCron
+	firstEntered := make(chan struct{})
+	secondEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var calls atomic.Int32
+	renderManagedCron = func() executor.TaskResult {
+		switch calls.Add(1) {
+		case 1:
+			close(firstEntered)
+			<-releaseFirst
+		case 2:
+			close(secondEntered)
+		}
+		return executor.TaskResult{Success: true, Message: "ok"}
+	}
+	t.Cleanup(func() {
+		select {
+		case <-releaseFirst:
+		default:
+			close(releaseFirst)
+		}
+		renderManagedCron = oldRender
+	})
+
+	responses := make(chan *httptest.ResponseRecorder, 2)
+	go func() {
+		responses <- cronJSONRequest(t, http.MethodPost, "/api/cron",
+			`{"name":"first","cron_expression":"5 1 * * *","command":"echo first","task_type":"command"}`, nil)
+	}()
+	select {
+	case <-firstEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first cron mutation did not reach synchronous render")
+	}
+
+	go func() {
+		responses <- cronJSONRequest(t, http.MethodPost, "/api/cron",
+			`{"name":"second","cron_expression":"10 2 * * *","command":"echo second","task_type":"command"}`, nil)
+	}()
+	select {
+	case <-secondEntered:
+		t.Fatal("second cron mutation rendered before the first mutation completed")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseFirst)
+	for i := 0; i < 2; i++ {
+		select {
+		case recorder := <-responses:
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("cron mutation did not finish")
+		}
+	}
+}
+
+func TestCronCreateInsertFailureLeavesNoRowOrRender(t *testing.T) {
+	setupBackupOverviewTestDB(t)
+	if _, err := database.GetDB().Exec(`CREATE TRIGGER reject_test_cron_insert
+		AFTER INSERT ON cron_jobs WHEN NEW.name='abort-insert'
+		BEGIN SELECT RAISE(ABORT, 'test insert failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	old := renderManagedCron
+	var renderCalls atomic.Int32
+	renderManagedCron = func() executor.TaskResult {
+		renderCalls.Add(1)
+		return executor.TaskResult{Success: true}
+	}
+	t.Cleanup(func() { renderManagedCron = old })
+
+	recorder := cronJSONRequest(t, http.MethodPost, "/api/cron",
+		`{"name":"abort-insert","cron_expression":"5 1 * * *","command":"echo abort","task_type":"command"}`, nil)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var count int
+	if err := database.GetDB().QueryRow(`SELECT COUNT(*) FROM cron_jobs WHERE name='abort-insert'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("failed insert left %d cron rows, want 0", count)
+	}
+	if got := renderCalls.Load(); got != 0 {
+		t.Fatalf("render calls=%d after failed insert, want 0", got)
+	}
 }

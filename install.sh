@@ -28,6 +28,7 @@ PHP_SOURCE_MODE="${YUB_WPANEL_PHP_SOURCE:-auto}"
 REPAIR_MODE=false
 REPAIR_BACKUP_DIR=""
 REPAIR_SERVICE_WAS_ACTIVE=false
+REPAIR_SERVICE_STOPPED_FOR_SNAPSHOT=false
 REPAIR_COMMITTED=false
 INSTALL_WORKDIR=""
 PANEL_CANDIDATE=""
@@ -45,7 +46,11 @@ REPAIR_BIN_EXISTED=false
 REPAIR_UNIT_EXISTED=false
 REPAIR_TLS_EXISTED=false
 REPAIR_DB_EXISTED=false
+REPAIR_LICENSE_DIR_EXISTED=false
 REPAIR_MUTATED=false
+REPAIR_INACTIVE_HEALTH_VERIFIED=false
+FRESH_SERVICE_CLEANUP_REQUIRED=false
+VALIDATED_TLS_PORT=""
 ATOMIC_STAGE_PATH=""
 # The signed bootstrap validates this marker before it delegates execution.
 # shellcheck disable=SC2034
@@ -106,7 +111,7 @@ init_install_workdir() {
     local required_cmd=""
     local previous_umask=""
 
-    for required_cmd in awk chmod cmp dpkg-deb find flock grep head install mktemp mv openssl readlink rm sed sha256sum stat sync systemctl systemd-analyze tar timeout tr uname wc; do
+    for required_cmd in awk chmod cmp cp dpkg-deb find flock grep head install mktemp mv openssl readlink rm rmdir sed sha256sum sort stat sync systemctl systemd-analyze tar timeout tr uname wc xargs; do
         command -v "$required_cmd" >/dev/null 2>&1 || log_error "缺少安装安全预检命令: ${required_cmd}"
     done
     if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
@@ -156,11 +161,23 @@ cleanup_atomic_stage_file() {
 	ATOMIC_STAGE_PATH=""
 }
 
+cleanup_failed_fresh_panel_service() {
+    [[ "$REPAIR_MODE" == false ]] || return 0
+    [[ "$FRESH_SERVICE_CLEANUP_REQUIRED" == true ]] || return 0
+
+    # A fresh install must never leave an unverified panel running now or at
+    # the next boot. Both operations are idempotent when the unit was not yet
+    # written or enabled.
+    systemctl stop yub-wpanel 2>/dev/null || true
+    systemctl disable yub-wpanel 2>/dev/null || true
+}
+
 installer_exit() {
     local exit_code=$?
     set +e
     if [[ $exit_code -ne 0 ]]; then
         repair_rollback
+        cleanup_failed_fresh_panel_service
     fi
 	cleanup_atomic_stage_file
     cleanup_install_workdir
@@ -674,6 +691,55 @@ validate_running_panel_service_identity() {
     return 1
 }
 
+# A successful systemd start is not enough to commit an install or repair: the
+# process must be the deployed binary, own the configured TLS listener, and
+# serve the expected release from the database-backed loopback health route.
+validate_running_panel_health() {
+    local expected_version="$1"
+    local panel_info=""
+    local reported_version=""
+    local tls_port=""
+    local main_pid=""
+    local running_executable=""
+    local confirmed_pid=""
+    local listeners=""
+    local health_response=""
+
+    [[ "$expected_version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || return 1
+    panel_info=$(timeout 20s "$BIN_PATH" --info --config "$CONFIG_FILE" 2>/dev/null) || return 1
+    reported_version=$(sed -n 's/^版本: \(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)\([[:space:]].*\)\{0,1\}$/\1/p' <<< "$panel_info")
+    tls_port=$(sed -n 's/^HTTPS 端口: \([0-9][0-9]*\)$/\1/p' <<< "$panel_info")
+    [[ $(printf '%s\n' "$reported_version" | awk 'NF {count++} END {print count+0}') == "1" ]] || return 1
+    [[ $(printf '%s\n' "$tls_port" | awk 'NF {count++} END {print count+0}') == "1" ]] || return 1
+    [[ "$reported_version" == "$expected_version" ]] || return 1
+    [[ "$tls_port" =~ ^[0-9]{1,5}$ ]] || return 1
+    (( 10#$tls_port >= 1 && 10#$tls_port <= 65535 )) || return 1
+
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        if systemctl is-active --quiet yub-wpanel 2>/dev/null; then
+            main_pid=$(systemctl show yub-wpanel.service --property=MainPID --value 2>/dev/null || true)
+            if [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] && [[ -e "/proc/${main_pid}/exe" ]]; then
+                running_executable=$(readlink -- "/proc/${main_pid}/exe" 2>/dev/null || true)
+                listeners=$(ss -H -ltnp "sport = :${tls_port}" 2>/dev/null || true)
+                if [[ "$running_executable" == "$BIN_PATH" ]] && \
+                   printf '%s\n' "$listeners" | grep -Fq "pid=${main_pid},"; then
+                    health_response=$(curl -q --noproxy '*' --insecure --fail --silent --show-error \
+                        --connect-timeout 2 --max-time 5 \
+                        "https://127.0.0.1:${tls_port}/healthz" 2>/dev/null || true)
+                    confirmed_pid=$(systemctl show yub-wpanel.service --property=MainPID --value 2>/dev/null || true)
+                    if [[ "$confirmed_pid" == "$main_pid" ]] && \
+                       [[ "$health_response" == "{\"ok\":true,\"version\":\"${expected_version}\"}" ]]; then
+                        VALIDATED_TLS_PORT="$tls_port"
+                        return 0
+                    fi
+                fi
+            fi
+        fi
+        sleep 2
+    done
+    return 1
+}
+
 validate_existing_panel_cron_file() {
 	local cron_parent="${CRON_PATH%/*}"
 	local parent_owner=""
@@ -820,6 +886,7 @@ prepare_panel_candidate() {
 
 create_repair_backup() {
     local timestamp=""
+    local license_file=""
     timestamp=$(date -u +%Y%m%dT%H%M%SZ)
     REPAIR_BACKUP_DIR="$INSTALL_DIR/backups/install-repair/${timestamp}-$$"
     [[ -s "$BIN_PATH" ]] && REPAIR_BIN_EXISTED=true
@@ -846,8 +913,51 @@ create_repair_backup() {
         install -m 0644 "$INSTALL_DIR/certs/panel.crt" "$REPAIR_BACKUP_DIR/panel.crt"
         install -m 0600 "$INSTALL_DIR/certs/panel.key" "$REPAIR_BACKUP_DIR/panel.key"
     fi
+    if [[ -e "$LICENSE_DOC_DIR" ]] || [[ -L "$LICENSE_DOC_DIR" ]]; then
+        validate_license_document_directory || \
+            log_error "repair前许可文档目录身份不安全"
+        for license_file in \
+            LICENSE \
+            NOTICE.md \
+            THIRD_PARTY_NOTICES.md \
+            RELEASE_VERSION \
+            yub-wpanel-third-party-licenses.tar.gz \
+            yub-wpanel-third-party-licenses.tar.gz.sha256 \
+            yub-wpanel-third-party-licenses.tar.gz.sha256.sig \
+            release-public-key.pem; do
+            if [[ -e "$LICENSE_DOC_DIR/$license_file" ]] || [[ -L "$LICENSE_DOC_DIR/$license_file" ]]; then
+                [[ -f "$LICENSE_DOC_DIR/$license_file" ]] && [[ ! -L "$LICENSE_DOC_DIR/$license_file" ]] || \
+                    log_error "repair前许可文档条目不是安全常规文件: $license_file"
+            fi
+        done
+        REPAIR_LICENSE_DIR_EXISTED=true
+        cp -a -- "$LICENSE_DOC_DIR" "$REPAIR_BACKUP_DIR/license-docs" || \
+            log_error "repair许可文档目录备份失败"
+    fi
     find "$REPAIR_BACKUP_DIR" -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > "$REPAIR_BACKUP_DIR/SHA256SUMS"
     sha256sum -c "$REPAIR_BACKUP_DIR/SHA256SUMS" >/dev/null || log_error "repair备份校验失败"
+}
+
+prepare_repair_snapshot() {
+    if systemctl is-active --quiet yub-wpanel 2>/dev/null; then
+        REPAIR_SERVICE_WAS_ACTIVE=true
+        # Stop immediately before the snapshot and do not start the candidate
+        # until every repair mutation is complete. This closes the window in
+        # which a post-snapshot SQLite write could be lost by rollback.
+        # Arm active-state restoration before stop: systemctl can report a
+        # failure after the stop has already taken effect.
+        REPAIR_SERVICE_STOPPED_FOR_SNAPSHOT=true
+        if ! systemctl stop yub-wpanel; then
+            if systemctl is-active --quiet yub-wpanel 2>/dev/null; then
+                log_error "repair快照前无法停止yub-wpanel；未修改服务器状态"
+            fi
+            log_warn "systemctl stop返回失败，但yub-wpanel已停止；继续创建repair快照"
+        fi
+        if systemctl is-active --quiet yub-wpanel 2>/dev/null; then
+            log_error "repair快照前yub-wpanel仍在运行；未创建快照"
+        fi
+    fi
+    create_repair_backup
 }
 
 atomic_install_managed_file() {
@@ -918,6 +1028,7 @@ atomic_install_license_document() {
         "$LICENSE_DOC_DIR/LICENSE"|\
         "$LICENSE_DOC_DIR/NOTICE.md"|\
         "$LICENSE_DOC_DIR/THIRD_PARTY_NOTICES.md"|\
+        "$LICENSE_DOC_DIR/RELEASE_VERSION"|\
         "$LICENSE_DOC_DIR/yub-wpanel-third-party-licenses.tar.gz"|\
         "$LICENSE_DOC_DIR/yub-wpanel-third-party-licenses.tar.gz.sha256"|\
         "$LICENSE_DOC_DIR/yub-wpanel-third-party-licenses.tar.gz.sha256.sig"|\
@@ -945,6 +1056,7 @@ install_release_license_documentation() {
     atomic_install_license_document "$PROJECT_LICENSE_FILE" "$LICENSE_DOC_DIR/LICENSE" || return 1
     atomic_install_license_document "$PROJECT_NOTICE_FILE" "$LICENSE_DOC_DIR/NOTICE.md" || return 1
     atomic_install_license_document "$THIRD_PARTY_NOTICE_FILE" "$LICENSE_DOC_DIR/THIRD_PARTY_NOTICES.md" || return 1
+    atomic_install_license_document "$LICENSE_RELEASE_VERSION_FILE" "$LICENSE_DOC_DIR/RELEASE_VERSION" || return 1
     atomic_install_license_document "$LICENSE_ARCHIVE" \
         "$LICENSE_DOC_DIR/yub-wpanel-third-party-licenses.tar.gz" || return 1
     atomic_install_license_document "$LICENSE_SHA256_FILE" \
@@ -957,25 +1069,65 @@ install_release_license_documentation() {
 repair_rollback() {
     [[ "$REPAIR_MODE" == true ]] || return 0
     [[ "$REPAIR_COMMITTED" == false ]] || return 0
-    [[ "$REPAIR_MUTATED" == true ]] || return 0
-    [[ -n "$REPAIR_BACKUP_DIR" ]] && [[ -d "$REPAIR_BACKUP_DIR" ]] || return 0
+
+    if [[ "$REPAIR_MUTATED" != true ]]; then
+        # Snapshot preparation may have stopped an originally active service
+        # before a backup failure. No persistent repair data changed yet, so
+        # restore only the original runtime state.
+        if $REPAIR_SERVICE_WAS_ACTIVE && $REPAIR_SERVICE_STOPPED_FOR_SNAPSHOT; then
+            systemctl start yub-wpanel 2>/dev/null || \
+                log_warn "严重：repair快照失败后无法恢复原active状态，请手动启动yub-wpanel"
+        fi
+        return 0
+    fi
+    if [[ -z "$REPAIR_BACKUP_DIR" ]] || [[ ! -d "$REPAIR_BACKUP_DIR" ]]; then
+        # A mutated repair without its snapshot cannot be restored safely. Fail
+        # closed instead of leaving the candidate service running.
+        systemctl stop yub-wpanel 2>/dev/null || \
+            log_warn "严重：repair备份目录不可用，且无法确认yub-wpanel已停止，请立即手动停服"
+        if systemctl is-active --quiet yub-wpanel 2>/dev/null; then
+            log_warn "严重：repair备份目录不可用，yub-wpanel仍在运行；请立即手动停服并从服务器快照恢复"
+        else
+            log_warn "严重：repair备份目录不可用，已保持yub-wpanel停止；请从服务器快照恢复"
+        fi
+        return 0
+    fi
 
     local db_rollback_ok=true
+    local runtime_rollback_ok=true
+    local license_rollback_ok=true
+    local license_file=""
+    local license_backup_dir="$REPAIR_BACKUP_DIR/license-docs"
     log_warn "repair未完成，正在恢复repair前的面板程序和数据库"
     # 新二进制可能已经升级SQLite结构。必须先停服并恢复同一时间点的数据库，
     # 不能让恢复后的旧二进制继续读取新结构。
     if ! systemctl stop yub-wpanel 2>/dev/null; then
-        log_warn "严重：无法停止yub-wpanel，未恢复面板数据库，保持服务停止后请联系开发者处理"
-        db_rollback_ok=false
-    elif $REPAIR_DB_EXISTED; then
-        if atomic_install_managed_file "$REPAIR_BACKUP_DIR/panel.db" "$DB_PATH" 0600; then
-            rm -f "${DB_PATH}-wal" "${DB_PATH}-shm"
+        if systemctl is-active --quiet yub-wpanel 2>/dev/null; then
+            log_warn "严重：无法停止yub-wpanel，未恢复面板数据库，保持服务停止后请联系开发者处理"
+            db_rollback_ok=false
         else
-            log_warn "严重：repair前的面板数据库恢复失败，旧面板不会重新启动，请联系开发者处理"
+            log_warn "repair回滚时systemctl stop返回失败，但yub-wpanel已停止；继续恢复"
+        fi
+    fi
+    if systemctl is-active --quiet yub-wpanel 2>/dev/null; then
+        log_warn "严重：repair回滚时yub-wpanel仍在运行，未恢复面板数据库，旧面板不会重新启动"
+        db_rollback_ok=false
+    fi
+    if $db_rollback_ok; then
+        if $REPAIR_DB_EXISTED; then
+            if atomic_install_managed_file "$REPAIR_BACKUP_DIR/panel.db" "$DB_PATH" 0600; then
+                if ! rm -f "${DB_PATH}-wal" "${DB_PATH}-shm"; then
+                    log_warn "严重：repair数据库恢复后无法移除SQLite sidecar，旧面板不会重新启动，请手动核对"
+                    db_rollback_ok=false
+                fi
+            else
+                log_warn "严重：repair前的面板数据库恢复失败，旧面板不会重新启动，请联系开发者处理"
+                db_rollback_ok=false
+            fi
+        elif ! rm -f "$DB_PATH" "${DB_PATH}-wal" "${DB_PATH}-shm"; then
+            log_warn "严重：无法移除repair期间创建的面板数据库，旧面板不会重新启动，请手动核对"
             db_rollback_ok=false
         fi
-    else
-        rm -f "$DB_PATH" "${DB_PATH}-wal" "${DB_PATH}-shm"
     fi
 
     if $REPAIR_BIN_EXISTED; then
@@ -984,24 +1136,88 @@ repair_rollback() {
 			db_rollback_ok=false
 		fi
     else
-        rm -f "$BIN_PATH"
+        if ! rm -f "$BIN_PATH"; then
+            log_warn "严重：无法移除repair期间创建的面板二进制，旧面板不会重新启动，请手动核对"
+            db_rollback_ok=false
+        fi
     fi
     if $REPAIR_UNIT_EXISTED; then
-        install -m 0644 "$REPAIR_BACKUP_DIR/yub-wpanel.service" "$SERVICE_PATH"
+        if ! install -m 0644 "$REPAIR_BACKUP_DIR/yub-wpanel.service" "$SERVICE_PATH"; then
+            log_warn "严重：repair前的systemd unit恢复失败，旧面板不会重新启动，请手动核对"
+            runtime_rollback_ok=false
+        fi
     else
-        rm -f "$SERVICE_PATH"
+        if ! rm -f "$SERVICE_PATH"; then
+            log_warn "严重：无法移除repair期间创建的systemd unit，旧面板不会重新启动，请手动核对"
+            runtime_rollback_ok=false
+        fi
     fi
     if $REPAIR_TLS_EXISTED; then
-        install -m 0644 "$REPAIR_BACKUP_DIR/panel.crt" "$INSTALL_DIR/certs/panel.crt"
-        install -m 0600 "$REPAIR_BACKUP_DIR/panel.key" "$INSTALL_DIR/certs/panel.key"
+        if ! install -m 0644 "$REPAIR_BACKUP_DIR/panel.crt" "$INSTALL_DIR/certs/panel.crt" || \
+           ! install -m 0600 "$REPAIR_BACKUP_DIR/panel.key" "$INSTALL_DIR/certs/panel.key"; then
+            log_warn "严重：repair前的TLS身份恢复失败，旧面板不会重新启动，请手动核对"
+            runtime_rollback_ok=false
+        fi
     elif [[ "${REPAIR_TLS_ACTION:-}" == "generate" ]]; then
-        rm -f "$INSTALL_DIR/certs/panel.crt" "$INSTALL_DIR/certs/panel.key"
+        if ! rm -f "$INSTALL_DIR/certs/panel.crt" "$INSTALL_DIR/certs/panel.key"; then
+            log_warn "严重：无法移除repair期间生成的TLS身份，旧面板不会重新启动，请手动核对"
+            runtime_rollback_ok=false
+        fi
     fi
-    systemctl daemon-reload 2>/dev/null || true
-    if $REPAIR_SERVICE_WAS_ACTIVE && $db_rollback_ok; then
-        systemctl start yub-wpanel 2>/dev/null || true
+
+    # Release documentation is version-bound just like the binary. Remove the
+    # files managed by this installer, then restore the exact pre-repair tree;
+    # when the directory did not previously exist, remove the now-empty one.
+    if [[ -e "$LICENSE_DOC_DIR" ]] || [[ -L "$LICENSE_DOC_DIR" ]]; then
+        if [[ ! -d "$LICENSE_DOC_DIR" ]] || [[ -L "$LICENSE_DOC_DIR" ]]; then
+            log_warn "严重：repair后的许可文档路径身份异常，拒绝自动恢复"
+            license_rollback_ok=false
+        else
+            for license_file in \
+                LICENSE \
+                NOTICE.md \
+                THIRD_PARTY_NOTICES.md \
+                RELEASE_VERSION \
+                yub-wpanel-third-party-licenses.tar.gz \
+                yub-wpanel-third-party-licenses.tar.gz.sha256 \
+                yub-wpanel-third-party-licenses.tar.gz.sha256.sig \
+                release-public-key.pem; do
+                if [[ -e "$LICENSE_DOC_DIR/$license_file" ]] || [[ -L "$LICENSE_DOC_DIR/$license_file" ]]; then
+                    if [[ -d "$LICENSE_DOC_DIR/$license_file" ]] && [[ ! -L "$LICENSE_DOC_DIR/$license_file" ]]; then
+                        log_warn "严重：repair后的许可文档条目不是常规文件: $license_file"
+                        license_rollback_ok=false
+                        continue
+                    fi
+                    rm -f -- "$LICENSE_DOC_DIR/$license_file" || license_rollback_ok=false
+                fi
+            done
+        fi
+    fi
+    if $license_rollback_ok && $REPAIR_LICENSE_DIR_EXISTED; then
+        if [[ ! -d "$license_backup_dir" ]] || [[ -L "$license_backup_dir" ]]; then
+            log_warn "严重：repair前许可文档备份不存在或身份异常"
+            license_rollback_ok=false
+        elif [[ -e "$LICENSE_DOC_DIR" ]] || [[ -L "$LICENSE_DOC_DIR" ]]; then
+            cp -a -- "$license_backup_dir/." "$LICENSE_DOC_DIR/" || license_rollback_ok=false
+        else
+            cp -a -- "$license_backup_dir" "$LICENSE_DOC_DIR" || license_rollback_ok=false
+        fi
+    elif $license_rollback_ok && [[ -d "$LICENSE_DOC_DIR" ]] && [[ ! -L "$LICENSE_DOC_DIR" ]]; then
+        rmdir "$LICENSE_DOC_DIR" 2>/dev/null || license_rollback_ok=false
+    fi
+    if ! $license_rollback_ok; then
+        log_warn "严重：repair前的许可文档目录未能完整恢复，请使用备份目录手动核对"
+    fi
+    if ! systemctl daemon-reload 2>/dev/null; then
+        log_warn "严重：repair回滚后systemd daemon-reload失败，旧面板不会重新启动，请手动核对"
+        runtime_rollback_ok=false
+    fi
+    if $REPAIR_SERVICE_WAS_ACTIVE && $db_rollback_ok && $runtime_rollback_ok && $license_rollback_ok; then
+        systemctl start yub-wpanel 2>/dev/null || \
+            log_warn "严重：repair回滚完成但无法恢复原active状态，请手动启动yub-wpanel"
     else
-        systemctl stop yub-wpanel 2>/dev/null || true
+        systemctl stop yub-wpanel 2>/dev/null || \
+            log_warn "严重：repair回滚未完整成功且无法确认yub-wpanel保持停止，请立即手动停服并核对"
     fi
 }
 
@@ -1091,7 +1307,7 @@ DEBIANSOURCESEOF
 }
 
 debian_packages_available() {
-    local packages=(ca-certificates wget curl gnupg lsb-release nginx mariadb-server redis-server)
+    local packages=(ca-certificates wget curl gnupg lsb-release iproute2 nginx mariadb-server redis-server)
     local pkg=""
 
     for pkg in "${packages[@]}"; do
@@ -1588,6 +1804,10 @@ if $REPAIR_MODE; then
         log_error "现有systemd unit不是YUB WPanel生成的精确安全版本，或存在drop-in；未修改服务器状态"
     validate_existing_panel_cron_file || \
         log_error "现有cron文件不是root安全持有的YUB WPanel受管文件；未修改服务器状态"
+    command -v curl >/dev/null 2>&1 || \
+        log_error "repair缺少curl，无法执行本机HTTPS健康检查；未修改服务器状态"
+    command -v ss >/dev/null 2>&1 || \
+        log_error "repair缺少ss(iproute2)，无法验证面板监听进程；未修改服务器状态"
     case "$repair_check" in
         *'"tls_action":"preserve"'*) REPAIR_TLS_ACTION="preserve" ;;
         *'"tls_action":"generate"'*) REPAIR_TLS_ACTION="generate" ;;
@@ -1604,10 +1824,7 @@ if $REPAIR_MODE; then
             log_error "repair自动安装sqlite3失败，请检查APT后重试"
         command -v sqlite3 >/dev/null 2>&1 || log_error "repair安装sqlite3后仍无法找到该命令"
     fi
-    if systemctl is-active --quiet yub-wpanel 2>/dev/null; then
-        REPAIR_SERVICE_WAS_ACTIVE=true
-    fi
-    create_repair_backup
+    prepare_repair_snapshot
     log_info "repair预检与备份完成"
 else
     if [[ -e "$SERVICE_PATH" ]] || [[ -L "$SERVICE_PATH" ]]; then
@@ -1715,6 +1932,7 @@ select_php_source "$DEBIAN_CODENAME"
 log_info "安装系统组件..."
 
 apt-get install -y \
+    iproute2 \
     nginx \
     mariadb-server \
     redis-server \
@@ -1851,22 +2069,37 @@ else
         MYSQL_PASS=$(head -c 24 /dev/urandom | sha256sum | head -c 32)
     fi
 
-    if mysql -u root -p"${MYSQL_PASS}" -e "SELECT 1" 2>/dev/null; then
+    [[ "$MYSQL_PASS" =~ ^[0-9a-f]{32}$ ]] || log_error "MariaDB root密码格式异常"
+    MYSQL_CLIENT_CONFIG="$INSTALL_WORKDIR/mariadb-client.cnf"
+    cat > "$MYSQL_CLIENT_CONFIG" << MYSQLCLIENTEOF
+[client]
+user=root
+password=${MYSQL_PASS}
+protocol=socket
+socket=/run/mysqld/mysqld.sock
+MYSQLCLIENTEOF
+    chmod 0600 "$MYSQL_CLIENT_CONFIG"
+
+    if mysql --defaults-extra-file="$MYSQL_CLIENT_CONFIG" -e "SELECT 1" 2>/dev/null; then
         log_info "MariaDB root 密码已验证"
-    elif mysql -u root -e "SELECT 1" 2>/dev/null; then
-        mysqladmin -u root password "${MYSQL_PASS}" 2>/dev/null
+    elif mysql --protocol=socket -u root -e "SELECT 1" 2>/dev/null; then
+        printf "%s\n" "ALTER USER 'root'@'localhost' IDENTIFIED BY '${MYSQL_PASS}'; FLUSH PRIVILEGES;" | \
+            mysql --protocol=socket -u root 2>/dev/null || \
+            log_error "MariaDB root 密码设置失败"
+        mysql --defaults-extra-file="$MYSQL_CLIENT_CONFIG" -e "SELECT 1" 2>/dev/null || \
+            log_error "MariaDB root 新密码验证失败"
         log_info "MariaDB root 密码已设置"
     else
         log_warn "MariaDB 密码状态异常，面板首次启动时将自动修复"
     fi
 
-    mysql -u root -p"${MYSQL_PASS}" -e "
+    mysql --defaults-extra-file="$MYSQL_CLIENT_CONFIG" << 'MARIADBSECURITYEOF' 2>/dev/null || log_warn "部分安全加固跳过(密码可能已设置)"
         DELETE FROM mysql.user WHERE User='';
         DELETE FROM mysql.user WHERE User='root' AND Host!='localhost';
         DROP DATABASE IF EXISTS test;
-        DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
+        DELETE FROM mysql.db WHERE Db='test' OR Db='test\_%';
         FLUSH PRIVILEGES;
-    " 2>/dev/null || log_warn "部分安全加固跳过(密码可能已设置)"
+MARIADBSECURITYEOF
 
     if [[ $TOTAL_MEM_MB -le 1024 ]]; then
         log_info "低内存环境，优化 MariaDB 配置..."
@@ -1968,15 +2201,25 @@ WEB_PASS=$(head -c 12 /dev/urandom | base64 | head -c 16)
 
 BASIC_HASH=""
 WEB_HASH=""
-if command -v php8.3 &>/dev/null; then
-    BASIC_HASH=$(php8.3 -r "echo password_hash('$BASIC_PASS', PASSWORD_BCRYPT, ['cost' => 12]);" 2>/dev/null)
-    WEB_HASH=$(php8.3 -r "echo password_hash('$WEB_PASS', PASSWORD_BCRYPT, ['cost' => 12]);" 2>/dev/null)
-fi
-if [[ -z "$BASIC_HASH" ]] && command -v python3 &>/dev/null; then
-    BASIC_HASH=$(python3 -c "import bcrypt; print(bcrypt.hashpw(b'$BASIC_PASS', bcrypt.gensalt(12)).decode())" 2>/dev/null)
-    WEB_HASH=$(python3 -c "import bcrypt; print(bcrypt.hashpw(b'$WEB_PASS', bcrypt.gensalt(12)).decode())" 2>/dev/null)
-fi
-if [[ -z "$BASIC_HASH" ]]; then
+generate_bcrypt_hash() {
+    local password="$1"
+    local hash=""
+
+    if command -v php8.3 &>/dev/null; then
+        hash=$(printf '%s' "$password" | php8.3 -r \
+            '$password = stream_get_contents(STDIN); echo password_hash($password, PASSWORD_BCRYPT, ["cost" => 12]);' \
+            2>/dev/null || true)
+    fi
+    if [[ -z "$hash" ]] && command -v python3 &>/dev/null; then
+        hash=$(printf '%s' "$password" | python3 -c \
+            'import bcrypt, sys; print(bcrypt.hashpw(sys.stdin.buffer.read(), bcrypt.gensalt(12)).decode())' \
+            2>/dev/null || true)
+    fi
+    printf '%s' "$hash"
+}
+BASIC_HASH=$(generate_bcrypt_hash "$BASIC_PASS")
+WEB_HASH=$(generate_bcrypt_hash "$WEB_PASS")
+if [[ -z "$BASIC_HASH" || -z "$WEB_HASH" ]]; then
     log_warn "无法生成 bcrypt 哈希，面板首次启动时将自动重置密码"
     # Literal invalid bcrypt fallbacks: dollar signs must not expand.
     # shellcheck disable=SC2016
@@ -2083,6 +2326,7 @@ if $REPAIR_MODE; then REPAIR_MUTATED=true; fi
 [[ ! -e "$SERVICE_PATH" ]] && [[ ! -L "$SERVICE_PATH" ]] || \
     log_error "写入systemd unit前目标已存在或为链接"
 write_panel_service_unit "$SERVICE_PATH" 0644 || log_error "写入yub-wpanel systemd unit失败"
+if ! $REPAIR_MODE; then FRESH_SERVICE_CLEANUP_REQUIRED=true; fi
 else
     log_info "repair模式保留现有systemd unit"
 fi
@@ -2092,12 +2336,12 @@ validate_effective_panel_service_unit || \
     log_error "systemd实际加载的unit、drop-in或ExecStart与YUB WPanel不一致"
 if $REPAIR_MODE; then
     if $REPAIR_SERVICE_WAS_ACTIVE; then
-        systemctl restart yub-wpanel || log_error "yub-wpanel重启失败"
+        systemctl start yub-wpanel || log_error "repair后yub-wpanel启动失败"
+        REPAIR_SERVICE_STOPPED_FOR_SNAPSHOT=false
     else
-        log_info "repair前yub-wpanel未运行，保持inactive状态"
+        log_info "repair前yub-wpanel未运行；部署后将临时启动完成健康验证，再恢复inactive状态"
     fi
 else
-    systemctl_enable_best_effort yub-wpanel
     systemctl_start_required yub-wpanel
     validate_running_panel_service_identity || \
         log_error "yub-wpanel MainPID未运行已部署的YUB WPanel二进制"
@@ -2105,18 +2349,32 @@ else
 fi
 
 # ============================================================
-# 端口监听检测
+# 运行时健康、版本与监听归属检测
 # ============================================================
 PORT_OK=false
-if systemctl is-active --quiet yub-wpanel; then
-    sleep 3
-    for i in 1 2 3 4 5 6 7 8; do
-        if ss -tlnp 2>/dev/null | grep -q ":8443"; then
-            PORT_OK=true
-            break
-        fi
-        sleep 2
-    done
+if $REPAIR_MODE && ! $REPAIR_SERVICE_WAS_ACTIVE; then
+    log_info "临时启动yub-wpanel验证repair后运行时健康"
+    systemctl start yub-wpanel || log_error "repair后面板临时启动失败"
+    validate_running_panel_health "$INSTALLER_RELEASE_VERSION" || {
+        journalctl -u yub-wpanel -n 20 --no-pager 2>/dev/null || true
+        log_error "repair后面板未通过/healthz、精确版本或MainPID监听归属验证"
+    }
+    systemctl stop yub-wpanel || log_error "repair健康验证后无法恢复原inactive状态"
+    if systemctl is-active --quiet yub-wpanel 2>/dev/null; then
+        log_error "repair健康验证后面板仍在运行，未恢复原inactive状态"
+    fi
+    REPAIR_INACTIVE_HEALTH_VERIFIED=true
+elif systemctl is-active --quiet yub-wpanel; then
+    validate_running_panel_health "$INSTALLER_RELEASE_VERSION" || {
+        journalctl -u yub-wpanel -n 20 --no-pager 2>/dev/null || true
+        log_error "面板未通过/healthz、精确版本或MainPID监听归属验证"
+    }
+    PORT_OK=true
+    if ! $REPAIR_MODE; then
+        systemctl enable yub-wpanel || log_error "yub-wpanel健康验证通过，但设置开机自启失败"
+    fi
+else
+    log_error "面板服务未运行，无法完成安装健康验证"
 fi
 
 # ============================================================
@@ -2124,6 +2382,8 @@ fi
 # ============================================================
 if systemctl is-active --quiet yub-wpanel; then
     STATUS="${GREEN}运行中${NC}"
+elif $REPAIR_INACTIVE_HEALTH_VERIFIED; then
+    STATUS="${YELLOW}保持未运行（健康验证已通过）${NC}"
 else
     STATUS="${RED}未运行${NC}"
 fi
@@ -2131,10 +2391,10 @@ fi
 if $REPAIR_MODE; then
     if $REPAIR_SERVICE_WAS_ACTIVE; then
         systemctl is-active --quiet yub-wpanel || log_error "repair后面板服务未运行"
-        validate_running_panel_service_identity || \
-            log_error "repair后yub-wpanel MainPID未运行已部署的YUB WPanel二进制"
     elif systemctl is-active --quiet yub-wpanel; then
         log_error "repair改变了面板服务原始inactive状态"
+    elif ! $REPAIR_INACTIVE_HEALTH_VERIFIED; then
+        log_error "repair未完成inactive服务的临时启动健康验证"
     fi
     "$BIN_PATH" --repair-config-check --config "$CONFIG_FILE" >/dev/null || \
         log_error "repair后配置复核失败"
@@ -2182,7 +2442,9 @@ else
 fi
 echo -e "面板状态 / Panel Status: ${STATUS}"
 if $PORT_OK; then
-    echo -e "端口监听 / Port:         ${GREEN}8443 is listening${NC}"
+    echo -e "端口监听 / Port:         ${GREEN}${VALIDATED_TLS_PORT} is listening (MainPID verified)${NC}"
+elif $REPAIR_INACTIVE_HEALTH_VERIFIED; then
+    echo -e "健康验证 / Health:       ${GREEN}passed; original inactive state restored${NC}"
 else
     echo -e "端口监听 / Port:         ${YELLOW}8443 is not listening. Check logs: journalctl -u yub-wpanel -n 20${NC}"
 fi

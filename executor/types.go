@@ -43,8 +43,11 @@ const (
 )
 
 type Task struct {
-	ID        string
-	Type      TaskType
+	ID   string
+	Type TaskType
+	// SiteID is non-sensitive task ownership metadata retained for status polling
+	// after Payload has been cleared.
+	SiteID    int
 	Payload   interface{}
 	Status    TaskStatus
 	CreatedAt time.Time

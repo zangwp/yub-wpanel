@@ -17,6 +17,119 @@ import (
 	"github.com/zangwp/yub-wpanel/models"
 )
 
+func TestFail2banSettingsLockSerializesSnapshotThroughDeployment(t *testing.T) {
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- WithFail2banSettingsLock(func(func() error) error {
+			close(firstEntered)
+			<-releaseFirst
+			return nil
+		})
+	}()
+	select {
+	case <-firstEntered:
+	case <-time.After(time.Second):
+		t.Fatal("first Fail2ban settings operation did not acquire the lock")
+	}
+
+	secondEntered := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- WithFail2banSettingsLock(func(func() error) error {
+			close(secondEntered)
+			return nil
+		})
+	}()
+	select {
+	case <-secondEntered:
+		t.Fatal("second Fail2ban settings operation entered before the first completed")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-secondEntered:
+	case <-time.After(time.Second):
+		t.Fatal("second Fail2ban settings operation did not acquire the released lock")
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestApplyFail2banSettingsRejectsMissingRequiredSettingBeforeDeployment(t *testing.T) {
+	openTestDB(t)
+	if _, err := database.GetDB().Exec(`DELETE FROM security_settings WHERE skey = 'fail2ban_maxretry'`); err != nil {
+		t.Fatal(err)
+	}
+	err := applyFail2banSettingsLocked()
+	if err == nil || !strings.Contains(err.Error(), "fail2ban_maxretry") {
+		t.Fatalf("applyFail2banSettingsLocked error = %v, want missing required setting", err)
+	}
+}
+
+func TestCombinedCDNRealIPRangesPropagatesDatabaseErrors(t *testing.T) {
+	openTestDB(t)
+	if _, err := database.GetDB().Exec(`DROP TABLE website_cdn_realip_groups`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := combinedCDNRealIPRangesForFail2ban(database.GetDB()); err == nil {
+		t.Fatal("combinedCDNRealIPRangesForFail2ban succeeded after its source table was dropped")
+	}
+}
+
+func TestReadCachedSecurityIPRangesPropagatesMissingSetting(t *testing.T) {
+	openTestDB(t)
+	if _, err := database.GetDB().Exec(`DELETE FROM security_settings WHERE skey = 'googlebot_ips'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readCachedSecurityIPRanges(database.GetDB(), "googlebot_ips"); err == nil || !strings.Contains(err.Error(), "googlebot_ips") {
+		t.Fatalf("readCachedSecurityIPRanges error = %v, want missing cache setting", err)
+	}
+}
+
+func TestWriteSecuritySettingUpdatesIsAtomic(t *testing.T) {
+	openTestDB(t)
+	beforeGoogle, err := readRequiredFail2banSetting(database.GetDB(), "googlebot_ips")
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeOfficial, err := readRequiredFail2banSetting(database.GetDB(), "official_whitelist_ips")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.GetDB().Exec(`CREATE TRIGGER reject_official_whitelist_update
+		BEFORE UPDATE ON security_settings
+		WHEN NEW.skey = 'official_whitelist_ips' AND NEW.svalue = '198.51.100.0/24'
+		BEGIN SELECT RAISE(ABORT, 'injected write failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	err = writeSecuritySettingUpdates(database.GetDB(), map[string]securitySettingUpdate{
+		"googlebot_ips":          {value: "203.0.113.0/24", description: "new google cache"},
+		"official_whitelist_ips": {value: "198.51.100.0/24", description: "new official cache"},
+	})
+	if err == nil {
+		t.Fatal("writeSecuritySettingUpdates succeeded despite injected write failure")
+	}
+	for key, want := range map[string]string{
+		"googlebot_ips":          beforeGoogle,
+		"official_whitelist_ips": beforeOfficial,
+	} {
+		got, readErr := readRequiredFail2banSetting(database.GetDB(), key)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if got != want {
+			t.Fatalf("%s = %q after failed transaction, want %q", key, got, want)
+		}
+	}
+}
+
 func TestGooglebotFetchUsesOfficialSource(t *testing.T) {
 	oldClient := googlebotHTTPClient
 	t.Cleanup(func() { googlebotHTTPClient = oldClient })

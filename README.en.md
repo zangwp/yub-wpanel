@@ -4,11 +4,11 @@
 
 YUB WPanel is a WordPress-focused server management panel for Debian 13 VPS environments. It helps you provision and operate WordPress sites with a single Go binary, embedded templates, and a workflow centered on security, isolation, backups, SSL, PHP-FPM, Nginx, MariaDB, and daily site operations.
 
-YUB WPanel is licensed under GPL-3.0. Its source, installer, and signed releases are maintained at [zangwp/yub-wpanel](https://github.com/zangwp/yub-wpanel).
+YUB WPanel is licensed under GNU GPL v3.0 only (SPDX: `GPL-3.0-only`). Its source, installer, and signed releases are maintained at [zangwp/yub-wpanel](https://github.com/zangwp/yub-wpanel).
 
 If you want the Chinese project README, see [README.md](README.md).
 
-[![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](LICENSE)
 [![Go](https://img.shields.io/badge/Go-1.26-00ADD8.svg)](https://go.dev/)
 
 ---
@@ -51,7 +51,7 @@ On a production server, download the installer, SHA-256 manifest, and Ed25519 si
 
 See the **[verified installation guide](docs/verified-install.md)** for copyable commands, the public key, and local release-bundle instructions.
 
-> **v2.0.0 upgrade notice:** Do not use the updater built into v2.0.0 for the direct upgrade to v2.0.1. Download the fixed v2.0.1 Release assets for `install.sh`, `yub-wpanel`, and the third-party license archive, including all three SHA-256 manifests and Ed25519 signatures (nine files total), verify them, then run the local `install.sh` and select repair. The version-bound updater and isolated watchdog apply from v2.0.1 onward. See the [upgrade compatibility note](docs/upgrade-compatibility.md).
+> **Upgrade notice:** Both v2.0.0 to v2.0.1 and v2.0.1 to v2.0.2 require the fixed target Release bundles for `install.sh`, `yub-wpanel`, and the third-party license archive, each with its SHA-256 manifest and Ed25519 signature (nine files total). Verify all three bundles, run the local `install.sh`, and select repair. For v2.0.2 this also synchronizes `/usr/share/doc/yub-wpanel`; do not use the panel's binary-only online updater for this upgrade. See the [upgrade compatibility note](docs/upgrade-compatibility.md).
 
 After installation, the script prints the panel URL and the two login layers: BasicAuth and web login.
 
@@ -132,7 +132,7 @@ A normal login requires the server's unique private path, the browser prompt, an
 
 ### Code Transparency
 
-- 100% open source under GPL-3.0
+- 100% open source under `GPL-3.0-only`
 - runtime telemetry is disabled by default and has no preset endpoint; when a custom endpoint is enabled it receives a stable pseudonymous ID and the version, not business content
 - panel version metadata comes from GitHub by default; WordPress updates and administrator-enabled integrations connect to their documented upstream services
 - no web shell and no online code editor
@@ -319,11 +319,11 @@ Verify the China-friendly `install-cn.sh` release asset and configure an HTTPS G
 └── yub-wpanel-optimizer/   # bundled WordPress plugin
 ```
 
-## License
+## YUB WPanel Open Source License
 
-GPL-3.0
+GNU GPL v3.0 only (SPDX: `GPL-3.0-only`)
 
-YUB WPanel is distributed under GPL-3.0 and maintained by zangwp. See
+YUB WPanel is distributed under GNU GPL v3.0 only and maintained by zangwp. See
 [`LICENSE`](LICENSE) for the complete terms, [`NOTICE.md`](NOTICE.md) for the
 project notice, and
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) plus the signed license

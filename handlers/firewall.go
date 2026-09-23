@@ -478,7 +478,10 @@ func (h *FirewallHandler) ManualBan(c *gin.Context) {
 	}
 
 	payload := &executor.ManualBanPayload{IP: req.IP, Duration: req.Duration}
-	task := executor.GlobalQueue.Enqueue(executor.TaskManualBan, payload)
+	task, ok := enqueueTask(c, executor.TaskManualBan, payload)
+	if !ok {
+		return
+	}
 	result := <-task.ResultCh
 
 	if result.Success {

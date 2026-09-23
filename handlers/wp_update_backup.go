@@ -144,9 +144,13 @@ func (h *WPUpdateBackupHandler) Restore(c *gin.Context) {
 		wpUpdateBackupError(c, http.StatusConflict, "wp_update_backup.file_unavailable")
 		return
 	}
-	task := executor.GlobalQueue.Enqueue(executor.TaskRestoreBackup, &executor.RestoreBackupPayload{
+	task, queued := enqueueTask(c, executor.TaskRestoreBackup, &executor.RestoreBackupPayload{
 		Site: site, UpdateBackupPath: cleanPath, ExpectedSHA256: expectedSHA,
 	})
+	if !queued {
+		executor.ReleaseSiteOpLock(siteID)
+		return
+	}
 	c.JSON(http.StatusAccepted, models.SuccessResponse(gin.H{
 		"task_id": task.ID,
 		"status":  task.Status,

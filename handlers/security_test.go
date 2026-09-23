@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -14,15 +15,142 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/zangwp/yub-wpanel/database"
+	"github.com/zangwp/yub-wpanel/executor"
 	"github.com/zangwp/yub-wpanel/models"
 )
+
+func TestRefreshWhitelistReportsQueuePressure(t *testing.T) {
+	previousEnqueue := enqueueOfficialWhitelistRefresh
+	enqueueOfficialWhitelistRefresh = func(context.Context) error {
+		return executor.ErrTaskQueueFull
+	}
+	t.Cleanup(func() { enqueueOfficialWhitelistRefresh = previousEnqueue })
+
+	rec := performSecurityRequest(http.MethodPost, "/refresh", "", func(router *gin.Engine, h *SecurityHandler) {
+		router.POST("/refresh", h.RefreshWhitelist)
+	})
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s, want 503", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "任务队列繁忙") {
+		t.Fatalf("unexpected body: %s", rec.Body.String())
+	}
+}
+
+func TestImportGooglebotRangesPropagatesRequiredCacheReadFailure(t *testing.T) {
+	setupSecurityTestDB(t)
+	restoreSecurityExecutorHooks(t)
+	if _, err := database.GetDB().Exec(`DELETE FROM security_settings WHERE skey = 'bingbot_ips'`); err != nil {
+		t.Fatal(err)
+	}
+	applyFail2banSettings = func() error {
+		t.Fatal("Fail2ban must not be applied when a required cache read fails")
+		return nil
+	}
+
+	rec := performSecurityRequest(
+		http.MethodPost,
+		"/googlebot",
+		`{"ip_ranges":"66.249.64.0/19"}`,
+		func(router *gin.Engine, h *SecurityHandler) { router.POST("/googlebot", h.ImportGooglebotRanges) },
+	)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(decodeAPIResponse(t, rec).Message, "bingbot_ips") {
+		t.Fatalf("unexpected response: %s", rec.Body.String())
+	}
+	if got := securitySettingValue(t, "googlebot_ips"); got != "" {
+		t.Fatalf("googlebot cache changed after failed snapshot: %q", got)
+	}
+}
+
+func TestImportGooglebotRangesWritesAtomically(t *testing.T) {
+	setupSecurityTestDB(t)
+	restoreSecurityExecutorHooks(t)
+	if _, err := database.GetDB().Exec(`CREATE TRIGGER reject_manual_googlebot_official
+		BEFORE UPDATE ON security_settings
+		WHEN NEW.skey = 'official_whitelist_ips' AND NEW.svalue LIKE '%66.249.64.0/19%'
+		BEGIN SELECT RAISE(ABORT, 'injected write failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	applyFail2banSettings = func() error {
+		t.Fatal("Fail2ban must not be applied after an atomic database write failure")
+		return nil
+	}
+
+	rec := performSecurityRequest(
+		http.MethodPost,
+		"/googlebot",
+		`{"ip_ranges":"66.249.64.0/19"}`,
+		func(router *gin.Engine, h *SecurityHandler) { router.POST("/googlebot", h.ImportGooglebotRanges) },
+	)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	for _, key := range []string{"googlebot_ips", "googlebot_ips_source", "googlebot_ips_last_success_at", "googlebot_ips_last_error", "official_whitelist_ips"} {
+		if got := securitySettingValue(t, key); got != "" {
+			t.Fatalf("%s changed after failed transaction: %q", key, got)
+		}
+	}
+}
+
+func TestImportGooglebotRangesRollsBackDatabaseAndRuntimeInsideLock(t *testing.T) {
+	setupSecurityTestDB(t)
+	restoreSecurityExecutorHooks(t)
+	if _, err := database.GetDB().Exec(`UPDATE security_settings SET svalue = '203.0.113.0/24' WHERE skey = 'googlebot_ips'`); err != nil {
+		t.Fatal(err)
+	}
+	applyCalls := 0
+	applyFail2banSettings = func() error {
+		applyCalls++
+		if applyCalls == 1 {
+			if got := securitySettingValue(t, "googlebot_ips"); got != "66.249.64.0/19" {
+				t.Fatalf("runtime apply observed googlebot_ips = %q, want imported value", got)
+			}
+			return errors.New("injected Fail2ban failure")
+		}
+		if got := securitySettingValue(t, "googlebot_ips"); got != "203.0.113.0/24" {
+			t.Fatalf("rollback apply observed googlebot_ips = %q, want old value", got)
+		}
+		return nil
+	}
+	logMapCalls := 0
+	ensureLogMap = func() error {
+		logMapCalls++
+		return nil
+	}
+
+	rec := performSecurityRequest(
+		http.MethodPost,
+		"/googlebot",
+		`{"ip_ranges":"66.249.64.0/19"}`,
+		func(router *gin.Engine, h *SecurityHandler) { router.POST("/googlebot", h.ImportGooglebotRanges) },
+	)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := securitySettingValue(t, "googlebot_ips"); got != "203.0.113.0/24" {
+		t.Fatalf("googlebot_ips after rollback = %q", got)
+	}
+	if applyCalls != 2 || logMapCalls != 1 {
+		t.Fatalf("Fail2ban/log-map calls = %d/%d, want 2/1", applyCalls, logMapCalls)
+	}
+}
 
 func TestUpdateCDNRealIPGroupFail2banFailureRollsBackDB(t *testing.T) {
 	setupSecurityTestDB(t)
 	insertTestCDNRealIPGroup(t)
 	restoreSecurityExecutorHooks(t)
 
-	applyFail2banSettings = func() error { return errors.New("fail2ban failed") }
+	applyCalls := 0
+	applyFail2banSettings = func() error {
+		applyCalls++
+		if applyCalls == 1 {
+			return errors.New("fail2ban failed")
+		}
+		return nil
+	}
 	regenerateAllSitesNginx = func() error {
 		t.Fatal("nginx regenerate should not run after fail2ban failure")
 		return nil
@@ -53,13 +181,23 @@ func TestUpdateCDNRealIPGroupFail2banFailureRollsBackDB(t *testing.T) {
 	if name != "Old" || header != "X-Forwarded-For" || ranges != "203.0.113.0/24" || enabled != 1 {
 		t.Fatalf("group was not rolled back: name=%q header=%q ranges=%q enabled=%d", name, header, ranges, enabled)
 	}
+	if applyCalls != 2 {
+		t.Fatalf("apply calls = %d, want initial apply and rollback apply", applyCalls)
+	}
 }
 
 func TestCreateCDNRealIPGroupFail2banFailureDeletesGroup(t *testing.T) {
 	setupSecurityTestDB(t)
 	restoreSecurityExecutorHooks(t)
 
-	applyFail2banSettings = func() error { return errors.New("fail2ban failed") }
+	applyCalls := 0
+	applyFail2banSettings = func() error {
+		applyCalls++
+		if applyCalls == 1 {
+			return errors.New("fail2ban failed")
+		}
+		return nil
+	}
 
 	rec := performSecurityRequest(
 		http.MethodPost,
@@ -83,6 +221,47 @@ func TestCreateCDNRealIPGroupFail2banFailureDeletesGroup(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("created group was not rolled back, count=%d", count)
+	}
+	if applyCalls != 2 {
+		t.Fatalf("apply calls = %d, want initial apply and rollback apply", applyCalls)
+	}
+}
+
+func TestUpdateCDNRealIPGroupTakesSnapshotInsideFail2banLock(t *testing.T) {
+	setupSecurityTestDB(t)
+	insertTestCDNRealIPGroup(t)
+	restoreSecurityExecutorHooks(t)
+
+	applyCalls := 0
+	applyFail2banSettings = func() error {
+		applyCalls++
+		if applyCalls == 1 {
+			return errors.New("injected apply failure")
+		}
+		return nil
+	}
+	withFail2banSettingsLock = func(fn func(apply func() error) error) error {
+		if _, err := database.GetDB().Exec(`UPDATE cdn_realip_groups SET name = 'Locked snapshot' WHERE id = 99`); err != nil {
+			return err
+		}
+		return fn(func() error { return applyFail2banSettings() })
+	}
+
+	rec := performSecurityRequest(
+		http.MethodPut,
+		"/groups/99",
+		`{"name":"New","header_name":"X-Real-IP","ip_ranges":"198.51.100.0/24","enabled":true,"description":"new desc"}`,
+		func(router *gin.Engine, h *SecurityHandler) { router.PUT("/groups/:id", h.UpdateCDNRealIPGroup) },
+	)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var name string
+	if err := database.GetDB().QueryRow(`SELECT name FROM cdn_realip_groups WHERE id = 99`).Scan(&name); err != nil {
+		t.Fatal(err)
+	}
+	if name != "Locked snapshot" {
+		t.Fatalf("rollback restored pre-lock value %q; want snapshot taken inside lock", name)
 	}
 }
 
@@ -738,13 +917,18 @@ func assertTestCDNRealIPGroupRolledBack(t *testing.T) {
 func restoreSecurityExecutorHooks(t *testing.T) {
 	t.Helper()
 	oldApplyFail2ban := applyFail2banSettings
+	oldWithFail2banLock := withFail2banSettingsLock
 	oldApplyRateLimit := applyRateLimitSettings
 	oldEnsureLogMap := ensureLogMap
 	oldRegenerateAllSitesNginx := regenerateAllSitesNginx
 	oldWebsiteIDsForCDNRealIPGroup := websiteIDsForCDNRealIPGroup
 	oldRestoreCDNRealIPGroupWithBindings := restoreCDNRealIPGroupWithBindings
+	withFail2banSettingsLock = func(fn func(apply func() error) error) error {
+		return fn(func() error { return applyFail2banSettings() })
+	}
 	t.Cleanup(func() {
 		applyFail2banSettings = oldApplyFail2ban
+		withFail2banSettingsLock = oldWithFail2banLock
 		applyRateLimitSettings = oldApplyRateLimit
 		ensureLogMap = oldEnsureLogMap
 		regenerateAllSitesNginx = oldRegenerateAllSitesNginx

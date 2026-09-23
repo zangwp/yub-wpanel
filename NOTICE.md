@@ -1,6 +1,7 @@
 # YUB WPanel Notice
 
-YUB WPanel is distributed under the GNU General Public License, version 3.
+YUB WPanel is distributed under the GNU General Public License, version 3 only
+(SPDX-License-Identifier: GPL-3.0-only).
 
 Copyright (C) 2026 zangwp. YUB WPanel is maintained in this repository.
 

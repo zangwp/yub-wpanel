@@ -20,16 +20,19 @@ import (
 )
 
 type alertRule struct {
-	key               string
-	checkFn           func() (firing bool, msg string)
-	thresholdDuration time.Duration
-	eventOnly         bool
-	sendRecovery      bool
-	pendingSince      time.Time
-	lastFired         time.Time
-	firing            bool
-	lastAlertMsg      string
-	runtimeStateDirty bool
+	key                string
+	checkFn            func() (firing bool, msg string)
+	checkStateFn       func() alertCheckResult
+	thresholdDuration  time.Duration
+	eventOnly          bool
+	sendRecovery       bool
+	pendingSince       time.Time
+	lastFired          time.Time
+	firing             bool
+	lastAlertMsg       string
+	runtimeStateDirty  bool
+	resolutionDirty    bool
+	runtimeStateLoaded bool
 }
 
 type alertManager struct {
@@ -39,8 +42,47 @@ type alertManager struct {
 }
 
 type alertCheckResult struct {
-	firing  bool
+	state   alertCheckState
 	message string
+	err     error
+}
+
+type alertCheckState uint8
+
+const (
+	alertCheckNormal alertCheckState = iota
+	alertCheckFiring
+	alertCheckUnknown
+)
+
+func normalAlertCheck() alertCheckResult {
+	return alertCheckResult{state: alertCheckNormal}
+}
+
+func firingAlertCheck(message string) alertCheckResult {
+	return alertCheckResult{state: alertCheckFiring, message: message}
+}
+
+func unknownAlertCheck(err error) alertCheckResult {
+	return alertCheckResult{state: alertCheckUnknown, err: err}
+}
+
+func legacyAlertCheck(result alertCheckResult) (bool, string) {
+	return result.state == alertCheckFiring, result.message
+}
+
+func (r *alertRule) evaluate() alertCheckResult {
+	if r.checkStateFn != nil {
+		return r.checkStateFn()
+	}
+	if r.checkFn == nil {
+		return unknownAlertCheck(errors.New("alert rule has no checker"))
+	}
+	firing, message := r.checkFn()
+	if firing {
+		return firingAlertCheck(message)
+	}
+	return normalAlertCheck()
 }
 
 var (
@@ -63,19 +105,19 @@ type cloudflareDetectionEntry struct {
 func StartAlertMonitor(currentVersion string) {
 	panelCurrentVersion = currentVersion
 	alertMgr.rules = []*alertRule{
-		{key: "alert_cpu", checkFn: checkCPU, thresholdDuration: 5 * time.Minute, sendRecovery: true},
-		{key: "alert_memory", checkFn: checkMemory, thresholdDuration: 5 * time.Minute, sendRecovery: true},
-		{key: "alert_disk", checkFn: checkDisk, sendRecovery: true},
-		{key: "alert_service", checkFn: checkService, sendRecovery: true},
-		{key: "alert_ssl", checkFn: checkSSL, sendRecovery: true},
-		{key: "alert_backup", checkFn: checkBackup, sendRecovery: true},
+		{key: "alert_cpu", checkStateFn: checkCPUState, thresholdDuration: 5 * time.Minute, sendRecovery: true},
+		{key: "alert_memory", checkStateFn: checkMemoryState, thresholdDuration: 5 * time.Minute, sendRecovery: true},
+		{key: "alert_disk", checkStateFn: checkDiskState, sendRecovery: true},
+		{key: "alert_service", checkStateFn: checkServiceState, sendRecovery: true},
+		{key: "alert_ssl", checkStateFn: checkSSLState, sendRecovery: true},
+		{key: "alert_backup", checkStateFn: checkBackupState, sendRecovery: true},
 		{key: "alert_website_expiry", checkFn: checkWebsiteExpiry, eventOnly: true},
-		{key: "alert_remote_backup", checkFn: checkRemoteBackup, sendRecovery: true},
-		{key: "alert_cron_fail", checkFn: checkCronFail, sendRecovery: true},
-		{key: "alert_site", checkFn: checkSites, sendRecovery: true},
-		{key: "alert_system_update", checkFn: checkSystemUpdate},
-		{key: "alert_panel_update", checkFn: checkPanelUpdate},
-		{key: "alert_wp_fake_search_bot", checkFn: checkWPFakeSearchBotThreshold},
+		{key: "alert_remote_backup", checkStateFn: checkRemoteBackupState, sendRecovery: true},
+		{key: "alert_cron_fail", checkStateFn: checkCronFailState, sendRecovery: true},
+		{key: "alert_site", checkStateFn: checkSitesState, sendRecovery: true},
+		{key: "alert_system_update", checkStateFn: checkSystemUpdateState},
+		{key: "alert_panel_update", checkStateFn: checkPanelUpdateState},
+		{key: "alert_wp_fake_search_bot", checkStateFn: checkWPFakeSearchBotThresholdState},
 	}
 	loadAlertRuntimeState(alertMgr.rules)
 	go alertMgr.loop()
@@ -101,27 +143,38 @@ func (m *alertManager) loop() {
 func (m *alertManager) runChecks() {
 	go runWPAnomalyChecks()
 	go runWPCodeIntegrityChecks()
-	// 站点访问和 SSL/CDN 探测可能等待网络。先在后台启动，让资源与服务规则
-	// 立即评估；轮到对应规则时再接收结果，避免网络等待串行叠加。
-	var siteResultCh chan alertCheckResult
-	if isRuleEnabled("alert_site") {
-		siteResultCh = make(chan alertCheckResult, 1)
-		go func() {
-			firing, message := checkSites()
-			siteResultCh <- alertCheckResult{firing: firing, message: message}
-		}()
-	}
-	var sslResultCh chan alertCheckResult
-	if isRuleEnabled("alert_ssl") {
-		sslResultCh = make(chan alertCheckResult, 1)
-		go func() {
-			firing, message := checkSSL()
-			sslResultCh <- alertCheckResult{firing: firing, message: message}
-		}()
-	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// A rule must not be evaluated until its persisted state has either been
+	// restored or confirmed absent. Otherwise a transient startup read failure
+	// turns a historical firing rule into an in-memory normal rule, which can
+	// duplicate the next alert or leave the old incident unresolved forever.
+	runtimeReady := make(map[string]bool, len(m.rules))
+	for _, r := range m.rules {
+		runtimeReady[r.key] = ensureAlertRuntimeStateLoaded(r)
+		if runtimeReady[r.key] {
+			retryDirtyAlertRuntimeState(r)
+		}
+	}
+
+	// 站点访问和 SSL/CDN 探测可能等待网络。先在后台启动，让资源与服务规则
+	// 立即评估；轮到对应规则时再接收结果，避免网络等待串行叠加。
+	var siteResultCh chan alertCheckResult
+	if runtimeReady["alert_site"] && isRuleEnabled("alert_site") {
+		siteResultCh = make(chan alertCheckResult, 1)
+		go func() {
+			siteResultCh <- checkSitesState()
+		}()
+	}
+	var sslResultCh chan alertCheckResult
+	if runtimeReady["alert_ssl"] && isRuleEnabled("alert_ssl") {
+		sslResultCh = make(chan alertCheckResult, 1)
+		go func() {
+			sslResultCh <- checkSSLState()
+		}()
+	}
 
 	cfg := GetSMTPConfig()
 	hasSMTP := cfg != nil && cfg.Host != "" && cfg.AdminEmail != ""
@@ -130,74 +183,112 @@ func (m *alertManager) runChecks() {
 	hasWebhook := webhookConfigured(wCfg)
 
 	for _, r := range m.rules {
-		retryDirtyAlertRuntimeState(r)
+		if !runtimeReady[r.key] {
+			continue
+		}
 		if !isRuleEnabled(r.key) {
 			disableAlertRule(r)
 			continue
 		}
 
-		var instantFiring bool
-		var msg string
+		var result alertCheckResult
 		if r.key == "alert_site" && siteResultCh != nil {
-			result := <-siteResultCh
-			instantFiring, msg = result.firing, result.message
+			result = <-siteResultCh
 		} else if r.key == "alert_ssl" && sslResultCh != nil {
-			result := <-sslResultCh
-			instantFiring, msg = result.firing, result.message
+			result = <-sslResultCh
 		} else {
-			instantFiring, msg = r.checkFn()
+			result = r.evaluate()
 		}
-		now := time.Now()
-		if r.eventOnly {
-			if instantFiring {
-				sendAlertMilestone(r.key, msg)
-			}
-			continue
+		processAlertCheckResult(r, result, time.Now(), hasSMTP, hasWebhook)
+	}
+}
+
+func processAlertCheckResult(r *alertRule, result alertCheckResult, now time.Time, hasSMTP, hasWebhook bool) {
+	if r == nil {
+		return
+	}
+	if result.state == alertCheckUnknown {
+		// Unknown is deliberately not normal: retain firing/pending state and
+		// open alert rows until a successful check observes recovery.
+		reportAlertStateError("告警检查状态未知 [%s]，保留原状态: %v", r.key, result.err)
+		return
+	}
+	instantFiring := result.state == alertCheckFiring
+	msg := result.message
+	if r.eventOnly {
+		if instantFiring {
+			sendAlertMilestone(r.key, msg)
 		}
-		wasPending := !r.pendingSince.IsZero()
-		firing := r.sustainedFiring(instantFiring, now)
-		if firing && !r.firing {
-			// Transition: normal → alert
-			r.firing = true
+		return
+	}
+	wasPending := !r.pendingSince.IsZero()
+	firing := r.sustainedFiring(instantFiring, now)
+	if firing && !r.firing {
+		// Transition: normal → alert
+		r.firing = true
+		r.lastFired = now
+		r.lastAlertMsg = msg
+		sendAlertNotificationWithChannels(r.key, msg, false, hasSMTP, hasWebhook)
+		persistAlertRuntimeState(r)
+	} else if !firing && r.firing {
+		// Transition: alert → normal
+		r.firing = false
+		recoveryDetail := buildRecoveryDetail(r)
+		if r.sendRecovery {
+			logAlert(r.key, "info", recoveryDetail)
+		}
+		_ = resolveOpenAlertRows(r)
+		// 即时告警（无阈值）直接发送恢复通知，有阈值的等 5 分钟防抖
+		sendRecovery := now.Sub(r.lastFired) > 5*time.Minute || r.thresholdDuration <= 0
+		if r.sendRecovery && hasSMTP && sendRecovery {
+			go SendMail("", getPanelTitle()+" 恢复通知", formatEmailHTML(alertLabel(r.key)+" 已恢复正常", recoveryDetail, getEmailTip(r.key, true), false))
+		}
+		if r.sendRecovery && hasWebhook && sendRecovery {
+			go SendWebhook(getPanelTitle()+" 恢复通知", recoveryDetail)
+		}
+		persistAlertRuntimeState(r)
+	} else if firing && r.firing {
+		r.lastAlertMsg = msg
+		// Continuous alert — re-send on each rule's interval.
+		if now.Sub(r.lastFired) > alertResendInterval(r.key) {
 			r.lastFired = now
-			r.lastAlertMsg = msg
-			sendAlertNotificationWithChannels(r.key, msg, false, hasSMTP, hasWebhook)
-			persistAlertRuntimeState(r)
-		} else if !firing && r.firing {
-			// Transition: alert → normal
-			r.firing = false
-			recoveryDetail := buildRecoveryDetail(r)
-			if r.sendRecovery {
-				logAlert(r.key, "info", recoveryDetail)
-			}
-			database.GetDB().Exec("UPDATE alert_log SET resolved = 1 WHERE alert_type = ? AND resolved = 0", r.key)
-			// 即时告警（无阈值）直接发送恢复通知，有阈值的等 5 分钟防抖
-			sendRecovery := time.Since(r.lastFired) > 5*time.Minute || r.thresholdDuration <= 0
-			if r.sendRecovery && hasSMTP && sendRecovery {
-				go SendMail("", getPanelTitle()+" 恢复通知", formatEmailHTML(alertLabel(r.key)+" 已恢复正常", recoveryDetail, getEmailTip(r.key, true), false))
-			}
-			if r.sendRecovery && hasWebhook && sendRecovery {
-				go SendWebhook(getPanelTitle()+" 恢复通知", recoveryDetail)
-			}
-			persistAlertRuntimeState(r)
-		} else if firing && r.firing {
-			r.lastAlertMsg = msg
-			// Continuous alert — re-send on each rule's interval.
-			if time.Since(r.lastFired) > alertResendInterval(r.key) {
-				r.lastFired = time.Now()
-				sendAlertNotificationWithChannels(r.key, msg, true, hasSMTP, hasWebhook)
-				persistAlertRuntimeState(r)
-			}
-		} else if wasPending != !r.pendingSince.IsZero() || (!firing && !r.pendingSince.IsZero()) {
+			sendAlertNotificationWithChannels(r.key, msg, true, hasSMTP, hasWebhook)
 			persistAlertRuntimeState(r)
 		}
+	} else if wasPending != !r.pendingSince.IsZero() || (!firing && !r.pendingSince.IsZero()) {
+		persistAlertRuntimeState(r)
 	}
 }
 
 func retryDirtyAlertRuntimeState(r *alertRule) {
-	if r != nil && r.runtimeStateDirty {
+	if r == nil {
+		return
+	}
+	if r.resolutionDirty && !r.firing {
+		_ = resolveOpenAlertRows(r)
+	}
+	if r.runtimeStateDirty {
 		_ = persistAlertRuntimeState(r)
 	}
+}
+
+func resolveOpenAlertRows(r *alertRule) error {
+	if r == nil || r.eventOnly {
+		return nil
+	}
+	db := database.GetDB()
+	if db == nil {
+		r.resolutionDirty = true
+		err := errors.New("database unavailable")
+		reportAlertStateError("关闭未解决告警失败 [%s]，下一轮将重试: %v", r.key, err)
+		return err
+	}
+	_, err := db.Exec("UPDATE alert_log SET resolved = 1 WHERE alert_type = ? AND resolved = 0", r.key)
+	r.resolutionDirty = err != nil
+	if err != nil {
+		reportAlertStateError("关闭未解决告警失败 [%s]，下一轮将重试: %v", r.key, err)
+	}
+	return err
 }
 
 func disableAlertRule(r *alertRule) {
@@ -210,10 +301,8 @@ func disableAlertRule(r *alertRule) {
 	if !wasActive {
 		return
 	}
-	if database.GetDB() != nil {
-		database.GetDB().Exec("UPDATE alert_log SET resolved = 1 WHERE alert_type = ? AND resolved = 0", r.key)
-	}
-	persistAlertRuntimeState(r)
+	_ = resolveOpenAlertRows(r)
+	_ = persistAlertRuntimeState(r)
 }
 
 func (r *alertRule) sustainedFiring(instantFiring bool, now time.Time) bool {
@@ -253,34 +342,78 @@ func alertResendInterval(key string) time.Duration {
 }
 
 func loadAlertRuntimeState(rules []*alertRule) {
-	db := database.GetDB()
-	if db == nil {
-		return
-	}
 	for _, r := range rules {
-		if r.eventOnly {
-			continue
-		}
-		var status, pending, fired, message string
-		err := db.QueryRow(`SELECT status, pending_since, last_fired_at, last_message
-			FROM alert_runtime_state WHERE alert_type = ?`, r.key).Scan(&status, &pending, &fired, &message)
-		if errors.Is(err, sql.ErrNoRows) {
-			continue
-		}
-		if err != nil {
-			reportAlertStateError("读取告警运行状态失败 [%s]: %v", r.key, err)
-			continue
-		}
-		r.firing = status == "firing"
-		r.pendingSince = parseAlertStateTime(pending)
-		r.lastFired = parseAlertStateTime(fired)
-		r.lastAlertMsg = message
+		_ = ensureAlertRuntimeStateLoaded(r)
 	}
 }
 
+func ensureAlertRuntimeStateLoaded(r *alertRule) bool {
+	if r == nil {
+		return false
+	}
+	if r.runtimeStateLoaded {
+		return true
+	}
+	if r.eventOnly {
+		r.runtimeStateLoaded = true
+		return true
+	}
+
+	db := database.GetDB()
+	if db == nil {
+		reportAlertStateError("读取告警运行状态失败 [%s]: database unavailable", r.key)
+		return false
+	}
+	var status, pending, fired, message string
+	err := db.QueryRow(`SELECT status, pending_since, last_fired_at, last_message
+		FROM alert_runtime_state WHERE alert_type = ?`, r.key).Scan(&status, &pending, &fired, &message)
+	if errors.Is(err, sql.ErrNoRows) {
+		r.runtimeStateLoaded = true
+		return true
+	}
+	if err != nil {
+		reportAlertStateError("读取告警运行状态失败 [%s]: %v", r.key, err)
+		return false
+	}
+	if status != "normal" && status != "pending" && status != "firing" {
+		reportAlertStateError("读取告警运行状态失败 [%s]: invalid status %q", r.key, status)
+		return false
+	}
+	pendingSince, err := parseOptionalAlertStateTime(pending)
+	if err != nil {
+		reportAlertStateError("读取告警运行状态失败 [%s]: invalid pending time: %v", r.key, err)
+		return false
+	}
+	lastFired, err := parseOptionalAlertStateTime(fired)
+	if err != nil {
+		reportAlertStateError("读取告警运行状态失败 [%s]: invalid firing time: %v", r.key, err)
+		return false
+	}
+
+	r.firing = status == "firing"
+	r.pendingSince = pendingSince
+	r.lastFired = lastFired
+	r.lastAlertMsg = message
+	r.runtimeStateLoaded = true
+	return true
+}
+
 func persistAlertRuntimeState(r *alertRule) error {
-	if r == nil || r.eventOnly || database.GetDB() == nil {
+	if r == nil || r.eventOnly {
 		return nil
+	}
+	if r.resolutionDirty && !r.firing {
+		r.runtimeStateDirty = true
+		err := errors.New("open alert rows are not resolved yet")
+		reportAlertStateError("保存告警运行状态延后 [%s]，等待未解决告警关闭: %v", r.key, err)
+		return err
+	}
+	db := database.GetDB()
+	if db == nil {
+		r.runtimeStateDirty = true
+		err := errors.New("database unavailable")
+		reportAlertStateError("保存告警运行状态失败 [%s]，下一轮将重试: %v", r.key, err)
+		return err
 	}
 	status := "normal"
 	if r.firing {
@@ -288,7 +421,7 @@ func persistAlertRuntimeState(r *alertRule) error {
 	} else if !r.pendingSince.IsZero() {
 		status = "pending"
 	}
-	_, err := database.GetDB().Exec(`INSERT INTO alert_runtime_state
+	_, err := db.Exec(`INSERT INTO alert_runtime_state
 		(alert_type, status, pending_since, last_fired_at, last_message, updated_at)
 		VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(alert_type) DO UPDATE SET status=excluded.status,
@@ -310,11 +443,15 @@ func formatAlertStateTime(t time.Time) string {
 }
 
 func parseAlertStateTime(raw string) time.Time {
-	if raw == "" {
-		return time.Time{}
-	}
-	t, _ := time.Parse(time.RFC3339Nano, raw)
+	t, _ := parseOptionalAlertStateTime(raw)
 	return t
+}
+
+func parseOptionalAlertStateTime(raw string) (time.Time, error) {
+	if raw == "" {
+		return time.Time{}, nil
+	}
+	return time.Parse(time.RFC3339Nano, raw)
 }
 
 func sendAlertMilestone(key, message string) {
@@ -539,26 +676,96 @@ func formatEmailHTML(title, detail, tip string, isAlert bool) string {
 
 // --- Checkers ---
 
+const (
+	monitoringMetricMaxAge     = 3 * time.Minute
+	monitoringMetricFutureSkew = time.Minute
+)
+
 func checkCPU() (bool, string) {
+	return legacyAlertCheck(checkCPUState())
+}
+
+func checkCPUState() alertCheckResult {
 	db := database.GetDB()
-	var cpu, ts string
-	db.QueryRow("SELECT cpu_percent, recorded_at FROM monitoring_metrics ORDER BY id DESC LIMIT 1").Scan(&cpu, &ts)
-	v, _ := strconv.ParseFloat(cpu, 64)
-	if v > 80 {
-		return true, fmt.Sprintf("CPU 使用率 %.1f%%（阈值 80%%），于 %s", v, toLocalTime(ts))
+	if db == nil {
+		return unknownAlertCheck(errors.New("database unavailable"))
 	}
-	return false, ""
+	var cpu, ts string
+	if err := db.QueryRow("SELECT cpu_percent, recorded_at FROM monitoring_metrics ORDER BY id DESC LIMIT 1").Scan(&cpu, &ts); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return unknownAlertCheck(errors.New("CPU metrics unavailable: no samples"))
+		}
+		return unknownAlertCheck(fmt.Errorf("query CPU metrics: %w", err))
+	}
+	if err := validateMonitoringMetricTime(ts, time.Now()); err != nil {
+		return unknownAlertCheck(fmt.Errorf("CPU metrics unavailable: %w", err))
+	}
+	v, err := strconv.ParseFloat(cpu, 64)
+	if err != nil {
+		return unknownAlertCheck(fmt.Errorf("parse CPU metric: %w", err))
+	}
+	if v > 80 {
+		return firingAlertCheck(fmt.Sprintf("CPU 使用率 %.1f%%（阈值 80%%），于 %s", v, toLocalTime(ts)))
+	}
+	return normalAlertCheck()
 }
 
 func checkMemory() (bool, string) {
+	return legacyAlertCheck(checkMemoryState())
+}
+
+func checkMemoryState() alertCheckResult {
 	db := database.GetDB()
-	var mem, ts string
-	db.QueryRow("SELECT memory_percent, recorded_at FROM monitoring_metrics ORDER BY id DESC LIMIT 1").Scan(&mem, &ts)
-	v, _ := strconv.ParseFloat(mem, 64)
-	if v > 90 {
-		return true, fmt.Sprintf("可用内存低于 10%%（当前使用率 %.1f%%），于 %s", v, toLocalTime(ts))
+	if db == nil {
+		return unknownAlertCheck(errors.New("database unavailable"))
 	}
-	return false, ""
+	var mem, ts string
+	if err := db.QueryRow("SELECT memory_percent, recorded_at FROM monitoring_metrics ORDER BY id DESC LIMIT 1").Scan(&mem, &ts); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return unknownAlertCheck(errors.New("memory metrics unavailable: no samples"))
+		}
+		return unknownAlertCheck(fmt.Errorf("query memory metrics: %w", err))
+	}
+	if err := validateMonitoringMetricTime(ts, time.Now()); err != nil {
+		return unknownAlertCheck(fmt.Errorf("memory metrics unavailable: %w", err))
+	}
+	v, err := strconv.ParseFloat(mem, 64)
+	if err != nil {
+		return unknownAlertCheck(fmt.Errorf("parse memory metric: %w", err))
+	}
+	if v > 90 {
+		return firingAlertCheck(fmt.Sprintf("可用内存低于 10%%（当前使用率 %.1f%%），于 %s", v, toLocalTime(ts)))
+	}
+	return normalAlertCheck()
+}
+
+func validateMonitoringMetricTime(raw string, now time.Time) error {
+	recordedAt, err := parseMonitoringMetricTime(raw)
+	if err != nil {
+		return err
+	}
+	age := now.Sub(recordedAt)
+	if age > monitoringMetricMaxAge {
+		return fmt.Errorf("latest sample is stale (%s old)", age.Round(time.Second))
+	}
+	if age < -monitoringMetricFutureSkew {
+		return fmt.Errorf("latest sample is in the future by %s", (-age).Round(time.Second))
+	}
+	return nil
+}
+
+func parseMonitoringMetricTime(raw string) (time.Time, error) {
+	raw = strings.TrimSpace(raw)
+	for _, layout := range []string{
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04:05.999999999",
+		time.RFC3339Nano,
+	} {
+		if recordedAt, err := time.Parse(layout, raw); err == nil {
+			return recordedAt, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("invalid sample timestamp %q", raw)
 }
 
 func toLocalTime(dbTime string) string {
@@ -576,47 +783,84 @@ func toLocalTime(dbTime string) string {
 }
 
 func checkDisk() (bool, string) {
+	return legacyAlertCheck(checkDiskState())
+}
+
+func checkDiskState() alertCheckResult {
 	out, err := exec.Command("df", "-h", "/").Output()
 	if err != nil {
-		return false, ""
+		return unknownAlertCheck(fmt.Errorf("read disk usage: %w", err))
 	}
 	lines := strings.Split(string(out), "\n")
 	if len(lines) < 2 {
-		return false, ""
+		return unknownAlertCheck(errors.New("unexpected df output"))
 	}
 	fields := strings.Fields(lines[1])
 	if len(fields) < 5 {
-		return false, ""
+		return unknownAlertCheck(errors.New("unexpected df fields"))
 	}
 	useStr := strings.TrimSuffix(fields[4], "%")
-	use, _ := strconv.Atoi(useStr)
-	if use > 90 {
-		return true, fmt.Sprintf("磁盘使用率 %d%%（阈值 90%%），剩余 %s", use, fields[3])
+	use, err := strconv.Atoi(useStr)
+	if err != nil {
+		return unknownAlertCheck(fmt.Errorf("parse disk usage: %w", err))
 	}
-	return false, ""
+	if use > 90 {
+		return firingAlertCheck(fmt.Sprintf("磁盘使用率 %d%%（阈值 90%%），剩余 %s", use, fields[3]))
+	}
+	return normalAlertCheck()
 }
 
 func checkService() (bool, string) {
+	return legacyAlertCheck(checkServiceState())
+}
+
+func checkServiceState() alertCheckResult {
 	svcs := GetGuardStatus()
 	var msgs []string
+	var unreadable []string
 	for _, s := range svcs {
-		if !s.Running && !s.Paused && s.Restarts > 0 {
-			msgs = append(msgs, fmt.Sprintf("%s 异常（已自动重启 %d 次，最近: %s）", s.Name, s.Restarts, s.LastIncident))
+		if s.Paused {
+			continue
+		}
+		state := readGuardServiceState(s.ServiceName)
+		if !state.valid || state.activeState == "" {
+			unreadable = append(unreadable, s.ServiceName)
+			continue
+		}
+		if !state.active {
+			detail := fmt.Sprintf("已自动重启 %d 次", s.Restarts)
+			if s.LastIncident != "" {
+				detail += "，最近: " + s.LastIncident
+			}
+			msgs = append(msgs, fmt.Sprintf("%s 异常（服务未运行；%s）", s.Name, detail))
 		}
 	}
 	if len(msgs) > 0 {
-		return true, strings.Join(msgs, "；")
+		return firingAlertCheck(strings.Join(msgs, "；"))
 	}
-	return false, ""
+	if len(unreadable) > 0 {
+		return unknownAlertCheck(fmt.Errorf("read service state for %s", strings.Join(unreadable, ", ")))
+	}
+	return normalAlertCheck()
 }
 
 func checkSSL() (bool, string) {
+	return legacyAlertCheck(checkSSLState())
+}
+
+const maxSSLCloudflareDetectionWorkers = 8
+
+func checkSSLState() alertCheckResult {
 	db := database.GetDB()
+	if db == nil {
+		return unknownAlertCheck(errors.New("database unavailable"))
+	}
 	rows, err := db.Query(`SELECT domain, ssl_expires_at, COALESCE(ssl_last_error, '')
 		FROM websites WHERE ssl_enabled = 1 AND ssl_expires_at IS NOT NULL`)
 	if err != nil {
-		return false, ""
+		return unknownAlertCheck(fmt.Errorf("query SSL certificates: %w", err))
 	}
+	defer rows.Close()
 	type sslAlertCandidate struct {
 		domain           string
 		message          string
@@ -628,8 +872,8 @@ func checkSSL() (bool, string) {
 	for rows.Next() {
 		var domain, lastError string
 		var expiresAt time.Time
-		if rows.Scan(&domain, &expiresAt, &lastError) != nil {
-			continue
+		if err := rows.Scan(&domain, &expiresAt, &lastError); err != nil {
+			return unknownAlertCheck(fmt.Errorf("scan SSL certificate: %w", err))
 		}
 		days := int(expiresAt.Sub(now).Hours() / 24)
 		message := ""
@@ -648,20 +892,40 @@ func checkSSL() (bool, string) {
 		}
 		candidates = append(candidates, sslAlertCandidate{domain: domain, message: message, detectCloudflare: detectCloudflare})
 	}
-	rows.Close()
-
-	var wg sync.WaitGroup
-	for i := range candidates {
-		if !candidates[i].detectCloudflare {
-			continue
-		}
-		wg.Add(1)
-		go func(index int) {
-			defer wg.Done()
-			candidates[index].cloudflare = cloudflareProxyDetector(candidates[index].domain)
-		}(i)
+	if err := rows.Err(); err != nil {
+		return unknownAlertCheck(fmt.Errorf("iterate SSL certificates: %w", err))
 	}
-	wg.Wait()
+
+	detectionCount := 0
+	for i := range candidates {
+		if candidates[i].detectCloudflare {
+			detectionCount++
+		}
+	}
+	workerCount := detectionCount
+	if workerCount > maxSSLCloudflareDetectionWorkers {
+		workerCount = maxSSLCloudflareDetectionWorkers
+	}
+	if workerCount > 0 {
+		indices := make(chan int)
+		var wg sync.WaitGroup
+		wg.Add(workerCount)
+		for worker := 0; worker < workerCount; worker++ {
+			go func() {
+				defer wg.Done()
+				for index := range indices {
+					candidates[index].cloudflare = cloudflareProxyDetector(candidates[index].domain)
+				}
+			}()
+		}
+		for i := range candidates {
+			if candidates[i].detectCloudflare {
+				indices <- i
+			}
+		}
+		close(indices)
+		wg.Wait()
+	}
 
 	msgs := make([]string, 0, len(candidates))
 	for _, candidate := range candidates {
@@ -672,9 +936,9 @@ func checkSSL() (bool, string) {
 		msgs = append(msgs, message)
 	}
 	if len(msgs) > 0 {
-		return true, strings.Join(msgs, "；")
+		return firingAlertCheck(strings.Join(msgs, "；"))
 	}
-	return false, ""
+	return normalAlertCheck()
 }
 
 func isLikelyCloudflareProxied(domain string) bool {
@@ -725,7 +989,14 @@ func cacheCloudflareDetection(domain string, proxied bool) bool {
 }
 
 func checkBackup() (bool, string) {
+	return legacyAlertCheck(checkBackupState())
+}
+
+func checkBackupState() alertCheckResult {
 	db := database.GetDB()
+	if db == nil {
+		return unknownAlertCheck(errors.New("database unavailable"))
+	}
 	rows, err := db.Query(`SELECT w.domain FROM backup_settings bs
 		JOIN websites w ON w.id = bs.site_id
 		WHERE bs.enabled = 1
@@ -745,21 +1016,25 @@ func checkBackup() (bool, string) {
 		)
 		ORDER BY w.domain`)
 	if err != nil {
-		return false, ""
+		return unknownAlertCheck(fmt.Errorf("query backup freshness: %w", err))
 	}
 	defer rows.Close()
 
 	var domains []string
 	for rows.Next() {
 		var d string
-		if rows.Scan(&d) == nil {
-			domains = append(domains, d)
+		if err := rows.Scan(&d); err != nil {
+			return unknownAlertCheck(fmt.Errorf("scan backup freshness: %w", err))
 		}
+		domains = append(domains, d)
+	}
+	if err := rows.Err(); err != nil {
+		return unknownAlertCheck(fmt.Errorf("iterate backup freshness: %w", err))
 	}
 	if len(domains) > 0 {
-		return true, strings.Join(domains, "、") + " 最近 24 小时内没有成功的自动备份"
+		return firingAlertCheck(strings.Join(domains, "、") + " 最近 24 小时内没有成功的自动备份")
 	}
-	return false, ""
+	return normalAlertCheck()
 }
 
 func checkWebsiteExpiry() (bool, string) {
@@ -813,45 +1088,70 @@ func checkWebsiteExpiry() (bool, string) {
 }
 
 func checkRemoteBackup() (bool, string) {
+	return legacyAlertCheck(checkRemoteBackupState())
+}
+
+func checkRemoteBackupState() alertCheckResult {
 	db := database.GetDB()
+	if db == nil {
+		return unknownAlertCheck(errors.New("database unavailable"))
+	}
 	var enabled int
-	db.QueryRow("SELECT enabled FROM remote_backup_settings WHERE id = 1").Scan(&enabled)
+	if err := db.QueryRow("SELECT enabled FROM remote_backup_settings WHERE id = 1").Scan(&enabled); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return unknownAlertCheck(errors.New("remote backup settings are missing"))
+		}
+		return unknownAlertCheck(fmt.Errorf("query remote backup settings: %w", err))
+	}
 	if enabled == 0 {
-		return false, ""
+		return normalAlertCheck()
 	}
 
 	// 失败记录只有在对应备份后续同步成功、transport_status 被更新后才算恢复。
 	var failCount int
-	db.QueryRow(`SELECT
+	if err := db.QueryRow(`SELECT
 		(SELECT COUNT(*) FROM db_backups WHERE transport_status = 'failed') +
-		(SELECT COUNT(*) FROM file_backups WHERE transport_status = 'failed')`).Scan(&failCount)
-	if failCount > 0 {
-		return true, fmt.Sprintf("有 %d 个远程备份文件同步失败", failCount)
+		(SELECT COUNT(*) FROM file_backups WHERE transport_status = 'failed')`).Scan(&failCount); err != nil {
+		return unknownAlertCheck(fmt.Errorf("query remote backup failures: %w", err))
 	}
-	return false, ""
+	if failCount > 0 {
+		return firingAlertCheck(fmt.Sprintf("有 %d 个远程备份文件同步失败", failCount))
+	}
+	return normalAlertCheck()
 }
 
 func checkCronFail() (bool, string) {
+	return legacyAlertCheck(checkCronFailState())
+}
+
+func checkCronFailState() alertCheckResult {
 	db := database.GetDB()
+	if db == nil {
+		return unknownAlertCheck(errors.New("database unavailable"))
+	}
 	rows, err := db.Query(`SELECT name FROM cron_jobs
 		WHERE enabled = 1 AND notify_fail = 1 AND running = 0
 		AND last_status = 'failed'`)
 	if err != nil {
-		return false, ""
+		return unknownAlertCheck(fmt.Errorf("query failed cron jobs: %w", err))
 	}
 	defer rows.Close()
 
 	var names []string
 	for rows.Next() {
 		var name string
-		if rows.Scan(&name) == nil {
-			names = append(names, "「"+name+"」")
+		if err := rows.Scan(&name); err != nil {
+			return unknownAlertCheck(fmt.Errorf("scan failed cron job: %w", err))
 		}
+		names = append(names, "「"+name+"」")
+	}
+	if err := rows.Err(); err != nil {
+		return unknownAlertCheck(fmt.Errorf("iterate failed cron jobs: %w", err))
 	}
 	if len(names) > 0 {
-		return true, "计划任务 " + strings.Join(names, "、") + " 执行失败"
+		return firingAlertCheck("计划任务 " + strings.Join(names, "、") + " 执行失败")
 	}
-	return false, ""
+	return normalAlertCheck()
 }
 
 const siteFailureAlertThreshold = 2
@@ -861,10 +1161,17 @@ var siteFailureMessages = make(map[string]string)
 var siteFailureCounts = make(map[string]int)
 
 func checkSites() (bool, string) {
+	return legacyAlertCheck(checkSitesState())
+}
+
+func checkSitesState() alertCheckResult {
 	db := database.GetDB()
+	if db == nil {
+		return unknownAlertCheck(errors.New("database unavailable"))
+	}
 	rows, err := db.Query(`SELECT id, domain, ssl_enabled, monitoring_interval FROM websites WHERE status = 'active' AND monitoring_enabled = 1`)
 	if err != nil {
-		return false, ""
+		return unknownAlertCheck(fmt.Errorf("query monitored sites: %w", err))
 	}
 	defer rows.Close()
 
@@ -878,14 +1185,17 @@ func checkSites() (bool, string) {
 	seen := make(map[string]bool)
 	for rows.Next() {
 		var s siteInfo
-		if rows.Scan(&s.id, &s.domain, &s.ssl, &s.interval) != nil {
-			continue
+		if err := rows.Scan(&s.id, &s.domain, &s.ssl, &s.interval); err != nil {
+			return unknownAlertCheck(fmt.Errorf("scan monitored site: %w", err))
 		}
 		seen[s.id] = true
 		if s.interval <= 0 {
 			s.interval = 5
 		}
 		sites = append(sites, s)
+	}
+	if err := rows.Err(); err != nil {
+		return unknownAlertCheck(fmt.Errorf("iterate monitored sites: %w", err))
 	}
 
 	for id := range siteFailureMessages {
@@ -909,10 +1219,15 @@ func checkSites() (bool, string) {
 	}
 	var toCheck []checkTarget
 	var msgs []string
+	var unconfirmedFailures []string
 	for _, s := range sites {
 		if last, ok := siteLastCheck[s.id]; ok && time.Since(last) < time.Duration(s.interval)*time.Minute {
-			if msg, ok := siteFailureMessages[s.id]; ok && siteFailureCounts[s.id] >= siteFailureAlertThreshold {
-				msgs = append(msgs, msg)
+			if msg, ok := siteFailureMessages[s.id]; ok {
+				if siteFailureCounts[s.id] >= siteFailureAlertThreshold {
+					msgs = append(msgs, msg)
+				} else if siteFailureCounts[s.id] > 0 {
+					unconfirmedFailures = append(unconfirmedFailures, msg)
+				}
 			}
 			continue
 		}
@@ -927,9 +1242,12 @@ func checkSites() (bool, string) {
 
 	if len(toCheck) == 0 {
 		if len(msgs) > 0 {
-			return true, strings.Join(msgs, "；")
+			return firingAlertCheck(strings.Join(msgs, "；"))
 		}
-		return false, ""
+		if len(unconfirmedFailures) > 0 {
+			return unknownAlertCheck(fmt.Errorf("site availability failure awaiting confirmation: %s", strings.Join(unconfirmedFailures, "；")))
+		}
+		return normalAlertCheck()
 	}
 
 	httpClient := &http.Client{
@@ -966,6 +1284,8 @@ func checkSites() (bool, string) {
 			siteFailureCounts[r.id]++
 			if siteFailureCounts[r.id] >= siteFailureAlertThreshold {
 				msgs = append(msgs, msg)
+			} else {
+				unconfirmedFailures = append(unconfirmedFailures, msg)
 			}
 		} else if r.code < 200 || r.code >= 400 {
 			msg := fmt.Sprintf("%s 返回 %d", r.domain, r.code)
@@ -973,6 +1293,8 @@ func checkSites() (bool, string) {
 			siteFailureCounts[r.id]++
 			if siteFailureCounts[r.id] >= siteFailureAlertThreshold {
 				msgs = append(msgs, msg)
+			} else {
+				unconfirmedFailures = append(unconfirmedFailures, msg)
 			}
 		} else {
 			delete(siteFailureMessages, r.id)
@@ -981,9 +1303,12 @@ func checkSites() (bool, string) {
 	}
 
 	if len(msgs) > 0 {
-		return true, strings.Join(msgs, "；")
+		return firingAlertCheck(strings.Join(msgs, "；"))
 	}
-	return false, ""
+	if len(unconfirmedFailures) > 0 {
+		return unknownAlertCheck(fmt.Errorf("site availability failure awaiting confirmation: %s", strings.Join(unconfirmedFailures, "；")))
+	}
+	return normalAlertCheck()
 }
 
 var sysUpdateCache struct {
@@ -998,6 +1323,20 @@ var panelUpdateCache struct {
 	latest  string
 	message string
 }
+
+const systemUpdateCommandTimeout = 2 * time.Minute
+
+func newSystemUpdateCommand(ctx context.Context) *exec.Cmd {
+	return exec.CommandContext(ctx, "apt", "list", "--upgradable")
+}
+
+var runSystemUpdateCommand = func() ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), systemUpdateCommandTimeout)
+	defer cancel()
+	return newSystemUpdateCommand(ctx).Output()
+}
+
+var fetchLatestPanelReleaseForAlert = FetchLatestPanelRelease
 
 func ClearSystemUpdateAlertCache() {
 	sysUpdateCache.mu.Lock()
@@ -1015,20 +1354,24 @@ func ClearPanelUpdateAlertCache() {
 }
 
 func checkSystemUpdate() (bool, string) {
+	return legacyAlertCheck(checkSystemUpdateState())
+}
+
+func checkSystemUpdateState() alertCheckResult {
 	sysUpdateCache.mu.Lock()
 	if time.Since(sysUpdateCache.lastAt) < 24*time.Hour {
 		names := sysUpdateCache.names
 		sysUpdateCache.mu.Unlock()
 		if len(names) > 0 {
-			return true, fmt.Sprintf("系统有 %d 个可用更新：%s", len(names), strings.Join(names, "、"))
+			return firingAlertCheck(fmt.Sprintf("系统有 %d 个可用更新：%s", len(names), strings.Join(names, "、")))
 		}
-		return false, ""
+		return normalAlertCheck()
 	}
 	sysUpdateCache.mu.Unlock()
 
-	out, err := exec.Command("bash", "-c", "apt list --upgradable 2>/dev/null").Output()
+	out, err := runSystemUpdateCommand()
 	if err != nil {
-		return false, ""
+		return unknownAlertCheck(fmt.Errorf("list system updates: %w", err))
 	}
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	var names []string
@@ -1049,27 +1392,37 @@ func checkSystemUpdate() (bool, string) {
 	sysUpdateCache.mu.Unlock()
 
 	if len(names) > 0 {
-		return true, fmt.Sprintf("系统有 %d 个可用更新：%s", len(names), strings.Join(names, "、"))
+		return firingAlertCheck(fmt.Sprintf("系统有 %d 个可用更新：%s", len(names), strings.Join(names, "、")))
 	}
-	return false, ""
+	return normalAlertCheck()
 }
 
 func checkPanelUpdate() (bool, string) {
+	return legacyAlertCheck(checkPanelUpdateState())
+}
+
+func checkPanelUpdateState() alertCheckResult {
 	if panelCurrentVersion == "" || panelCurrentVersion == "dev" {
-		return false, ""
+		return normalAlertCheck()
 	}
 
 	panelUpdateCache.mu.Lock()
 	if time.Since(panelUpdateCache.lastAt) < 24*time.Hour {
 		msg := panelUpdateCache.message
 		panelUpdateCache.mu.Unlock()
-		return msg != "", msg
+		if msg != "" {
+			return firingAlertCheck(msg)
+		}
+		return normalAlertCheck()
 	}
 	panelUpdateCache.mu.Unlock()
 
-	latest, err := FetchLatestPanelRelease("")
-	if err != nil || latest == nil || latest.TagName == "" {
-		return false, ""
+	latest, err := fetchLatestPanelReleaseForAlert("")
+	if err != nil {
+		return unknownAlertCheck(fmt.Errorf("fetch panel release metadata: %w", err))
+	}
+	if latest == nil || latest.TagName == "" {
+		return unknownAlertCheck(errors.New("fetch panel release metadata: empty release"))
 	}
 
 	msg := ""
@@ -1083,7 +1436,10 @@ func checkPanelUpdate() (bool, string) {
 	panelUpdateCache.message = msg
 	panelUpdateCache.mu.Unlock()
 
-	return msg != "", msg
+	if msg != "" {
+		return firingAlertCheck(msg)
+	}
+	return normalAlertCheck()
 }
 
 // 方案 D 阶段四：SQL 注入探测 / 伪装搜索引擎爬虫告警，默认关闭。
@@ -1109,54 +1465,85 @@ type wpSecurityAlertConfig struct {
 	maxOffenders int
 }
 
-// getWPSecurityAlertConfig 从 security_settings 读取阈值与窗口，DB 不可用或
-// 值非法时回退到包级默认值。每次告警判定（最多每分钟一次）调用一次，无需缓存。
-func getWPSecurityAlertConfig() wpSecurityAlertConfig {
-	cfg := wpSecurityAlertConfig{
+func defaultWPSecurityAlertConfigValue() wpSecurityAlertConfig {
+	return wpSecurityAlertConfig{
 		threshold:    defaultWPSecurityAlertThreshold,
 		window:       defaultWPSecurityAlertWindow,
 		pathLimit:    wpSecurityAlertPathLimit,
 		maxOffenders: wpSecurityAlertMaxOffenders,
 	}
+}
+
+// loadWPSecurityAlertConfig is strict so a broken or unreadable configuration
+// cannot be interpreted as a healthy security signal by the alert state machine.
+func loadWPSecurityAlertConfig() (wpSecurityAlertConfig, error) {
+	cfg := defaultWPSecurityAlertConfigValue()
 	db := database.GetDB()
 	if db == nil {
-		return cfg
+		return cfg, errors.New("database unavailable")
 	}
-	var s string
-	if db.QueryRow("SELECT svalue FROM security_settings WHERE skey = 'alert_wp_security_threshold'").Scan(&s) == nil {
-		if n, err := strconv.Atoi(s); err == nil && n >= 1 && n <= 10000 {
-			cfg.threshold = n
-		}
+	var thresholdValue string
+	if err := db.QueryRow("SELECT svalue FROM security_settings WHERE skey = 'alert_wp_security_threshold'").Scan(&thresholdValue); err != nil {
+		return cfg, fmt.Errorf("read WordPress security alert threshold: %w", err)
 	}
-	if db.QueryRow("SELECT svalue FROM security_settings WHERE skey = 'alert_wp_security_window_hours'").Scan(&s) == nil {
-		if n, err := strconv.Atoi(s); err == nil && n >= 1 && n <= 168 {
-			cfg.window = time.Duration(n) * time.Hour
-		}
+	threshold, err := strconv.Atoi(thresholdValue)
+	if err != nil || threshold < 1 || threshold > 10000 {
+		return cfg, fmt.Errorf("invalid WordPress security alert threshold %q", thresholdValue)
+	}
+	cfg.threshold = threshold
+
+	var windowValue string
+	if err := db.QueryRow("SELECT svalue FROM security_settings WHERE skey = 'alert_wp_security_window_hours'").Scan(&windowValue); err != nil {
+		return cfg, fmt.Errorf("read WordPress security alert window: %w", err)
+	}
+	windowHours, err := strconv.Atoi(windowValue)
+	if err != nil || windowHours < 1 || windowHours > 168 {
+		return cfg, fmt.Errorf("invalid WordPress security alert window %q", windowValue)
+	}
+	cfg.window = time.Duration(windowHours) * time.Hour
+	return cfg, nil
+}
+
+// getWPSecurityAlertConfig keeps the legacy fallback contract used outside the
+// stateful alert path. The state checker itself uses the strict loader above.
+func getWPSecurityAlertConfig() wpSecurityAlertConfig {
+	cfg, err := loadWPSecurityAlertConfig()
+	if err != nil {
+		return defaultWPSecurityAlertConfigValue()
 	}
 	return cfg
 }
 
 func checkWPFakeSearchBotThreshold() (bool, string) {
-	return checkWPSecurityEventThreshold(SecurityEventFakeSearchBot, "伪装搜索引擎爬虫")
+	return legacyAlertCheck(checkWPFakeSearchBotThresholdState())
+}
+
+func checkWPFakeSearchBotThresholdState() alertCheckResult {
+	return checkWPSecurityEventThresholdState(SecurityEventFakeSearchBot, "伪装搜索引擎爬虫")
 }
 
 func checkWPSecurityEventThreshold(eventType, label string) (bool, string) {
-	cfg := getWPSecurityAlertConfig()
+	return legacyAlertCheck(checkWPSecurityEventThresholdState(eventType, label))
+}
+
+func checkWPSecurityEventThresholdState(eventType, label string) alertCheckResult {
+	cfg, err := loadWPSecurityAlertConfig()
+	if err != nil {
+		return unknownAlertCheck(fmt.Errorf("load WordPress security alert configuration: %w", err))
+	}
 	since := time.Now().UTC().Add(-cfg.window)
-	offenders, err := topWPSecurityOffenders(eventType, since, cfg.threshold, cfg.pathLimit)
-	if err != nil || len(offenders) == 0 {
-		return false, ""
+	offenders, omitted, err := queryWPSecurityOffendersForAlert(eventType, since, cfg.threshold, cfg.pathLimit, cfg.maxOffenders)
+	if err != nil {
+		return unknownAlertCheck(fmt.Errorf("query WordPress security offenders: %w", err))
+	}
+	if len(offenders) == 0 {
+		return normalAlertCheck()
 	}
 
 	// 分布式扫描可能同时有几十上百个 IP 超过阈值，不截断的话邮件正文会膨胀到
 	// 几百 KB，Webhook 走 URL 路径段的渠道（如 Bark）还会直接投递失败。
-	// topWPSecurityOffenders 已按次数降序排列，只取影响最大的前 N 个即可。
-	omitted := 0
-	if len(offenders) > cfg.maxOffenders {
-		omitted = len(offenders) - cfg.maxOffenders
-		offenders = offenders[:cfg.maxOffenders]
-	}
-
+	// 告警专用查询已在 SQL 层按次数排序并限制为影响最大的前 N 个，并且只为
+	// 这些最终展示的 IP 查询热门路径，避免对所有攻击来源执行逐个路径查询。
 	// 邮件正文按单个 <p> 段落渲染，换行符不会被转成 <br>，因此和其余告警规则一样
 	// 使用「；」分隔多条信息，避免所有 IP 挤成一整行无法阅读。
 	entries := make([]string, 0, len(offenders))
@@ -1173,7 +1560,93 @@ func checkWPSecurityEventThreshold(eventType, label string) (bool, string) {
 	}
 	msg := fmt.Sprintf("过去 %d 小时内以下 IP 触发「%s」次数达到阈值（%d 次）：%s%s面板仅记录、不自动封禁，请结合 IP 来源在「安全防御」页面手动决定是否封禁。",
 		int(cfg.window.Hours()), label, cfg.threshold, strings.Join(entries, "；"), suffix)
-	return true, msg
+	return firingAlertCheck(msg)
+}
+
+func queryWPSecurityOffendersForAlert(eventType string, since time.Time, threshold, pathLimit, maxOffenders int) ([]WPSecurityAlertOffender, int, error) {
+	db := database.GetDB()
+	if db == nil {
+		return nil, 0, errors.New("database unavailable")
+	}
+	if maxOffenders <= 0 {
+		return nil, 0, errors.New("maximum offender count must be positive")
+	}
+	formattedSince := since.UTC().Format("2006-01-02 15:04:05")
+
+	var total int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM (
+		SELECT ip_address FROM wp_security_events
+		WHERE event_type = ? AND occurred_at >= ?
+		GROUP BY ip_address HAVING COUNT(*) >= ?
+	)`, eventType, formattedSince, threshold).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count offenders: %w", err)
+	}
+	if total == 0 {
+		return nil, 0, nil
+	}
+
+	rows, err := db.Query(`SELECT ip_address, COUNT(*) AS hit_count FROM wp_security_events
+		WHERE event_type = ? AND occurred_at >= ?
+		GROUP BY ip_address HAVING COUNT(*) >= ?
+		ORDER BY hit_count DESC, ip_address ASC LIMIT ?`,
+		eventType, formattedSince, threshold, maxOffenders)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var offenders []WPSecurityAlertOffender
+	for rows.Next() {
+		var offender WPSecurityAlertOffender
+		if err := rows.Scan(&offender.IP, &offender.Count); err != nil {
+			return nil, 0, fmt.Errorf("scan offender count: %w", err)
+		}
+		offenders = append(offenders, offender)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("iterate offender counts: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, 0, fmt.Errorf("close offender counts: %w", err)
+	}
+
+	for i := range offenders {
+		paths, err := queryWPSecurityEventPathsForAlert(db, eventType, since, offenders[i].IP, pathLimit)
+		if err != nil {
+			return nil, 0, fmt.Errorf("query paths for %s: %w", offenders[i].IP, err)
+		}
+		offenders[i].Paths = paths
+	}
+	omitted := total - len(offenders)
+	if omitted < 0 {
+		omitted = 0
+	}
+	return offenders, omitted, nil
+}
+
+func queryWPSecurityEventPathsForAlert(db *sql.DB, eventType string, since time.Time, ip string, limit int) ([]string, error) {
+	rows, err := db.Query(`SELECT path, COUNT(*) c FROM wp_security_events
+		WHERE event_type = ? AND ip_address = ? AND occurred_at >= ?
+		GROUP BY path ORDER BY c DESC, path ASC LIMIT ?`,
+		eventType, ip, since.UTC().Format("2006-01-02 15:04:05"), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var paths []string
+	for rows.Next() {
+		var path string
+		var count int
+		if err := rows.Scan(&path, &count); err != nil {
+			return nil, fmt.Errorf("scan offender path: %w", err)
+		}
+		paths = append(paths, fmt.Sprintf("%s × %d", path, count))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate offender paths: %w", err)
+	}
+	return paths, nil
 }
 
 func getPanelTitle() string {

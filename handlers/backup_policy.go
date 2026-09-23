@@ -9,7 +9,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/zangwp/yub-wpanel/database"
 	"github.com/zangwp/yub-wpanel/executor"
@@ -22,10 +21,8 @@ import (
 const backupPolicyCommand = "yub-wpanel file backup"
 
 var (
-	backupPolicyMu         sync.Mutex
 	renderBackupPolicyCron = func() error {
-		task := executor.GlobalQueue.Enqueue(executor.TaskRenderCron, nil)
-		result := <-task.ResultCh
+		result := executor.RenderCronConfig()
 		if !result.Success {
 			return errors.New(result.Message)
 		}
@@ -107,13 +104,44 @@ func SaveBackupPolicy(c *gin.Context) {
 		return
 	}
 
-	backupPolicyMu.Lock()
-	defer backupPolicyMu.Unlock()
+	// The backup-policy endpoint mutates the same cron_jobs rows and renders
+	// the same system cron file as CronHandler. Share its mutation lock so one
+	// endpoint cannot restore a snapshot over a concurrent accepted change from
+	// the other.
+	cronMutationMu.Lock()
+	defer cronMutationMu.Unlock()
 	db := database.GetDB()
+	jobIDs, hasRunningJob, err := backupPolicyCronJobIDs(db, req.Sites)
+	if err != nil {
+		log.Printf("读取批量备份任务运行状态失败: %v", err)
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse(i18n.TE(c.Request, "backups.policy_snapshot_failed")))
+		return
+	}
+	if hasRunningJob {
+		c.JSON(http.StatusConflict, models.ErrorResponse("备份任务正在执行中，暂时不能修改策略"))
+		return
+	}
+	mutationLocks, err := executor.AcquireCronJobMutationLocks(jobIDs)
+	if err != nil {
+		if errors.Is(err, executor.ErrCronJobAlreadyRunning) {
+			c.JSON(http.StatusConflict, models.ErrorResponse("备份任务正在执行中，暂时不能修改策略"))
+		} else {
+			log.Printf("取得批量备份任务变更锁失败: %v", err)
+			c.JSON(http.StatusInternalServerError, models.ErrorResponse(i18n.TE(c.Request, "backups.policy_snapshot_failed")))
+		}
+		return
+	}
+	defer mutationLocks.Close()
 	snapshot, err := snapshotBackupPolicy(db, req.Sites)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.ErrorResponse(i18n.TE(c.Request, "backups.policy_snapshot_failed")))
 		return
+	}
+	for _, job := range snapshot.Jobs {
+		if job.Running == 1 {
+			c.JSON(http.StatusConflict, models.ErrorResponse("备份任务正在执行中，暂时不能修改策略"))
+			return
+		}
 	}
 	changed, skipped, err := applyBackupPolicy(db, req.Sites)
 	if err != nil {
@@ -465,7 +493,41 @@ func allocateBackupCron(cycle string, occupied map[string]bool) (string, error) 
 	return "", backupPolicyUserError("backups.policy_slots_exhausted")
 }
 
+func backupPolicyCronJobIDs(db *sql.DB, requests []backupPolicySiteRequest) ([]int, bool, error) {
+	ids := make([]int, 0)
+	for _, req := range requests {
+		rows, err := db.Query(`SELECT id,running FROM cron_jobs
+			WHERE site_id=? AND task_type='file_backup' ORDER BY id`, req.SiteID)
+		if err != nil {
+			return nil, false, err
+		}
+		for rows.Next() {
+			var id, running int
+			if err := rows.Scan(&id, &running); err != nil {
+				rows.Close()
+				return nil, false, err
+			}
+			if running == 1 {
+				rows.Close()
+				return nil, true, nil
+			}
+			ids = append(ids, id)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, false, err
+		}
+		rows.Close()
+	}
+	return ids, false, nil
+}
+
 func snapshotBackupPolicy(db *sql.DB, requests []backupPolicySiteRequest) (backupPolicySnapshot, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return backupPolicySnapshot{}, err
+	}
+	defer tx.Rollback()
 	ids := make([]int, 0, len(requests))
 	for _, req := range requests {
 		ids = append(ids, req.SiteID)
@@ -474,13 +536,13 @@ func snapshotBackupPolicy(db *sql.DB, requests []backupPolicySiteRequest) (backu
 	snapshot := backupPolicySnapshot{}
 	for _, id := range ids {
 		setting := backupSettingSnapshot{SiteID: id}
-		err := db.QueryRow(`SELECT enabled,keep_count FROM backup_settings WHERE site_id=?`, id).Scan(&setting.Enabled, &setting.KeepCount)
+		err := tx.QueryRow(`SELECT enabled,keep_count FROM backup_settings WHERE site_id=?`, id).Scan(&setting.Enabled, &setting.KeepCount)
 		if err != nil && err != sql.ErrNoRows {
 			return snapshot, err
 		}
 		setting.Exists = err == nil
 		snapshot.Settings = append(snapshot.Settings, setting)
-		rows, err := db.Query(`SELECT id,name,cron_expression,command,site_id,run_as_user,task_type,backup_mode,keep_count,notify_fail,enabled,running,last_run_at,last_status,last_output,created_at,updated_at
+		rows, err := tx.Query(`SELECT id,name,cron_expression,command,site_id,run_as_user,task_type,backup_mode,keep_count,notify_fail,enabled,running,last_run_at,last_status,last_output,created_at,updated_at
 			FROM cron_jobs WHERE site_id=? AND task_type='file_backup' ORDER BY id`, id)
 		if err != nil {
 			return snapshot, err
@@ -499,6 +561,9 @@ func snapshotBackupPolicy(db *sql.DB, requests []backupPolicySiteRequest) (backu
 		}
 		rows.Close()
 	}
+	if err := tx.Commit(); err != nil {
+		return snapshot, err
+	}
 	return snapshot, nil
 }
 
@@ -508,12 +573,38 @@ func restoreBackupPolicy(db *sql.DB, requests []backupPolicySiteRequest, snapsho
 		return err
 	}
 	defer tx.Rollback()
+	originalJobIDs := make(map[int]struct{}, len(snapshot.Jobs))
+	for _, job := range snapshot.Jobs {
+		originalJobIDs[job.ID] = struct{}{}
+	}
 	for _, req := range requests {
 		if _, err := tx.Exec(`DELETE FROM backup_settings WHERE site_id=?`, req.SiteID); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`DELETE FROM cron_jobs WHERE site_id=? AND task_type='file_backup'`, req.SiteID); err != nil {
+		rows, err := tx.Query(`SELECT id FROM cron_jobs WHERE site_id=? AND task_type='file_backup'`, req.SiteID)
+		if err != nil {
 			return err
+		}
+		var newJobIDs []int
+		for rows.Next() {
+			var id int
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return err
+			}
+			if _, existed := originalJobIDs[id]; !existed {
+				newJobIDs = append(newJobIDs, id)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+		for _, id := range newJobIDs {
+			if _, err := tx.Exec(`DELETE FROM cron_jobs WHERE id=?`, id); err != nil {
+				return err
+			}
 		}
 	}
 	for _, setting := range snapshot.Settings {
@@ -525,7 +616,21 @@ func restoreBackupPolicy(db *sql.DB, requests []backupPolicySiteRequest, snapsho
 	}
 	for _, job := range snapshot.Jobs {
 		if _, err := tx.Exec(`INSERT INTO cron_jobs(id,name,cron_expression,command,site_id,run_as_user,task_type,backup_mode,keep_count,notify_fail,enabled,running,last_run_at,last_status,last_output,created_at,updated_at)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, job.ID, job.Name, job.CronExpression, job.Command, job.SiteID, job.RunAsUser, job.TaskType, job.BackupMode, job.KeepCount, job.NotifyFail, job.Enabled, job.Running, job.LastRunAt, job.LastStatus, job.LastOutput, job.CreatedAt, job.UpdatedAt); err != nil {
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			ON CONFLICT(id) DO UPDATE SET
+				name=excluded.name,
+				cron_expression=excluded.cron_expression,
+				command=excluded.command,
+				site_id=excluded.site_id,
+				run_as_user=excluded.run_as_user,
+				task_type=excluded.task_type,
+				backup_mode=excluded.backup_mode,
+				keep_count=excluded.keep_count,
+				notify_fail=excluded.notify_fail,
+				enabled=excluded.enabled,
+				created_at=excluded.created_at,
+				updated_at=excluded.updated_at`,
+			job.ID, job.Name, job.CronExpression, job.Command, job.SiteID, job.RunAsUser, job.TaskType, job.BackupMode, job.KeepCount, job.NotifyFail, job.Enabled, job.Running, job.LastRunAt, job.LastStatus, job.LastOutput, job.CreatedAt, job.UpdatedAt); err != nil {
 			return err
 		}
 	}

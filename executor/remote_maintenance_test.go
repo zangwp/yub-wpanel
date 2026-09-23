@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -75,6 +76,19 @@ func TestCleanupSupersededFileBackupChainDeletesInOrder(t *testing.T) {
 	want := []string{"remote:example.com/files/old.tar.gz", "local:/backup/example.com/files/old.tar.gz", "record"}
 	if cleaned != 1 || !reflect.DeepEqual(calls, want) {
 		t.Fatalf("cleanup = %d, calls=%v, want 1,%v", cleaned, calls, want)
+	}
+}
+
+func TestCleanupSupersededFileBackupChainStopsAtCallerDeadline(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	called := false
+	cleaned, err := cleanupSupersededFileBackupChainWithContext(ctx, 7, "example.com", t.TempDir(), []string{"old.tar.gz"},
+		func(context.Context, string) error { called = true; return nil },
+		func(string) error { called = true; return nil },
+		func(int, string) error { called = true; return nil })
+	if cleaned != 0 || !errors.Is(err, context.Canceled) || called {
+		t.Fatalf("cancelled cleanup = %d, %v, called=%t", cleaned, err, called)
 	}
 }
 

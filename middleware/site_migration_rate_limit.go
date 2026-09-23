@@ -73,9 +73,13 @@ func (t *siteMigrationFailureTracker) clear(ip string) {
 func SiteMigrationFailureLimit() gin.HandlerFunc {
 	tracker := newSiteMigrationFailureTracker()
 	return func(c *gin.Context) {
+		if !isSiteMigrationAPIPath(c.Request.URL.Path) {
+			c.Next()
+			return
+		}
 		ip := c.ClientIP()
 		if tracker.isBlocked(ip) {
-			c.AbortWithStatus(http.StatusTooManyRequests)
+			abortSiteMigrationWithoutReading(c, http.StatusTooManyRequests, time.Now, setSiteMigrationReadDeadline)
 			return
 		}
 

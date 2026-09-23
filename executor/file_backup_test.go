@@ -1,14 +1,234 @@
 package executor
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/zangwp/yub-wpanel/database"
 )
+
+func TestFileBackupCommandsHonorCancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	root := t.TempDir()
+	target := filepath.Join(root, "backup.tar.gz")
+	if err := createFullFileArchiveContext(ctx, filepath.Join(root, "site"), target, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("full archive error = %v, want context.Canceled", err)
+	}
+	if _, err := createIncrementalFileArchiveContext(ctx, filepath.Join(root, "uploads"), filepath.Join(root, "stamp"), target); !errors.Is(err, context.Canceled) {
+		t.Fatalf("incremental archive error = %v, want context.Canceled", err)
+	}
+	if err := verifyFileBackupArchiveContext(ctx, target); !errors.Is(err, context.Canceled) {
+		t.Fatalf("archive verification error = %v, want context.Canceled", err)
+	}
+	if _, err := checkDiskSpaceContext(ctx, root, 1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("disk-space check error = %v, want context.Canceled", err)
+	}
+}
+
+func TestFileBackupCommandContextHasHardDeadlineAndKeepsEarlierCallerDeadline(t *testing.T) {
+	ctx, cancel := withFileBackupCommandTimeout(context.Background())
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		cancel()
+		t.Fatal("default file backup context has no deadline")
+	}
+	remaining := time.Until(deadline)
+	cancel()
+	if remaining <= fileBackupCommandTimeout-time.Minute || remaining > fileBackupCommandTimeout {
+		t.Fatalf("default file backup deadline remaining = %s", remaining)
+	}
+
+	parent, parentCancel := context.WithTimeout(context.Background(), time.Minute)
+	defer parentCancel()
+	bounded, boundedCancel := withFileBackupCommandTimeout(parent)
+	defer boundedCancel()
+	boundedDeadline, ok := bounded.Deadline()
+	if !ok {
+		t.Fatal("bounded file backup context has no deadline")
+	}
+	if boundedDeadline.After(time.Now().Add(time.Minute)) {
+		t.Fatalf("file backup context extended caller deadline to %s", boundedDeadline)
+	}
+}
+
+func TestAcquireFileBackupLockHonorsCancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	lockPath := filepath.Join(t.TempDir(), "backup.lock")
+	started := time.Now()
+	lock, err := acquireFileBackupLock(ctx, lockPath)
+	if lock != nil {
+		_ = lock.Close()
+		t.Fatal("cancelled lock acquisition unexpectedly returned a lock")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("lock error = %v, want context.Canceled", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("cancelled lock wait returned too slowly: %s", elapsed)
+	}
+	if _, statErr := os.Stat(lockPath); !os.IsNotExist(statErr) {
+		t.Fatalf("cancelled lock wait created lock file: %v", statErr)
+	}
+}
+
+func TestReserveFileBackupArchiveSameInstantNeverOverwrites(t *testing.T) {
+	cutoff := time.Date(2026, time.September, 23, 12, 34, 56, 789, time.UTC)
+	for _, mode := range []string{"full", "inc"} {
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			firstName, firstPath, err := reserveFileBackupArchive(dir, mode, cutoff)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(firstPath, []byte("first archive"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			secondName, secondPath, err := reserveFileBackupArchive(dir, mode, cutoff)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if firstName == secondName || firstPath == secondPath {
+				t.Fatalf("same-instant reservations collided: %q", firstName)
+			}
+			contents, err := os.ReadFile(firstPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(contents) != "first archive" {
+				t.Fatalf("second reservation overwrote first archive: %q", contents)
+			}
+			if info, err := os.Stat(secondPath); err != nil || info.Size() != 0 {
+				t.Fatalf("second reservation is not a distinct empty placeholder: info=%v err=%v", info, err)
+			}
+		})
+	}
+}
+
+func TestAcquireFileBackupLockIgnoresPreexistingContents(t *testing.T) {
+	lockPath := filepath.Join(t.TempDir(), "backup.lock")
+	if err := os.WriteFile(lockPath, []byte("1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	lock, err := acquireFileBackupLock(ctx, lockPath)
+	if err != nil {
+		t.Fatalf("pre-existing unlocked lock file prevented acquisition: %v", err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFileBackupLockCoordinatesProcesses(t *testing.T) {
+	const (
+		helperLockEnv     = "YUB_WPANEL_FILE_BACKUP_LOCK_HELPER_PATH"
+		helperStartedEnv  = "YUB_WPANEL_FILE_BACKUP_LOCK_HELPER_STARTED"
+		helperAcquiredEnv = "YUB_WPANEL_FILE_BACKUP_LOCK_HELPER_ACQUIRED"
+	)
+	if lockPath := os.Getenv(helperLockEnv); lockPath != "" {
+		if err := os.WriteFile(os.Getenv(helperStartedEnv), nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		lock, err := acquireFileBackupLock(ctx, lockPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer lock.Close()
+		if err := os.WriteFile(os.Getenv(helperAcquiredEnv), nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+
+	root := t.TempDir()
+	lockPath := filepath.Join(root, "backup.lock")
+	startedPath := filepath.Join(root, "started")
+	acquiredPath := filepath.Join(root, "acquired")
+	parentLock, err := acquireFileBackupLock(context.Background(), lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parentLock.Close()
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestFileBackupLockCoordinatesProcesses$", "-test.count=1")
+	cmd.Env = append(os.Environ(),
+		helperLockEnv+"="+lockPath,
+		helperStartedEnv+"="+startedPath,
+		helperAcquiredEnv+"="+acquiredPath,
+	)
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(startedPath); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("lock helper did not start: %s", output.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(2 * fileBackupLockRetry)
+	if _, err := os.Stat(acquiredPath); err == nil {
+		t.Fatal("second process acquired file-backup lock while parent held it")
+	} else if !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if err := parentLock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("lock helper failed: %v: %s", err, output.String())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("lock helper did not acquire released lock: %s", output.String())
+	}
+	if _, err := os.Stat(acquiredPath); err != nil {
+		t.Fatalf("lock helper never recorded acquisition: %v", err)
+	}
+}
+
+func TestVerifyFileBackupArchiveContextKillsTimedOutTar(t *testing.T) {
+	binDir := t.TempDir()
+	tarPath := filepath.Join(binDir, "tar")
+	if err := os.WriteFile(tarPath, []byte("#!/bin/sh\nexec sleep 30\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := verifyFileBackupArchiveContext(ctx, filepath.Join(t.TempDir(), "archive.tar.gz"))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("verification error = %v, want context.DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("timed-out tar was not killed promptly: %s", elapsed)
+	}
+}
 
 func TestCleanOldBackupsRemovesRotatedFileBackupsRows(t *testing.T) {
 	openTestDB(t)

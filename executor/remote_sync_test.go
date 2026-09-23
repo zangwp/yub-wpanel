@@ -1,6 +1,8 @@
 package executor
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/zangwp/yub-wpanel/database"
 )
@@ -205,6 +208,25 @@ func TestPutFileToS3UsesMultipartForLargeFiles(t *testing.T) {
 	}
 }
 
+func TestPutFileToS3StopsHTTPAtCallerDeadline(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	withS3TestClient(t, server)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := putFileToS3(ctx, server.URL, "yub-wpanel-backups", "auto", "access-key_123", "secret", "yub-wpanel/site.tar.gz", seedS3TestFile(t, 1))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("putFileToS3 error = %v, want context deadline", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("S3 HTTP upload ignored caller deadline: %s", elapsed)
+	}
+}
+
 func TestPutFileToS3AbortsMultipartOnPartFailure(t *testing.T) {
 	var mu sync.Mutex
 	requests := []string{}
@@ -242,6 +264,150 @@ func TestPutFileToS3AbortsMultipartOnPartFailure(t *testing.T) {
 	got := strings.Join(requests, "\n")
 	if !strings.Contains(got, "DELETE /yub-wpanel-backups/yub-wpanel/site.tar.gz?uploadId=upload-2") {
 		t.Fatalf("abort request missing; got:\n%s", got)
+	}
+}
+
+func TestPutFileToS3RejectsEmbeddedCompleteErrorAndAborts(t *testing.T) {
+	abortSeen := make(chan struct{}, 1)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.RawQuery == "uploads=":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`<InitiateMultipartUploadResult><UploadId>upload-embedded-error</UploadId></InitiateMultipartUploadResult>`))
+		case r.Method == http.MethodPut && strings.Contains(r.URL.RawQuery, "partNumber="):
+			w.Header().Set("ETag", `"etag-`+r.URL.Query().Get("partNumber")+`"`)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Query().Get("uploadId") == "upload-embedded-error":
+			// S3 may report completion failure in an XML Error document while
+			// retaining an HTTP 200 status.
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`<Error><Code>InternalError</Code><Message>commit failed</Message></Error>`))
+		case r.Method == http.MethodDelete && r.URL.Query().Get("uploadId") == "upload-embedded-error":
+			abortSeen <- struct{}{}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	withS3TestClient(t, server)
+	restore := withS3MultipartSettings(t, 1, 5*1024*1024)
+	defer restore()
+
+	err := putFileToS3(t.Context(), server.URL, "yub-wpanel-backups", "auto", "access-key_123", "secret", "yub-wpanel/site.tar.gz", seedS3TestFile(t, 6*1024*1024))
+	if err == nil || !strings.Contains(err.Error(), "InternalError") {
+		t.Fatalf("putFileToS3 error = %v, want embedded completion error", err)
+	}
+	select {
+	case <-abortSeen:
+	default:
+		t.Fatal("embedded completion error did not abort multipart upload")
+	}
+}
+
+func TestPutFileToS3DeadlineStillAbortsMultipart(t *testing.T) {
+	abortContextLive := make(chan bool, 1)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.RawQuery == "uploads=":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`<InitiateMultipartUploadResult><UploadId>upload-deadline</UploadId></InitiateMultipartUploadResult>`))
+		case r.Method == http.MethodPut && strings.Contains(r.URL.RawQuery, "partNumber="):
+			<-r.Context().Done()
+		case r.Method == http.MethodDelete && r.URL.Query().Get("uploadId") == "upload-deadline":
+			abortContextLive <- r.Context().Err() == nil
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	withS3TestClient(t, server)
+	restore := withS3MultipartSettings(t, 1, 5*1024*1024)
+	defer restore()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	err := putFileToS3(ctx, server.URL, "yub-wpanel-backups", "auto", "access-key_123", "secret", "yub-wpanel/site.tar.gz", seedS3TestFile(t, 6*1024*1024))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("putFileToS3 error = %v, want context deadline", err)
+	}
+	select {
+	case live := <-abortContextLive:
+		if !live {
+			t.Fatal("multipart abort inherited the expired upload context")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("multipart abort was not sent after upload deadline")
+	}
+}
+
+func TestCleanupSupersededFileBackupChainUsesFrozenRemoteTarget(t *testing.T) {
+	openTestDB(t)
+	insertMinimalWebsite(t, "frozen.example.com")
+	db := database.GetDB()
+	filename := "file_full_old.tar.gz"
+	if _, err := db.Exec(`INSERT INTO file_backups (site_id, filename, file_size, mode) VALUES (1, ?, 1, 'full')`, filename); err != nil {
+		t.Fatal(err)
+	}
+	backupDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(backupDir, filename), []byte("old"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var paths []string
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		if r.Method != http.MethodDelete {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	withS3TestClient(t, server)
+
+	target := remoteBackupTarget{
+		Enabled:       true,
+		backupType:    "s3",
+		s3Endpoint:    server.URL + "/target-a",
+		s3Bucket:      "yub-wpanel-backups",
+		s3Region:      "auto",
+		s3AccessKeyID: "access-key_123",
+		s3SecretKey:   "secret",
+		s3PathPrefix:  "archives",
+	}
+	// Simulate an administrator switching the singleton setting after this
+	// backup captured target A but before it starts old-chain cleanup.
+	if _, err := db.Exec(`UPDATE remote_backup_settings SET enabled=1, backup_type='s3',
+		s3_endpoint=?, s3_bucket='yub-wpanel-backups', s3_region='auto',
+		s3_access_key_id='access-key_123', s3_secret_key='secret', s3_path_prefix='archives'
+		WHERE id=1`, server.URL+"/target-b"); err != nil {
+		t.Fatal(err)
+	}
+
+	cleaned, err := cleanupSupersededFileBackupChainContext(t.Context(), target, 1, "frozen.example.com", backupDir, []string{filename})
+	if err != nil || cleaned != 1 {
+		t.Fatalf("cleanup = %d, %v", cleaned, err)
+	}
+	mu.Lock()
+	gotPaths := append([]string(nil), paths...)
+	mu.Unlock()
+	if len(gotPaths) != 1 || !strings.HasPrefix(gotPaths[0], "/target-a/") {
+		t.Fatalf("cleanup requests = %v, want only frozen target A", gotPaths)
+	}
+	if _, err := os.Stat(filepath.Join(backupDir, filename)); !os.IsNotExist(err) {
+		t.Fatalf("local old-chain file still exists: %v", err)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM file_backups WHERE site_id=1 AND filename=?`, filename).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("old-chain database row count = %d, err=%v", count, err)
 	}
 }
 
@@ -283,6 +449,122 @@ func seedS3TestFile(t *testing.T, size int64) string {
 // ------------------------------------------------------------------
 // 远程全量基线探测（RemoteHasFullFileBackup 及底层 remoteHasFullBackup/s3HasFullBackup）
 // ------------------------------------------------------------------
+
+func TestRemoteHasFullFileBackupContextStopsS3ProbeAtCallerDeadline(t *testing.T) {
+	openTestDB(t)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	withS3TestClient(t, server)
+
+	db := database.GetDB()
+	if _, err := db.Exec(`UPDATE remote_backup_settings SET enabled=1, backup_type='s3',
+		s3_endpoint=?, s3_bucket='yub-wpanel-backups', s3_region='auto',
+		s3_access_key_id='access-key_123', s3_secret_key='secret', s3_path_prefix='yub-wpanel'
+		WHERE id=1`, server.URL); err != nil {
+		t.Fatalf("update remote backup settings: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := RemoteHasFullFileBackupContext(ctx, "example.com")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("RemoteHasFullFileBackupContext error = %v, want context deadline", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("S3 baseline probe ignored caller deadline: %s", elapsed)
+	}
+}
+
+func TestRemoteHasFullFileBackupContextStopsRsyncProbeAtCallerDeadline(t *testing.T) {
+	openTestDB(t)
+	installSleepingCommand(t, "sshpass")
+	db := database.GetDB()
+	if _, err := db.Exec(`UPDATE remote_backup_settings SET enabled=1, backup_type='rsync',
+		host='backup.example.com', port=22, username='root', auth_type='password',
+		password='secret', remote_path='/backups' WHERE id=1`); err != nil {
+		t.Fatalf("update remote backup settings: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := RemoteHasFullFileBackupContext(ctx, "example.com")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("RemoteHasFullFileBackupContext error = %v, want context deadline", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("rsync baseline probe ignored caller deadline: %s", elapsed)
+	}
+}
+
+func TestSyncBackupToRemoteContextStopsRsyncAtCallerDeadline(t *testing.T) {
+	openTestDB(t)
+	installSleepingCommand(t, "sshpass")
+	db := database.GetDB()
+	if _, err := db.Exec(`UPDATE remote_backup_settings SET enabled=1, backup_type='rsync',
+		host='backup.example.com', port=22, username='root', auth_type='password',
+		password='secret', remote_path='/backups', keep_local=1 WHERE id=1`); err != nil {
+		t.Fatalf("update remote backup settings: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	ok := SyncBackupToRemoteContext(ctx, backupsRoot+"/example.com/files/file_full_test.tar.gz", BackupSourceFile, 0, "")
+	if ok {
+		t.Fatal("SyncBackupToRemoteContext = true after caller deadline")
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("rsync upload ignored caller deadline: %s", elapsed)
+	}
+}
+
+func TestSyncBackupToRemoteContextPassesCallerDeadlineToS3(t *testing.T) {
+	openTestDB(t)
+	db := database.GetDB()
+	if _, err := db.Exec(`UPDATE remote_backup_settings SET enabled=1, backup_type='s3',
+		s3_endpoint='https://s3.example.com', s3_bucket='yub-wpanel-backups', s3_region='auto',
+		s3_access_key_id='access-key_123', s3_secret_key='secret', s3_path_prefix='yub-wpanel',
+		keep_local=1 WHERE id=1`); err != nil {
+		t.Fatalf("update remote backup settings: %v", err)
+	}
+
+	oldPut := putFileToS3ForSync
+	t.Cleanup(func() { putFileToS3ForSync = oldPut })
+	called := false
+	putFileToS3ForSync = func(ctx context.Context, endpoint, bucket, region, accessKeyID, secretKey, objectKey, path string) error {
+		called = true
+		if _, ok := ctx.Deadline(); !ok {
+			t.Fatal("S3 upload context has no caller deadline")
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	ok := SyncBackupToRemoteContext(ctx, backupsRoot+"/example.com/files/file_full_test.tar.gz", BackupSourceFile, 0, "")
+	if ok || !called {
+		t.Fatalf("SyncBackupToRemoteContext = %t, S3 called = %t", ok, called)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("S3 upload ignored caller deadline: %s", elapsed)
+	}
+}
+
+func installSleepingCommand(t *testing.T, name string) {
+	t.Helper()
+	binDir := t.TempDir()
+	path := filepath.Join(binDir, name)
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexec sleep 30\n"), 0755); err != nil {
+		t.Fatalf("write fake %s: %v", name, err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
 
 func TestRemoteHasFullFileBackupDisabledReturnsTrue(t *testing.T) {
 	openTestDB(t)

@@ -40,6 +40,7 @@ func (s *SiteMigrationRemoteSource) WriteFileShard(ctx context.Context, peerID, 
 	if err != nil {
 		return err
 	}
+	defer client.CloseIdleConnections()
 	response, err := client.Do(request)
 	if err != nil {
 		return err
@@ -186,6 +187,7 @@ func (s *SiteMigrationRemoteSource) readChunk(ctx context.Context, peerID, route
 	if err != nil {
 		return nil, err
 	}
+	defer client.CloseIdleConnections()
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, err

@@ -2,6 +2,7 @@ package executor
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/zangwp/yub-wpanel/database"
@@ -19,41 +21,50 @@ import (
 
 var errScheduledWorkNotAllowed = errors.New("网站当前不允许运行自动任务")
 
+const (
+	fileBackupCommandTimeout  = 6 * time.Hour
+	fileBackupLockWaitTimeout = 2 * time.Hour
+	fileBackupLockRetry       = 250 * time.Millisecond
+	fileBackupLockPath        = "/run/yub-wpanel/file-backup.lock"
+)
+
+var fileBackupArchiveSequence atomic.Uint64
+
 func ExecuteFileBackup(siteID int, mode string, keepCount int) (string, error) {
-	return executeFileBackup(siteID, mode, keepCount, false)
+	return ExecuteFileBackupContext(context.Background(), siteID, mode, keepCount)
+}
+
+// ExecuteFileBackupContext runs a manual file backup that can be cancelled by
+// the caller. ExecuteFileBackup remains available for callers without a
+// context, preserving the existing public API.
+func ExecuteFileBackupContext(ctx context.Context, siteID int, mode string, keepCount int) (string, error) {
+	return executeFileBackupContext(ctx, siteID, mode, keepCount, false)
 }
 
 func executeFileBackup(siteID int, mode string, keepCount int, scheduled bool) (string, error) {
+	return executeFileBackupContext(context.Background(), siteID, mode, keepCount, scheduled)
+}
+
+func executeFileBackupContext(ctx context.Context, siteID int, mode string, keepCount int, scheduled bool) (string, error) {
+	ctx, cancel := withFileBackupCommandTimeout(ctx)
+	defer cancel()
+	if err := fileBackupContextError(ctx, "文件备份"); err != nil {
+		return "", err
+	}
 	if keepCount <= 0 {
 		keepCount = 3
 	}
 
-	// 文件备份排队锁：多个站点同时触发时依次执行，避免并发争抢磁盘/CPU
-	lockPath := "/tmp/yub-wpanel-file-backup.lock"
-	myPID := fmt.Sprintf("%d", os.Getpid())
-	acquired := false
-	for i := 0; i < 1440; i++ { // 最多等2小时（每5秒检查一次）
-		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0644)
-		if err == nil {
-			f.WriteString(myPID)
-			f.Close()
-			acquired = true
-			break
+	// 内核文件锁跨主服务和 cron 进程串行备份。锁文件固定保留在 root-only
+	// 运行目录中；不通过 PID 文件推断存活状态，避免 stale-lock TOCTOU。
+	backupLock, err := acquireFileBackupLock(ctx, fileBackupLockPath)
+	if err != nil {
+		if contextErr := fileBackupContextError(ctx, "等待备份锁"); contextErr != nil {
+			return "", contextErr
 		}
-		// 检查锁持有者是否还活着
-		if stale, _ := os.ReadFile(lockPath); len(stale) > 0 {
-			pid := strings.TrimSpace(string(stale))
-			if _, err := os.Stat("/proc/" + pid); os.IsNotExist(err) {
-				os.Remove(lockPath) // 死锁清理
-				continue
-			}
-		}
-		time.Sleep(5 * time.Second)
+		return "", err
 	}
-	if !acquired {
-		return "", fmt.Errorf("等待备份锁超时（有其他备份任务未完成），请稍后重试")
-	}
-	defer os.Remove(lockPath)
+	defer backupLock.Close()
 	if scheduled {
 		allowed, _, err := siteScheduledWorkAllowed(siteID)
 		if err != nil {
@@ -66,7 +77,7 @@ func executeFileBackup(siteID int, mode string, keepCount int, scheduled bool) (
 
 	db := database.GetDB()
 	var domain, webRoot string
-	err := db.QueryRow("SELECT domain, web_root FROM websites WHERE id = ?", siteID).Scan(&domain, &webRoot)
+	err = db.QueryRow("SELECT domain, web_root FROM websites WHERE id = ?", siteID).Scan(&domain, &webRoot)
 	if err != nil {
 		return "", fmt.Errorf("网站不存在")
 	}
@@ -78,12 +89,19 @@ func executeFileBackup(siteID int, mode string, keepCount int, scheduled bool) (
 	stampFile := filepath.Join(backupDir, ".last_backup.stamp")
 
 	// Check disk space: need at least 1GB free after backup
-	if !checkDiskSpace(backupDir, 1024*1024*1024) {
+	hasSpace, err := checkDiskSpaceContext(ctx, backupDir, 1024*1024*1024)
+	if err != nil {
+		return "", err
+	}
+	if !hasSpace {
 		return "", fmt.Errorf("磁盘空间不足，备份取消")
+	}
+	remoteTarget, err := loadRemoteBackupTarget(ctx)
+	if err != nil {
+		return "", fmt.Errorf("读取远程备份设置失败: %w", err)
 	}
 
 	backupCutoff := time.Now()
-	ts := backupCutoff.Format("20060102_150405")
 	var tarName string
 	var fullPath string
 	var isFull bool
@@ -101,9 +119,15 @@ func executeFileBackup(siteID int, mode string, keepCount int, scheduled bool) (
 	// 探测失败（连接失败/配置无效）同样按"未确认完整"处理，强制全量。
 	forcedFullByRemote := false
 	if !isFull {
-		hasFull, err := RemoteHasFullFileBackup(domain)
+		if err := fileBackupContextError(ctx, "文件备份"); err != nil {
+			return "", err
+		}
+		hasFull, err := remoteTargetHasFullFileBackupContext(ctx, remoteTarget, domain)
 		if err != nil {
 			return "", fmt.Errorf("无法确认远程全量基线，已保留现有增量链: %w", err)
+		}
+		if err := fileBackupContextError(ctx, "文件备份"); err != nil {
+			return "", err
 		}
 		if !hasFull {
 			isFull = true
@@ -132,33 +156,32 @@ func executeFileBackup(siteID int, mode string, keepCount int, scheduled bool) (
 		"--exclude=wp-content/backup-db",
 	}
 
+	archiveMode := "inc"
 	if isFull {
-		tarName = fmt.Sprintf("file_full_%s.tar.gz", ts)
-		fullPath = filepath.Join(backupDir, tarName)
-		args := []string{"-czf", fullPath, "--warning=no-file-changed"}
-		args = append(args, tarExcludes...)
-		args = append(args, "-C", filepath.Dir(webRoot), filepath.Base(webRoot))
-		cmd := exec.Command("tar", args...)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			_ = os.Remove(fullPath)
-			if len(out) == 0 {
-				return "", fmt.Errorf("全量备份失败: %v", err)
-			}
-			return "", fmt.Errorf("全量备份失败: %s", string(out))
+		archiveMode = "full"
+	}
+	tarName, fullPath, err = reserveFileBackupArchive(backupDir, archiveMode, backupCutoff)
+	if err != nil {
+		return "", err
+	}
+
+	if isFull {
+		if err := createFullFileArchiveContext(ctx, webRoot, fullPath, tarExcludes); err != nil {
+			return "", err
 		}
 	} else {
-		tarName = fmt.Sprintf("file_inc_%s.tar.gz", ts)
-		fullPath = filepath.Join(backupDir, tarName)
 		uploadsDir := filepath.Join(webRoot, "wp-content", "uploads")
 		if _, err := os.Stat(uploadsDir); os.IsNotExist(err) {
+			_ = os.Remove(fullPath)
 			return "", fmt.Errorf("uploads 目录不存在")
 		}
-		hasFiles, err := createIncrementalFileArchive(uploadsDir, stampFile, fullPath)
+		hasFiles, err := createIncrementalFileArchiveContext(ctx, uploadsDir, stampFile, fullPath)
 		if err != nil {
+			_ = os.Remove(fullPath)
 			return "", err
 		}
 		if !hasFiles {
+			_ = os.Remove(fullPath)
 			if err := writeBackupStamp(stampFile, backupCutoff); err != nil {
 				return "", fmt.Errorf("更新增量备份时间戳失败: %w", err)
 			}
@@ -166,7 +189,7 @@ func executeFileBackup(siteID int, mode string, keepCount int, scheduled bool) (
 		}
 	}
 
-	if err := verifyFileBackupArchive(fullPath); err != nil {
+	if err := verifyFileBackupArchiveContext(ctx, fullPath); err != nil {
 		_ = os.Remove(fullPath)
 		return "", err
 	}
@@ -180,12 +203,21 @@ func executeFileBackup(siteID int, mode string, keepCount int, scheduled bool) (
 	if isFull {
 		modeLabel = "full"
 	}
+	if err := fileBackupContextError(ctx, "文件备份"); err != nil {
+		return "", err
+	}
 	if !recordFileBackup(siteID, tarName, size, modeLabel, domain) {
 		return "", fmt.Errorf("文件备份已生成，但记录写入失败，未执行远程换代")
 	}
 
-	remoteEnabled := remoteBackupEnabled()
-	remoteSynced := SyncBackupToRemote(fullPath, BackupSourceFile, siteID, tarName)
+	remoteEnabled := remoteTarget.Enabled
+	remoteSynced := false
+	if remoteEnabled {
+		remoteSynced = syncBackupToRemoteTargetContext(ctx, remoteTarget, fullPath, BackupSourceFile, siteID, tarName)
+	}
+	if err := fileBackupContextError(ctx, "文件备份"); err != nil {
+		return "", err
+	}
 	if remoteEnabled && !remoteSynced {
 		return "", fmt.Errorf("本地文件备份已生成，但远程同步失败，旧备份链已保留")
 	}
@@ -194,7 +226,9 @@ func executeFileBackup(siteID int, mode string, keepCount int, scheduled bool) (
 	}
 	if isFull {
 		if remoteEnabled && remoteSynced {
-			cleanupSupersededFileBackupChain(siteID, domain, backupDir, oldChain)
+			if _, err := cleanupSupersededFileBackupChainContext(ctx, remoteTarget, siteID, domain, backupDir, oldChain); err != nil {
+				return "", fmt.Errorf("新全量备份已完成，但旧备份链清理中止: %w", err)
+			}
 		} else if !remoteEnabled {
 			cleanOldBackups(backupDir, keepCount, siteID)
 		}
@@ -207,20 +241,177 @@ func executeFileBackup(siteID int, mode string, keepCount int, scheduled bool) (
 	return logMsg, nil
 }
 
+func withFileBackupCommandTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithTimeout(ctx, fileBackupCommandTimeout)
+}
+
+// reserveFileBackupArchive atomically claims a unique filename before tar is
+// invoked. Nanoseconds, PID and a process-local sequence make collisions rare;
+// O_EXCL is the final cross-process guarantee and prevents overwriting an
+// existing backup even if clocks or process identifiers repeat.
+func reserveFileBackupArchive(backupDir, mode string, cutoff time.Time) (string, string, error) {
+	if mode != "full" && mode != "inc" {
+		return "", "", fmt.Errorf("文件备份模式无效")
+	}
+	for attempt := 0; attempt < 128; attempt++ {
+		sequence := fileBackupArchiveSequence.Add(1)
+		filename := fmt.Sprintf("file_%s_%s_p%d_%016x.tar.gz",
+			mode, cutoff.Format("20060102_150405.000000000"), os.Getpid(), sequence)
+		fullPath := filepath.Join(backupDir, filename)
+		file, err := os.OpenFile(fullPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err == nil {
+			if closeErr := file.Close(); closeErr != nil {
+				_ = os.Remove(fullPath)
+				return "", "", fmt.Errorf("预留文件备份路径失败: %w", closeErr)
+			}
+			return filename, fullPath, nil
+		}
+		if !os.IsExist(err) {
+			return "", "", fmt.Errorf("预留文件备份路径失败: %w", err)
+		}
+	}
+	return "", "", fmt.Errorf("无法生成唯一文件备份名称")
+}
+
+type fileBackupLock struct {
+	file   *os.File
+	closed bool
+}
+
+func (lock *fileBackupLock) Close() error {
+	if lock == nil || lock.file == nil || lock.closed {
+		return nil
+	}
+	lock.closed = true
+	unlockErr := releaseFileBackupKernelLock(lock.file)
+	closeErr := lock.file.Close()
+	if unlockErr != nil {
+		return unlockErr
+	}
+	return closeErr
+}
+
+func acquireFileBackupLock(ctx context.Context, lockPath string) (*fileBackupLock, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	lockDir := filepath.Dir(lockPath)
+	if err := os.MkdirAll(lockDir, 0700); err != nil {
+		return nil, fmt.Errorf("创建备份锁目录失败: %w", err)
+	}
+	info, err := os.Lstat(lockDir)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("备份锁目录身份无效")
+	}
+	if err := os.Chmod(lockDir, 0700); err != nil {
+		return nil, fmt.Errorf("设置备份锁目录权限失败: %w", err)
+	}
+	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("打开备份锁失败: %w", err)
+	}
+	if err := file.Chmod(0600); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("设置备份锁权限失败: %w", err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, fileBackupLockWaitTimeout)
+	defer cancel()
+	for {
+		locked, lockErr := tryFileBackupKernelLock(file)
+		if lockErr != nil {
+			_ = file.Close()
+			return nil, fmt.Errorf("获取备份锁失败: %w", lockErr)
+		}
+		if locked {
+			return &fileBackupLock{file: file}, nil
+		}
+
+		timer := time.NewTimer(fileBackupLockRetry)
+		select {
+		case <-waitCtx.Done():
+			timer.Stop()
+			_ = file.Close()
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, fmt.Errorf("等待备份锁超时（有其他备份任务未完成），请稍后重试")
+		case <-timer.C:
+		}
+	}
+}
+
+func fileBackupContextError(ctx context.Context, operation string) error {
+	if ctx == nil || ctx.Err() == nil {
+		return nil
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("%s超时: %w", operation, ctx.Err())
+	}
+	return fmt.Errorf("%s已取消: %w", operation, ctx.Err())
+}
+
+func createFullFileArchiveContext(ctx context.Context, webRoot, target string, excludes []string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	args := []string{"-czf", target, "--warning=no-file-changed"}
+	args = append(args, excludes...)
+	args = append(args, "-C", filepath.Dir(webRoot), filepath.Base(webRoot))
+	cmd := exec.CommandContext(ctx, "tar", args...)
+	configureBackupCommandCancellation(cmd)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	_ = os.Remove(target)
+	if contextErr := fileBackupContextError(ctx, "全量备份"); contextErr != nil {
+		return contextErr
+	}
+	if len(out) == 0 {
+		return fmt.Errorf("全量备份失败: %v", err)
+	}
+	return fmt.Errorf("全量备份失败: %s", strings.TrimSpace(string(out)))
+}
+
 func createIncrementalFileArchive(uploadsDir, stampFile, target string) (bool, error) {
-	checkCmd := exec.Command("find", uploadsDir, "-newer", stampFile, "-type", "f")
+	return createIncrementalFileArchiveContext(context.Background(), uploadsDir, stampFile, target)
+}
+
+func createIncrementalFileArchiveContext(ctx context.Context, uploadsDir, stampFile, target string) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	checkCmd := exec.CommandContext(ctx, "find", uploadsDir, "-newer", stampFile, "-type", "f")
+	configureBackupCommandCancellation(checkCmd)
 	files, err := checkCmd.CombinedOutput()
 	if err != nil {
+		if contextErr := fileBackupContextError(ctx, "扫描增量文件"); contextErr != nil {
+			return false, contextErr
+		}
 		return false, fmt.Errorf("扫描增量文件失败: %s", strings.TrimSpace(string(files)))
+	}
+	if contextErr := fileBackupContextError(ctx, "扫描增量文件"); contextErr != nil {
+		return false, contextErr
 	}
 	if len(files) == 0 {
 		return false, nil
 	}
-	cmd := exec.Command("tar", "-czf", target, "--verbatim-files-from", "-T", "-")
+	cmd := exec.CommandContext(ctx, "tar", "-czf", target, "--verbatim-files-from", "-T", "-")
+	configureBackupCommandCancellation(cmd)
 	cmd.Stdin = bytes.NewReader(files)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		_ = os.Remove(target)
+		if contextErr := fileBackupContextError(ctx, "增量备份"); contextErr != nil {
+			return false, contextErr
+		}
 		if len(out) == 0 {
 			return false, fmt.Errorf("增量备份失败: %v", err)
 		}
@@ -230,12 +421,23 @@ func createIncrementalFileArchive(uploadsDir, stampFile, target string) (bool, e
 }
 
 func verifyFileBackupArchive(path string) error {
-	cmd := exec.Command("tar", "-tzf", path)
+	return verifyFileBackupArchiveContext(context.Background(), path)
+}
+
+func verifyFileBackupArchiveContext(ctx context.Context, path string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cmd := exec.CommandContext(ctx, "tar", "-tzf", path)
+	configureBackupCommandCancellation(cmd)
 	cmd.Stdout = io.Discard
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	if err != nil {
+		if contextErr := fileBackupContextError(ctx, "文件备份归档校验"); contextErr != nil {
+			return contextErr
+		}
 		return fmt.Errorf("文件备份归档校验失败: %s", strings.TrimSpace(stderr.String()))
 	}
 	return nil
@@ -292,21 +494,53 @@ func loadFileBackupChain(siteID int) []string {
 // cleanupSupersededFileBackupChain 仅清理新全量开始前冻结的旧链名单。远端删除成功后才删除
 // 本地文件和数据库记录；失败项保留，供后台维护重试。
 func cleanupSupersededFileBackupChain(siteID int, domain, backupDir string, oldChain []string) int {
-	return cleanupSupersededFileBackupChainWith(siteID, domain, backupDir, oldChain,
-		deleteRemoteBackupFile,
+	target, err := loadRemoteBackupTarget(context.Background())
+	if err != nil || !target.Enabled {
+		return 0
+	}
+	cleaned, _ := cleanupSupersededFileBackupChainContext(context.Background(), target, siteID, domain, backupDir, oldChain)
+	return cleaned
+}
+
+func cleanupSupersededFileBackupChainContext(ctx context.Context, target remoteBackupTarget, siteID int, domain, backupDir string, oldChain []string) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return cleanupSupersededFileBackupChainWithContext(ctx, siteID, domain, backupDir, oldChain,
+		func(deleteCtx context.Context, relPath string) error {
+			return deleteRemoteBackupFileFromTargetContext(deleteCtx, target, relPath)
+		},
 		func(path string) error { return os.Remove(path) },
 		func(siteID int, filename string) error {
-			_, err := database.GetDB().Exec(`DELETE FROM file_backups WHERE site_id=? AND filename=?`, siteID, filename)
+			_, err := database.GetDB().ExecContext(ctx, `DELETE FROM file_backups WHERE site_id=? AND filename=?`, siteID, filename)
 			return err
 		})
 }
 
+// cleanupSupersededFileBackupChainWith is retained for focused cleanup tests.
+// Production uses the context-aware variant above with a frozen remote target.
 func cleanupSupersededFileBackupChainWith(siteID int, domain, backupDir string, oldChain []string,
 	deleteRemote func(string) error, removeLocal func(string) error, deleteRecord func(int, string) error) int {
+	cleaned, _ := cleanupSupersededFileBackupChainWithContext(context.Background(), siteID, domain, backupDir, oldChain,
+		func(_ context.Context, relPath string) error { return deleteRemote(relPath) }, removeLocal, deleteRecord)
+	return cleaned
+}
+
+func cleanupSupersededFileBackupChainWithContext(ctx context.Context, siteID int, domain, backupDir string, oldChain []string,
+	deleteRemote func(context.Context, string) error, removeLocal func(string) error, deleteRecord func(int, string) error) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	cleaned := 0
 	for _, filename := range oldChain {
+		if err := ctx.Err(); err != nil {
+			return cleaned, err
+		}
 		relPath := domain + "/files/" + filename
-		if err := deleteRemote(relPath); err != nil {
+		if err := deleteRemote(ctx, relPath); err != nil {
+			if ctx.Err() != nil {
+				return cleaned, ctx.Err()
+			}
 			log.Printf("清理远程旧文件备份失败 [%s]: %v", relPath, err)
 			continue
 		}
@@ -316,12 +550,15 @@ func cleanupSupersededFileBackupChainWith(siteID int, domain, backupDir string, 
 			continue
 		}
 		if err := deleteRecord(siteID, filename); err != nil {
+			if ctx.Err() != nil {
+				return cleaned, ctx.Err()
+			}
 			log.Printf("清理旧文件备份记录失败 [%s]: %v", relPath, err)
 			continue
 		}
 		cleaned++
 	}
-	return cleaned
+	return cleaned, nil
 }
 
 func cleanOldBackups(dir string, keep int, siteID int) {
@@ -363,20 +600,33 @@ func cleanOldBackups(dir string, keep int, siteID int) {
 }
 
 func checkDiskSpace(backupDir string, minFree int64) bool {
-	out, err := exec.Command("df", "-B1", backupDir).Output()
+	ok, _ := checkDiskSpaceContext(context.Background(), backupDir, minFree)
+	return ok
+}
+
+func checkDiskSpaceContext(ctx context.Context, backupDir string, minFree int64) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cmd := exec.CommandContext(ctx, "df", "-B1", backupDir)
+	configureBackupCommandCancellation(cmd)
+	out, err := cmd.Output()
 	if err != nil {
-		return true // can't check, allow to proceed
+		if contextErr := fileBackupContextError(ctx, "检查备份磁盘空间"); contextErr != nil {
+			return false, contextErr
+		}
+		return true, nil // can't check, allow to proceed
 	}
 	lines := strings.Split(string(out), "\n")
 	if len(lines) < 2 {
-		return true
+		return true, nil
 	}
 	fields := strings.Fields(lines[1])
 	if len(fields) < 4 {
-		return true
+		return true, nil
 	}
 	free, _ := strconv.ParseInt(fields[3], 10, 64)
-	return free >= minFree
+	return free >= minFree, nil
 }
 
 // recordFileBackup 把生成的文件备份写入 file_backups 表，供备份总览页面展示。

@@ -188,6 +188,10 @@ func TestReleaseWorkflowSupplyChainBoundaries(t *testing.T) {
 		"refusing to replace published assets",
 		`if [[ "$RELEASE_TAG" == 'v2.0.1' ]]`,
 		"IMPORTANT for v2.0.0: do not use its built-in online updater",
+		"nine fixed v2.0.1 installer, panel-binary, and license-archive files",
+		`if [[ "$RELEASE_TAG" == 'v2.0.2' ]]`,
+		"IMPORTANT for v2.0.1: do not use the binary-only online updater",
+		"nine fixed v2.0.2 installer, panel-binary, and license-archive files",
 	} {
 		if !strings.Contains(workflow, required) {
 			t.Errorf("release workflow is missing required hardening control %q", required)

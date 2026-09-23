@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ import (
 )
 
 var syncMu sync.Mutex
+var fail2banSettingsApplyMu sync.Mutex
 var sshRecordActionPending atomic.Bool
 var manualAddNginxBan = AddNginxBan
 var manualRemoveNginxBan = RemoveNginxBan
@@ -527,22 +529,40 @@ func ReloadFail2ban() error {
 }
 
 func executeRefreshWhitelist(task *Task) TaskResult {
+	var result TaskResult
+	err := WithFail2banSettingsLock(func(apply func() error) error {
+		result = executeRefreshWhitelistLocked(task, apply)
+		return nil
+	})
+	if err != nil {
+		return TaskResult{Success: false, Message: err.Error()}
+	}
+	return result
+}
+
+func executeRefreshWhitelistLocked(task *Task, apply func() error) TaskResult {
 	var allIPs []string
 	var details []string
 	db := database.GetDB()
+	if db == nil {
+		return TaskResult{Success: false, Message: "刷新官方白名单失败: 数据库未初始化"}
+	}
+	updates := make(map[string]securitySettingUpdate)
+	var refreshedCloudflareIPs []string
 
 	if cfIPs, err := fetchCloudflareIPs(); err == nil {
 		allIPs = append(allIPs, cfIPs...)
 		details = append(details, fmt.Sprintf("Cloudflare: %d 条", len(cfIPs)))
-		cacheCloudflareRealIPRanges(cfIPs)
-		if err := DeployCloudflareRealIPConfig(cfIPs); err != nil {
-			details = append(details, "Cloudflare Real IP: 配置失败")
-		} else {
-			details = append(details, "Cloudflare Real IP: 已更新")
+		refreshedCloudflareIPs = append([]string(nil), cfIPs...)
+		updates["cloudflare_realip_ips"] = securitySettingUpdate{
+			value:       strings.Join(cfIPs, "\n"),
+			description: "Cloudflare 官方 IP 段缓存",
 		}
 	} else {
-		cfRaw := cachedCloudflareRealIPRanges()
-		cfIPs := strings.Fields(cfRaw)
+		cfIPs, cacheErr := readCachedSecurityIPRanges(db, "cloudflare_realip_ips")
+		if cacheErr != nil {
+			return TaskResult{Success: false, Message: fmt.Sprintf("读取 Cloudflare IP 段缓存失败: %v", cacheErr)}
+		}
 		allIPs = append(allIPs, cfIPs...)
 		details = append(details, fmt.Sprintf("Cloudflare: 获取失败，沿用缓存 %d 条", len(cfIPs)))
 	}
@@ -550,14 +570,17 @@ func executeRefreshWhitelist(task *Task) TaskResult {
 	if googleErr == nil {
 		allIPs = append(allIPs, googleIPs...)
 		details = append(details, fmt.Sprintf("Googlebot: %d 条（%s）", len(googleIPs), googlebotSourceLabel(googleSource)))
-		cacheSearchBotIPRanges("googlebot_ips", googleIPs)
-		upsertSecuritySetting("googlebot_ips_source", googleSource, "Googlebot IP段当前来源")
-		upsertSecuritySetting("googlebot_ips_last_success_at", time.Now().UTC().Format("2006-01-02 15:04:05"), "Googlebot IP段最近成功更新时间")
-		upsertSecuritySetting("googlebot_ips_last_error", "", "Googlebot IP段最近刷新错误")
+		updates["googlebot_ips"] = securitySettingUpdate{value: strings.Join(googleIPs, "\n"), description: "googlebot_ips 官方 IP 段缓存"}
+		updates["googlebot_ips_source"] = securitySettingUpdate{value: googleSource, description: "Googlebot IP 段当前来源"}
+		updates["googlebot_ips_last_success_at"] = securitySettingUpdate{value: time.Now().UTC().Format("2006-01-02 15:04:05"), description: "Googlebot IP 段最近成功更新时间"}
+		updates["googlebot_ips_last_error"] = securitySettingUpdate{value: "", description: "Googlebot IP 段最近刷新错误"}
 	} else {
-		cached := cachedSecurityIPRanges("googlebot_ips")
+		cached, cacheErr := readCachedSecurityIPRanges(db, "googlebot_ips")
+		if cacheErr != nil {
+			return TaskResult{Success: false, Message: fmt.Sprintf("读取 Googlebot IP 段缓存失败: %v", cacheErr)}
+		}
 		allIPs = append(allIPs, cached...)
-		upsertSecuritySetting("googlebot_ips_last_error", googleErr.Error(), "Googlebot IP段最近刷新错误")
+		updates["googlebot_ips_last_error"] = securitySettingUpdate{value: googleErr.Error(), description: "Googlebot IP 段最近刷新错误"}
 		if len(cached) > 0 {
 			details = append(details, fmt.Sprintf("Googlebot: 官方与中转均失败，沿用缓存 %d 条", len(cached)))
 		} else {
@@ -567,18 +590,37 @@ func executeRefreshWhitelist(task *Task) TaskResult {
 	if bingIPs, err := fetchBingbotIPs(); err == nil {
 		allIPs = append(allIPs, bingIPs...)
 		details = append(details, fmt.Sprintf("Bingbot: %d 条", len(bingIPs)))
-		cacheSearchBotIPRanges("bingbot_ips", bingIPs)
+		updates["bingbot_ips"] = securitySettingUpdate{value: strings.Join(bingIPs, "\n"), description: "bingbot_ips 官方 IP 段缓存"}
 	} else {
-		cached := cachedSecurityIPRanges("bingbot_ips")
+		cached, cacheErr := readCachedSecurityIPRanges(db, "bingbot_ips")
+		if cacheErr != nil {
+			return TaskResult{Success: false, Message: fmt.Sprintf("读取 Bingbot IP 段缓存失败: %v", cacheErr)}
+		}
 		allIPs = append(allIPs, cached...)
 		details = append(details, fmt.Sprintf("Bingbot: 获取失败，沿用缓存 %d 条", len(cached)))
 	}
 
-	db.Exec(`UPDATE security_settings SET svalue = ?, updated_at = CURRENT_TIMESTAMP WHERE skey = 'official_whitelist_ips'`,
-		strings.Join(uniqueStrings(allIPs), "\n"))
-	db.Exec(`UPDATE security_settings SET svalue = datetime('now'), updated_at = CURRENT_TIMESTAMP WHERE skey = 'last_whitelist_update'`)
+	updates["official_whitelist_ips"] = securitySettingUpdate{
+		value:       strings.Join(uniqueStrings(allIPs), "\n"),
+		description: "自动获取的官方 IP 白名单",
+	}
+	updates["last_whitelist_update"] = securitySettingUpdate{
+		value:       time.Now().UTC().Format("2006-01-02 15:04:05"),
+		description: "官方 IP 白名单最近更新时间",
+	}
+	if err := writeSecuritySettingUpdates(db, updates); err != nil {
+		return TaskResult{Success: false, Message: fmt.Sprintf("保存官方白名单缓存失败: %v", err)}
+	}
 
-	if err := ApplyFail2banSettings(); err != nil {
+	if len(refreshedCloudflareIPs) > 0 {
+		if err := DeployCloudflareRealIPConfig(refreshedCloudflareIPs); err != nil {
+			details = append(details, "Cloudflare Real IP: 配置失败")
+		} else {
+			details = append(details, "Cloudflare Real IP: 已更新")
+		}
+	}
+
+	if err := apply(); err != nil {
 		return TaskResult{Success: false, Message: err.Error()}
 	}
 
@@ -607,53 +649,104 @@ func googlebotSourceLabel(source string) string {
 	return "Google 官方"
 }
 
-func upsertSecuritySetting(key, value, description string) {
-	if database.GetDB() == nil {
-		return
-	}
-	_, _ = database.GetDB().Exec(`INSERT INTO security_settings (skey, svalue, description, updated_at)
-		VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-		ON CONFLICT(skey) DO UPDATE SET svalue = excluded.svalue, updated_at = excluded.updated_at`, key, value, description)
+type securitySettingUpdate struct {
+	value       string
+	description string
 }
 
-func cachedSecurityIPRanges(key string) []string {
-	if database.GetDB() == nil {
-		return nil
+func writeSecuritySettingUpdates(db *sql.DB, updates map[string]securitySettingUpdate) error {
+	if db == nil {
+		return errors.New("database is not initialized")
 	}
-	var raw string
-	_ = database.GetDB().QueryRow(`SELECT svalue FROM security_settings WHERE skey = ?`, key).Scan(&raw)
-	ips, _ := NormalizeOfficialIPRanges(raw)
-	return ips
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	keys := make([]string, 0, len(updates))
+	for key := range updates {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		update := updates[key]
+		if _, err := tx.Exec(`INSERT INTO security_settings (skey, svalue, description, updated_at)
+			VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+			ON CONFLICT(skey) DO UPDATE SET svalue = excluded.svalue, description = excluded.description, updated_at = excluded.updated_at`,
+			key, update.value, update.description); err != nil {
+			return fmt.Errorf("write security setting %q: %w", key, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit security setting updates: %w", err)
+	}
+	return nil
 }
 
-func cacheSearchBotIPRanges(key string, ips []string) {
-	if database.GetDB() == nil {
-		return
+func readCachedSecurityIPRanges(db *sql.DB, key string) ([]string, error) {
+	raw, err := readRequiredFail2banSetting(db, key)
+	if err != nil {
+		return nil, err
 	}
-	if key != "googlebot_ips" && key != "bingbot_ips" {
-		return
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
 	}
-	database.GetDB().Exec(`INSERT INTO security_settings (skey, svalue, description, updated_at)
-		VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-		ON CONFLICT(skey) DO UPDATE SET svalue = excluded.svalue, updated_at = excluded.updated_at`,
-		key, strings.Join(ips, "\n"), key+"官方IP段缓存")
+	ips, err := NormalizeOfficialIPRanges(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid cached ranges for %q: %w", key, err)
+	}
+	return ips, nil
+}
+
+// WithFail2banSettingsLock serializes every Fail2ban settings snapshot,
+// deployment, and rollback. The callback receives the lock-aware internal
+// apply function so callers can keep their database mutation and compensation
+// in the same critical section without recursively acquiring the mutex.
+func WithFail2banSettingsLock(fn func(apply func() error) error) error {
+	if fn == nil {
+		return errors.New("fail2ban settings callback is nil")
+	}
+	fail2banSettingsApplyMu.Lock()
+	defer fail2banSettingsApplyMu.Unlock()
+	return fn(applyFail2banSettingsLocked)
 }
 
 func ApplyFail2banSettings() error {
+	return WithFail2banSettingsLock(func(apply func() error) error {
+		return apply()
+	})
+}
+
+func applyFail2banSettingsLocked() error {
 	db := database.GetDB()
+	if db == nil {
+		return errors.New("apply Fail2ban settings: database is not initialized")
+	}
 
-	var officialIPs, customIPs, cdnRealIPIPs string
-	var maxRetry, findTime, sqliMaxRetry, sqliFindTime string
-	db.QueryRow(`SELECT svalue FROM security_settings WHERE skey = 'official_whitelist_ips'`).Scan(&officialIPs)
-	db.QueryRow(`SELECT svalue FROM security_settings WHERE skey = 'whitelist_ips'`).Scan(&customIPs)
-	cdnRealIPIPs = CombinedCDNRealIPRangesForFail2ban()
-	db.QueryRow(`SELECT svalue FROM security_settings WHERE skey = 'fail2ban_maxretry'`).Scan(&maxRetry)
-	db.QueryRow(`SELECT svalue FROM security_settings WHERE skey = 'fail2ban_findtime'`).Scan(&findTime)
-	db.QueryRow(`SELECT svalue FROM security_settings WHERE skey = 'wp_sqli_ban_threshold'`).Scan(&sqliMaxRetry)
-	db.QueryRow(`SELECT svalue FROM security_settings WHERE skey = 'wp_sqli_ban_window_seconds'`).Scan(&sqliFindTime)
+	settings := make(map[string]string)
+	for _, key := range []string{
+		"official_whitelist_ips",
+		"whitelist_ips",
+		"fail2ban_maxretry",
+		"fail2ban_findtime",
+		"wp_sqli_ban_threshold",
+		"wp_sqli_ban_window_seconds",
+		"auto_whitelist_enabled",
+	} {
+		value, err := readRequiredFail2banSetting(db, key)
+		if err != nil {
+			return err
+		}
+		settings[key] = value
+	}
+	cdnRealIPIPs, err := combinedCDNRealIPRangesForFail2ban(db)
+	if err != nil {
+		return err
+	}
 
-	baseIPs := strings.TrimSpace(officialIPs)
-	if customIPs != "" {
+	baseIPs := strings.TrimSpace(settings["official_whitelist_ips"])
+	if customIPs := settings["whitelist_ips"]; customIPs != "" {
 		if baseIPs != "" {
 			baseIPs += "\n"
 		}
@@ -667,17 +760,33 @@ func ApplyFail2banSettings() error {
 		webIPs += cdnRealIPIPs
 	}
 
-	mr := parseIntOr(maxRetry, 5)
-	ft := parseIntOr(findTime, 60)
+	mr, err := parseRequiredPositiveSetting("fail2ban_maxretry", settings["fail2ban_maxretry"])
+	if err != nil {
+		return err
+	}
+	ft, err := parseRequiredPositiveSetting("fail2ban_findtime", settings["fail2ban_findtime"])
+	if err != nil {
+		return err
+	}
+	sqliMR, err := parseRequiredPositiveSetting("wp_sqli_ban_threshold", settings["wp_sqli_ban_threshold"])
+	if err != nil {
+		return err
+	}
+	sqliFT, err := parseRequiredPositiveSetting("wp_sqli_ban_window_seconds", settings["wp_sqli_ban_window_seconds"])
+	if err != nil {
+		return err
+	}
+	autoEnabled := settings["auto_whitelist_enabled"]
+	if autoEnabled != "true" && autoEnabled != "false" {
+		return fmt.Errorf("invalid security setting %q: expected true or false", "auto_whitelist_enabled")
+	}
 	// The incremental ladder is intentionally fixed at 10m, 1h, 6h, 24h and 7d.
 	bt := 600
 
-	if err := deployFail2ban(webIPs, baseIPs, mr, ft, bt, parseIntOr(sqliMaxRetry, 5), parseIntOr(sqliFindTime, 600)); err != nil {
+	if err := deployFail2ban(webIPs, baseIPs, mr, ft, bt, sqliMR, sqliFT); err != nil {
 		return err
 	}
 
-	var autoEnabled string
-	db.QueryRow(`SELECT svalue FROM security_settings WHERE skey = 'auto_whitelist_enabled'`).Scan(&autoEnabled)
 	if autoEnabled == "false" {
 		executeCommand("systemctl", "stop", "yubwpanel-whitelist.timer")
 		executeCommand("systemctl", "disable", "yubwpanel-whitelist.timer")
@@ -685,6 +794,85 @@ func ApplyFail2banSettings() error {
 		DeployWhitelistTimer()
 	}
 	return nil
+}
+
+func readRequiredFail2banSetting(db *sql.DB, key string) (string, error) {
+	if db == nil {
+		return "", errors.New("read security setting: database is not initialized")
+	}
+	var value string
+	if err := db.QueryRow(`SELECT svalue FROM security_settings WHERE skey = ?`, key).Scan(&value); err != nil {
+		return "", fmt.Errorf("read required security setting %q: %w", key, err)
+	}
+	return value, nil
+}
+
+func parseRequiredPositiveSetting(key, raw string) (int, error) {
+	value, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || value <= 0 {
+		return 0, fmt.Errorf("invalid security setting %q: expected a positive integer", key)
+	}
+	return value, nil
+}
+
+func combinedCDNRealIPRangesForFail2ban(db *sql.DB) (string, error) {
+	if db == nil {
+		return "", errors.New("read CDN real-IP ranges: database is not initialized")
+	}
+	rows, err := db.Query(`SELECT DISTINCT g.id, g.provider, g.ip_ranges
+		FROM cdn_realip_groups g
+		INNER JOIN website_cdn_realip_groups wg ON wg.group_id = g.id
+		INNER JOIN websites w ON w.id = wg.website_id
+		WHERE g.enabled = 1 AND w.cdn_realip_enabled = 1`)
+	if err != nil {
+		return "", fmt.Errorf("query CDN real-IP ranges for Fail2ban: %w", err)
+	}
+
+	type fail2banCDNGroup struct {
+		id       int
+		provider string
+		raw      string
+	}
+	var groups []fail2banCDNGroup
+	for rows.Next() {
+		var group fail2banCDNGroup
+		if err := rows.Scan(&group.id, &group.provider, &group.raw); err != nil {
+			_ = rows.Close()
+			return "", fmt.Errorf("scan CDN real-IP group for Fail2ban: %w", err)
+		}
+		groups = append(groups, group)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return "", fmt.Errorf("iterate CDN real-IP ranges for Fail2ban: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return "", fmt.Errorf("close CDN real-IP ranges query: %w", err)
+	}
+
+	seen := make(map[string]bool)
+	var merged []string
+	for _, group := range groups {
+		raw := group.raw
+		if group.provider == CDNProviderCloudflare && strings.TrimSpace(raw) == "" {
+			raw, err = readRequiredFail2banSetting(db, "cloudflare_realip_ips")
+			if err != nil {
+				return "", fmt.Errorf("read Cloudflare ranges for CDN group %d: %w", group.id, err)
+			}
+		}
+		ranges, err := NormalizeCDNRealIPRanges(raw)
+		if err != nil {
+			return "", fmt.Errorf("invalid CDN real-IP ranges for group %d: %w", group.id, err)
+		}
+		for _, item := range ranges {
+			if !seen[item] {
+				seen[item] = true
+				merged = append(merged, item)
+			}
+		}
+	}
+	sort.Strings(merged)
+	return strings.Join(merged, "\n"), nil
 }
 
 type fail2banJailIP struct{ jail, ip string }

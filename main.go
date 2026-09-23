@@ -50,7 +50,6 @@ type wpCoreUpdateWorkerFactory func(*config.Config) (wpCoreUpdateWorkerLifecycle
 
 func main() {
 	configPath := flag.String("config", "/www/server/panel/config.json", "配置文件路径")
-	resetPass := flag.String("passwd", "", "重置管理员密码（8位以上）")
 	resetAdmin := flag.Bool("reset-admin", false, "一键重置管理员账号密码")
 	refreshWhitelist := flag.Bool("refresh-whitelist", false, "手动触发白名单刷新")
 	unbanAll := flag.Bool("unban-all", false, "一键清空所有IP封禁记录")
@@ -189,7 +188,7 @@ func main() {
 		log.Fatalf("数据库升级失败: %v", err)
 	}
 	// CLI 短任务不是服务重启，不能收回另一个主进程管理的维护窗口。
-	if !*resetAdmin && *resetPass == "" && !*refreshWhitelist && !*unbanAll && *fileBackup == "" && !*runAutoBackup {
+	if !*resetAdmin && !*refreshWhitelist && !*unbanAll && *fileBackup == "" && !*runAutoBackup {
 		maintenanceCtx, stopMaintenance := context.WithCancel(context.Background())
 		defer stopMaintenance()
 		// Start 同步完成第一轮回锁，然后才启动周期检查；必须先于站点写入和 worker。
@@ -214,11 +213,6 @@ func main() {
 
 	if *resetAdmin {
 		resetAllAdmin(cfg, *configPath)
-		return
-	}
-
-	if *resetPass != "" {
-		resetAdminPassword(cfg, *resetPass)
 		return
 	}
 
@@ -622,45 +616,6 @@ func resetAllAdmin(cfg *config.Config, configPath string) {
 	fmt.Println("")
 	fmt.Println("正在重启面板...")
 	exec.Command("systemctl", "restart", "yub-wpanel").Run()
-}
-
-func resetAdminPassword(cfg *config.Config, newPass string) {
-	if len(newPass) < 8 {
-		fmt.Println("错误: 密码至少8位")
-		os.Exit(1)
-	}
-
-	hash, err := bcrypt.GenerateFromPassword([]byte(newPass), 12)
-	if err != nil {
-		fmt.Printf("错误: 密码加密失败: %v\n", err)
-		os.Exit(1)
-	}
-
-	db := database.GetDB()
-
-	var count int
-	db.QueryRow("SELECT COUNT(*) FROM admin_users").Scan(&count)
-
-	if count == 0 {
-		_, err = db.Exec(
-			"INSERT INTO admin_users (username, password_hash) VALUES (?, ?)",
-			cfg.Admin.Username, string(hash),
-		)
-	} else {
-		_, err = db.Exec(
-			"UPDATE admin_users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1",
-			string(hash),
-		)
-	}
-
-	if err != nil {
-		fmt.Printf("错误: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Printf("管理员密码已重置\n")
-	fmt.Printf("  用户名: %s\n", cfg.Admin.Username)
-	fmt.Printf("  新密码: %s\n", newPass)
 }
 
 func randomString(n int) string {

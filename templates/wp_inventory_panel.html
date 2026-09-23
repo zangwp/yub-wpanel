@@ -798,6 +798,11 @@ function wpInventoryPanel() {
             } catch (error) {
                 if (generation !== this.requestGeneration || siteID !== this.siteID) return;
                 this.pages.backups.error = error.message || t('wp_update_backup.restore_status_failed');
+                if ([404, 410].includes(error.status)) {
+                    this.stopBackupRestorePolling();
+                    this.pages.backups.restoringID = null;
+                    return;
+                }
                 this.backupRestoreTimer = setTimeout(() => {
                     this.backupRestoreTimer = null;
                     this.pollUpdateBackupRestore(taskID, generation, siteID);

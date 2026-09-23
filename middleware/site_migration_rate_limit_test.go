@@ -12,7 +12,7 @@ func TestSiteMigrationFailureLimitBlocksAfterTwentyUnauthorizedResponses(t *test
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.Use(SiteMigrationFailureLimit())
-	router.POST("/machine", func(c *gin.Context) { c.Status(http.StatusUnauthorized) })
+	router.POST(siteMigrationAPIPath+"/machine", func(c *gin.Context) { c.Status(http.StatusUnauthorized) })
 
 	for i := 0; i < siteMigrationFailureLimit; i++ {
 		if status := performMigrationLimitRequest(router); status != http.StatusUnauthorized {
@@ -29,7 +29,7 @@ func TestSiteMigrationFailureLimitSuccessClearsFailures(t *testing.T) {
 	succeed := false
 	router := gin.New()
 	router.Use(SiteMigrationFailureLimit())
-	router.POST("/machine", func(c *gin.Context) {
+	router.POST(siteMigrationAPIPath+"/machine", func(c *gin.Context) {
 		if succeed {
 			c.Status(http.StatusOK)
 			return
@@ -50,8 +50,37 @@ func TestSiteMigrationFailureLimitSuccessClearsFailures(t *testing.T) {
 	}
 }
 
+func TestSiteMigrationFailureLimitClosesBlockedSlowBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(SiteMigrationFailureLimit())
+	router.POST(siteMigrationAPIPath+"/machine", func(c *gin.Context) { c.Status(http.StatusUnauthorized) })
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	for i := 0; i < siteMigrationFailureLimit; i++ {
+		request, err := http.NewRequest(http.MethodPost, server.URL+siteMigrationAPIPath+"/machine", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := server.Client().Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("failure %d status=%d", i+1, response.StatusCode)
+		}
+	}
+
+	status, closed := performPartialChunkedMigrationRequest(t, server, siteMigrationAPIPath+"/machine")
+	if status != http.StatusTooManyRequests || !closed {
+		t.Fatalf("status=%d connection_closed=%t", status, closed)
+	}
+}
+
 func performMigrationLimitRequest(handler http.Handler) int {
-	req := httptest.NewRequest(http.MethodPost, "/machine", nil)
+	req := httptest.NewRequest(http.MethodPost, siteMigrationAPIPath+"/machine", nil)
 	req.RemoteAddr = "203.0.113.25:12345"
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)

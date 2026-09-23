@@ -24,6 +24,17 @@ type fakeSiteMigrationWorkflow struct {
 	called bool
 }
 
+type siteMigrationTimeoutError struct{}
+
+func (siteMigrationTimeoutError) Error() string   { return "i/o timeout" }
+func (siteMigrationTimeoutError) Timeout() bool   { return true }
+func (siteMigrationTimeoutError) Temporary() bool { return true }
+
+type siteMigrationTimeoutBody struct{}
+
+func (siteMigrationTimeoutBody) Read([]byte) (int, error) { return 0, siteMigrationTimeoutError{} }
+func (siteMigrationTimeoutBody) Close() error             { return nil }
+
 func (f *fakeSiteMigrationWorkflow) Start(_ context.Context, peerID, batchID, requestedBy string, siteIDs []int64) (*executor.SiteMigrationBatchPlanResult, error) {
 	if peerID != "peer_00000000001" || batchID != "batch_0000000001" || requestedBy != "admin" || len(siteIDs) != 1 || siteIDs[0] != 7 {
 		return nil, errors.New("unexpected start request")
@@ -55,6 +66,21 @@ func TestSiteMigrationStartHandlerUsesAuthenticatedOperatorAndStrictJSON(t *test
 	router.ServeHTTP(badRecorder, bad)
 	if badRecorder.Code != http.StatusBadRequest {
 		t.Fatalf("unknown field status=%d", badRecorder.Code)
+	}
+}
+
+func TestSiteMigrationJSONReadTimeoutReturnsRequestTimeout(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := &SiteMigrationHandler{}
+	router := gin.New()
+	router.POST("/estimate", handler.Estimate)
+	req := httptest.NewRequest(http.MethodPost, "/estimate", nil)
+	req.Body = siteMigrationTimeoutBody{}
+	req.ContentLength = -1
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusRequestTimeout {
+		t.Fatalf("timeout status=%d, want %d; body=%s", recorder.Code, http.StatusRequestTimeout, recorder.Body.String())
 	}
 }
 

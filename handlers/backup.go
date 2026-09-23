@@ -96,7 +96,10 @@ func (h *BackupHandler) Create(c *gin.Context) {
 		return
 	}
 	payload := &executor.CreateBackupPayload{Site: site, Auto: false}
-	task := executor.GlobalQueue.Enqueue(executor.TaskCreateBackup, payload)
+	task, ok := enqueueTask(c, executor.TaskCreateBackup, payload)
+	if !ok {
+		return
+	}
 	result := <-task.ResultCh
 	if result.Success {
 		c.JSON(http.StatusOK, models.SuccessResponse(gin.H{"message": result.Message}))
@@ -208,7 +211,10 @@ func (h *BackupHandler) Restore(c *gin.Context) {
 	}
 
 	payload := &executor.RestoreBackupPayload{Site: site, Filename: filename}
-	task := executor.GlobalQueue.Enqueue(executor.TaskRestoreBackup, payload)
+	task, queued := enqueueTask(c, executor.TaskRestoreBackup, payload)
+	if !queued {
+		return
+	}
 	c.JSON(http.StatusOK, models.SuccessResponse(gin.H{
 		"async":   true,
 		"message": "数据库恢复任务已开始",
@@ -253,7 +259,11 @@ func (h *BackupHandler) UploadRestore(c *gin.Context) {
 	}
 
 	payload := &executor.RestoreBackupPayload{Site: site, FilePath: tmpPath, RemoveFileAfter: true}
-	task := executor.GlobalQueue.Enqueue(executor.TaskRestoreBackup, payload)
+	task, queued := enqueueTask(c, executor.TaskRestoreBackup, payload)
+	if !queued {
+		os.Remove(tmpPath)
+		return
+	}
 	c.JSON(http.StatusOK, models.SuccessResponse(gin.H{
 		"async":   true,
 		"message": "数据库恢复任务已开始",
@@ -341,8 +351,7 @@ func (h *BackupHandler) RestoreStatus(c *gin.Context) {
 		c.JSON(http.StatusNotFound, models.ErrorResponse("恢复任务不存在"))
 		return
 	}
-	payload, ok := task.Payload.(*executor.RestoreBackupPayload)
-	if !ok || task.Type != executor.TaskRestoreBackup || payload.Site == nil || payload.Site.ID != site.ID {
+	if task.Type != executor.TaskRestoreBackup || task.SiteID != site.ID {
 		c.JSON(http.StatusNotFound, models.ErrorResponse("恢复任务不存在"))
 		return
 	}
@@ -389,14 +398,23 @@ func (h *BackupHandler) UpdateSettings(c *gin.Context) {
 	if req.KeepCount > 30 {
 		req.KeepCount = 30
 	}
+	// SaveBackupPolicy may need to compensate a failed Cron render from a
+	// snapshot of this same row. Serialize the legacy single-site endpoint so
+	// compensation can never overwrite a setting accepted concurrently.
+	cronMutationMu.Lock()
+	defer cronMutationMu.Unlock()
 	enabledVal := 0
 	if req.Enabled {
 		enabledVal = 1
 	}
 	db := database.GetDB()
-	db.Exec(`INSERT INTO backup_settings (site_id, enabled, keep_count) VALUES (?, ?, ?)
+	if _, err := db.Exec(`INSERT INTO backup_settings (site_id, enabled, keep_count) VALUES (?, ?, ?)
 		ON CONFLICT(site_id) DO UPDATE SET enabled = ?, keep_count = ?`,
-		id, enabledVal, req.KeepCount, enabledVal, req.KeepCount)
+		id, enabledVal, req.KeepCount, enabledVal, req.KeepCount); err != nil {
+		log.Printf("保存网站备份设置失败 site=%d: %v", id, err)
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse("设置保存失败"))
+		return
+	}
 	c.JSON(http.StatusOK, models.SuccessResponse(gin.H{"message": "设置已保存"}))
 }
 

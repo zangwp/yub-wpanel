@@ -2,15 +2,19 @@ package executor
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -19,19 +23,118 @@ import (
 )
 
 var cronLogFile = "/www/server/panel/logs/cron.log"
-var cronJobLockDir = "/run/lock"
 
-var errCronJobAlreadyRunning = errors.New("cron job is already running")
+const canonicalCronJobLockDir = "/run/yub-wpanel/cron-locks"
+
+var cronJobLockDir = canonicalCronJobLockDir
+
+// ErrCronJobAlreadyRunning reports that execution or mutation already owns a
+// job's non-blocking process lock.
+var ErrCronJobAlreadyRunning = errors.New("cron job is already running")
 
 var restartCronService = func() (string, error) {
 	return executeCommand("systemctl", "restart", "cron")
 }
 
+var executeCronFileBackup = executeFileBackupContext
+var syncCronParentDirectory = syncDirectory
+
+// cronRenderMu serializes every writer of the managed cron file, including
+// synchronous API mutations and the legacy internal render task.
+var cronRenderMu sync.Mutex
+
 const (
-	cronLogKeepLines  = 1000
-	managedCronHeader = "# YUB WPanel Cron Jobs — DO NOT EDIT MANUALLY"
-	managedCronPath   = "/etc/cron.d/yub_wpanel_cron"
+	cronLogKeepLines        = 1000
+	cronLogMaxBytes         = 4 << 20
+	cronOutputMaxBytes      = 64 << 10
+	cronJobExecutionTimeout = 10 * time.Minute
+	managedCronHeader       = "# YUB WPanel Cron Jobs — DO NOT EDIT MANUALLY"
+	managedCronPath         = "/etc/cron.d/yub_wpanel_cron"
 )
+
+const cronOutputTruncatedMarker = "\n[output truncated by YUB WPanel]\n"
+
+type boundedCronOutput struct {
+	mu        sync.Mutex
+	buf       bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func newBoundedCronOutput(limit int) *boundedCronOutput {
+	return &boundedCronOutput{limit: limit}
+}
+
+func (w *boundedCronOutput) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	written := len(p)
+	remaining := w.limit - w.buf.Len()
+	if remaining > 0 {
+		if len(p) > remaining {
+			p = p[:remaining]
+		}
+		_, _ = w.buf.Write(p)
+	}
+	if written > remaining {
+		w.truncated = true
+	}
+	return written, nil
+}
+
+func (w *boundedCronOutput) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.limit <= 0 {
+		return ""
+	}
+	data := w.buf.Bytes()
+	if !w.truncated {
+		return string(data)
+	}
+	marker := []byte(cronOutputTruncatedMarker)
+	if len(marker) >= w.limit {
+		return string(marker[:w.limit])
+	}
+	contentLen := w.limit - len(marker)
+	if len(data) < contentLen {
+		contentLen = len(data)
+	}
+	result := make([]byte, 0, contentLen+len(marker))
+	result = append(result, data[:contentLen]...)
+	result = append(result, marker...)
+	return string(result)
+}
+
+func boundCronOutput(value string) string {
+	if len(value) <= cronOutputMaxBytes {
+		return value
+	}
+	contentLen := cronOutputMaxBytes - len(cronOutputTruncatedMarker)
+	if contentLen < 0 {
+		contentLen = 0
+	}
+	return value[:contentLen] + cronOutputTruncatedMarker
+}
+
+func runCronCommand(ctx context.Context, binary string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, binary, args...)
+	configureCronCommandCancellation(cmd)
+	output := newBoundedCronOutput(cronOutputMaxBytes)
+	cmd.Stdout = output
+	cmd.Stderr = output
+	err := cmd.Run()
+	return output.String(), err
+}
+
+func cronExecutionTimeout(taskType string) time.Duration {
+	if taskType == "file_backup" {
+		return fileBackupCommandTimeout
+	}
+	return cronJobExecutionTimeout
+}
 
 // ReconcileInterruptedManualCronJobs releases claims owned by the main
 // process's in-memory queue. The scheduled Cron CLI never sets running, so a
@@ -66,7 +169,20 @@ func executeRenderCron(task *Task) TaskResult {
 	return renderCronConfig()
 }
 
+// RenderCronConfig synchronously reconciles the managed cron file. Callers
+// that already serialize their database mutations use this instead of waiting
+// behind unrelated long-running work in the global task queue.
+func RenderCronConfig() TaskResult {
+	return renderCronConfig()
+}
+
 func renderCronConfig() TaskResult {
+	cronRenderMu.Lock()
+	defer cronRenderMu.Unlock()
+	return renderCronConfigLocked()
+}
+
+func renderCronConfigLocked() TaskResult {
 	cfg := config.AppConfig
 	if cfg == nil {
 		return TaskResult{Success: false, Message: "配置未加载"}
@@ -80,26 +196,15 @@ func renderCronConfig() TaskResult {
 		log.Printf("查询Cron任务失败: %v", err)
 		return TaskResult{Success: false, Message: "查询Cron任务失败"}
 	}
-	defer rows.Close()
 
-	var cronLines []string
-	cronLines = append(cronLines, managedCronHeader)
-	cronLines = append(cronLines, "SHELL=/bin/bash")
-	cronLines = append(cronLines, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-	cronLines = append(cronLines, "")
-
-	for rows.Next() {
-		var id int
-		var name, cronExpr string
-		if err := rows.Scan(&id, &name, &cronExpr); err != nil {
-			continue
-		}
-		safeName := sanitizeCronArg(name)
-		line := fmt.Sprintf(`%s root /usr/local/bin/yub-wpanel --run-scheduled-cron=%d --config=/www/server/panel/config.json # %s`, cronExpr, id, safeName)
-		if !strings.HasSuffix(line, "\n") {
-			line += "\n"
-		}
-		cronLines = append(cronLines, line)
+	cronLines, err := managedCronLines(rows)
+	closeErr := rows.Close()
+	if err == nil && closeErr != nil {
+		err = fmt.Errorf("close Cron task rows: %w", closeErr)
+	}
+	if err != nil {
+		log.Printf("读取Cron任务失败: %v", err)
+		return TaskResult{Success: false, Message: "读取Cron任务失败，已保留原配置"}
 	}
 
 	cronContent := strings.Join(cronLines, "\n") + "\n"
@@ -115,6 +220,38 @@ func renderCronConfig() TaskResult {
 	}
 
 	return TaskResult{Success: true, Message: "Cron配置已更新"}
+}
+
+type managedCronRowReader interface {
+	Next() bool
+	Scan(dest ...any) error
+	Err() error
+}
+
+func managedCronLines(rows managedCronRowReader) ([]string, error) {
+	cronLines := []string{
+		managedCronHeader,
+		"SHELL=/bin/bash",
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"",
+	}
+	for rows.Next() {
+		var id int
+		var name, cronExpr string
+		if err := rows.Scan(&id, &name, &cronExpr); err != nil {
+			return nil, fmt.Errorf("scan Cron task: %w", err)
+		}
+		safeName := sanitizeCronArg(name)
+		line := fmt.Sprintf(`%s root /usr/local/bin/yub-wpanel --run-scheduled-cron=%d --config=/www/server/panel/config.json # %s`, cronExpr, id, safeName)
+		if !strings.HasSuffix(line, "\n") {
+			line += "\n"
+		}
+		cronLines = append(cronLines, line)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate Cron tasks: %w", err)
+	}
+	return cronLines, nil
 }
 
 // ValidateManagedCronFileIdentity accepts an absent target or the one exact
@@ -219,6 +356,9 @@ func writeManagedCronFile(path string, content []byte) (retErr error) {
 	if err := os.Rename(tmpPath, path); err != nil {
 		return fmt.Errorf("replace cron target: %w", err)
 	}
+	if err := syncCronParentDirectory(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("sync cron parent directory: %w", err)
+	}
 	if err := ValidateManagedCronFileIdentity(path); err != nil {
 		return fmt.Errorf("verify replaced cron target: %w", err)
 	}
@@ -235,7 +375,7 @@ func executeRunCron(task *Task) TaskResult {
 	defer database.GetDB().Exec(`UPDATE cron_jobs SET running=0 WHERE id=?`, payload.JobID)
 	lock, err := acquireCronJobExecutionLock(payload.JobID)
 	if err != nil {
-		if errors.Is(err, errCronJobAlreadyRunning) {
+		if errors.Is(err, ErrCronJobAlreadyRunning) {
 			return TaskResult{Success: false, Message: "任务正在执行中，请稍后再试"}
 		}
 		return TaskResult{Success: false, Message: "取得任务运行锁失败"}
@@ -335,7 +475,7 @@ func CronJobRuntimeSuspended(jobID int) (bool, string, string, error) {
 func RunScheduledCron(jobID int) TaskResult {
 	lock, err := acquireCronJobExecutionLock(jobID)
 	if err != nil {
-		if errors.Is(err, errCronJobAlreadyRunning) {
+		if errors.Is(err, ErrCronJobAlreadyRunning) {
 			appendCronMessage("SKIPPED", jobID, "任务仍在执行，本次自动触发已跳过")
 			return TaskResult{Success: true, Message: "任务仍在执行，本次自动触发已跳过"}
 		}
@@ -386,7 +526,7 @@ func runCronJob(jobID int, scheduled bool) TaskResult {
 
 	var out string
 	var execErr error
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), cronExecutionTimeout(job.taskType))
 	defer cancel()
 
 	if job.taskType == "file_backup" {
@@ -394,7 +534,7 @@ func runCronJob(jobID int, scheduled bool) TaskResult {
 			return TaskResult{Success: false, Message: "关联网站已不存在"}
 		}
 		var msg string
-		msg, execErr = executeFileBackup(int(job.siteID.Int64), job.backupMode, job.keepCount, scheduled)
+		msg, execErr = executeCronFileBackup(ctx, int(job.siteID.Int64), job.backupMode, job.keepCount, scheduled)
 		if errors.Is(execErr, errScheduledWorkNotAllowed) {
 			return TaskResult{Success: true, Message: "网站当前不允许运行自动任务，文件备份已跳过"}
 		}
@@ -405,17 +545,11 @@ func runCronJob(jobID int, scheduled bool) TaskResult {
 		}
 	} else if job.taskType == "wp_cron" {
 		url := "https://" + job.command + "/wp-cron.php?doing_wp_cron"
-		var outBytes []byte
-		outBytes, execErr = exec.CommandContext(ctx, "curl", "-k", "-s", "-o", "/dev/null", url).CombinedOutput()
-		out = string(outBytes)
+		out, execErr = runCronCommand(ctx, "curl", "-k", "-s", "-o", "/dev/null", url)
 	} else if job.runAsUser != "" {
-		var outBytes []byte
-		outBytes, execErr = exec.CommandContext(ctx, "runuser", "-u", job.runAsUser, "--", "bash", "-c", job.command).CombinedOutput()
-		out = string(outBytes)
+		out, execErr = runCronCommand(ctx, "runuser", "-u", job.runAsUser, "--", "bash", "-c", job.command)
 	} else {
-		var outBytes []byte
-		outBytes, execErr = exec.CommandContext(ctx, "bash", "-c", job.command).CombinedOutput()
-		out = string(outBytes)
+		out, execErr = runCronCommand(ctx, "bash", "-c", job.command)
 	}
 
 	status := "success"
@@ -425,6 +559,7 @@ func runCronJob(jobID int, scheduled bool) TaskResult {
 			out = execErr.Error()
 		}
 	}
+	out = boundCronOutput(out)
 
 	if scheduled {
 		_, _ = db.Exec(
@@ -478,24 +613,125 @@ type cronJobExecutionLock struct {
 	file *os.File
 }
 
+type cronJobMutationLocks struct {
+	locks []*cronJobExecutionLock
+	once  sync.Once
+	err   error
+}
+
+// AcquireCronJobMutationLocks prevents the selected jobs from starting while
+// a handler changes or removes their database rows. IDs are acquired in sorted
+// order so overlapping multi-job mutations have deterministic lock behavior.
+// Acquisition is deliberately non-blocking: an active job is reported to the
+// caller instead of making an HTTP mutation wait for a long-running backup.
+func AcquireCronJobMutationLocks(jobIDs []int) (io.Closer, error) {
+	unique := make(map[int]struct{}, len(jobIDs))
+	ids := make([]int, 0, len(jobIDs))
+	for _, id := range jobIDs {
+		if id <= 0 {
+			return nil, fmt.Errorf("invalid cron job ID %d", id)
+		}
+		if _, exists := unique[id]; exists {
+			continue
+		}
+		unique[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+
+	group := &cronJobMutationLocks{locks: make([]*cronJobExecutionLock, 0, len(ids))}
+	for _, id := range ids {
+		lock, err := acquireCronJobExecutionLock(id)
+		if err != nil {
+			return nil, errors.Join(err, group.Close())
+		}
+		group.locks = append(group.locks, lock)
+	}
+	return group, nil
+}
+
+func (l *cronJobMutationLocks) Close() error {
+	if l == nil {
+		return nil
+	}
+	l.once.Do(func() {
+		for i := len(l.locks) - 1; i >= 0; i-- {
+			l.err = errors.Join(l.err, l.locks[i].Close())
+		}
+		l.locks = nil
+	})
+	return l.err
+}
+
 func acquireCronJobExecutionLock(jobID int) (*cronJobExecutionLock, error) {
 	if jobID <= 0 {
 		return nil, errors.New("invalid cron job ID")
+	}
+	if err := ensureCronJobLockDirectory(cronJobLockDir); err != nil {
+		return nil, err
 	}
 	path := filepath.Join(cronJobLockDir, fmt.Sprintf("yub-wpanel-cron-%d.lock", jobID))
 	fd, err := syscall.Open(path, syscall.O_CREAT|syscall.O_RDWR|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0600)
 	if err != nil {
 		return nil, err
 	}
+	var stat syscall.Stat_t
+	if err := syscall.Fstat(fd, &stat); err != nil {
+		_ = syscall.Close(fd)
+		return nil, fmt.Errorf("inspect cron job lock: %w", err)
+	}
+	expectedUID := uint32(os.Geteuid())
+	if stat.Mode&syscall.S_IFMT != syscall.S_IFREG || stat.Uid != expectedUID || stat.Nlink != 1 || stat.Mode&0o777 != 0o600 {
+		_ = syscall.Close(fd)
+		return nil, errors.New("cron job lock file identity is unsafe")
+	}
 	file := os.NewFile(uintptr(fd), path)
 	if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		_ = file.Close()
 		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
-			return nil, errCronJobAlreadyRunning
+			return nil, ErrCronJobAlreadyRunning
 		}
 		return nil, err
 	}
 	return &cronJobExecutionLock{file: file}, nil
+}
+
+func ensureCronJobLockDirectory(path string) error {
+	path = filepath.Clean(strings.TrimSpace(path))
+	if path == "." || !filepath.IsAbs(path) {
+		return errors.New("cron job lock directory is not absolute")
+	}
+	expectedUID := uint32(os.Geteuid())
+	if path == canonicalCronJobLockDir {
+		if os.Geteuid() != 0 {
+			return errors.New("canonical cron job lock directory requires root")
+		}
+		if err := ensureOwnedPrivateDirectory(filepath.Dir(path), expectedUID); err != nil {
+			return fmt.Errorf("secure cron runtime directory: %w", err)
+		}
+	}
+	if err := ensureOwnedPrivateDirectory(path, expectedUID); err != nil {
+		return fmt.Errorf("secure cron job lock directory: %w", err)
+	}
+	return nil
+}
+
+func ensureOwnedPrivateDirectory(path string, expectedUID uint32) error {
+	if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || stat.Uid != expectedUID {
+		return errors.New("directory identity is unsafe")
+	}
+	if info.Mode().Perm() != 0o700 {
+		return fmt.Errorf("directory permissions are %o, want 700", info.Mode().Perm())
+	}
+	return nil
 }
 
 func (l *cronJobExecutionLock) Close() error {
@@ -507,18 +743,59 @@ func (l *cronJobExecutionLock) Close() error {
 }
 
 func pruneCronLog(path string, keep int) {
-	data, err := os.ReadFile(path)
+	if keep <= 0 {
+		return
+	}
+	f, err := os.Open(path)
 	if err != nil {
 		return
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return
+	}
+	readSize := info.Size()
+	if readSize > cronLogMaxBytes {
+		readSize = cronLogMaxBytes
+	}
+	offset := info.Size() - readSize
+	data := make([]byte, int(readSize))
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		_ = f.Close()
+		return
+	}
+	if _, err := io.ReadFull(f, data); err != nil {
+		_ = f.Close()
+		return
+	}
+	_ = f.Close()
+	if offset > 0 {
+		// The bounded tail normally begins in the middle of a log line. Drop that
+		// fragment so the rewritten log never presents partial output as a full
+		// event. If the oversized file has no newline in the retained tail, clear
+		// it rather than allocating memory proportional to the original file.
+		if newline := bytes.IndexByte(data, '\n'); newline >= 0 {
+			data = data[newline+1:]
+		} else {
+			data = nil
+		}
 	}
 	lines := strings.Split(string(data), "\n")
 	if len(lines) > 0 && lines[len(lines)-1] == "" {
 		lines = lines[:len(lines)-1]
 	}
-	if len(lines) <= keep {
+	if offset == 0 && len(lines) <= keep {
 		return
 	}
-	os.WriteFile(path, []byte(strings.Join(lines[len(lines)-keep:], "\n")+"\n"), 0644)
+	if len(lines) > keep {
+		lines = lines[len(lines)-keep:]
+	}
+	content := ""
+	if len(lines) > 0 {
+		content = strings.Join(lines, "\n") + "\n"
+	}
+	_ = os.WriteFile(path, []byte(content), 0644)
 }
 
 // sanitizeCronArg escapes shell metacharacters for use inside double quotes in bash.
