@@ -121,8 +121,10 @@ func TestReleaseWorkflowSupplyChainBoundaries(t *testing.T) {
 		"./yub-wpanel",
 		"./install.sh",
 		"./install-cn.sh",
+		"./bootstrap.sh",
 		"bash install.sh",
 		"bash install-cn.sh",
+		"bash bootstrap.sh",
 		"bash scripts/",
 	} {
 		if strings.Contains(signJob, forbidden) {
@@ -132,7 +134,7 @@ func TestReleaseWorkflowSupplyChainBoundaries(t *testing.T) {
 			t.Errorf("isolated release job may not execute repository code: found %q", forbidden)
 		}
 	}
-	shellExecutionPattern := regexp.MustCompile(`(?m)^\s*sh\s+(?:\./)?(?:install(?:-cn)?\.sh|scripts/)`)
+	shellExecutionPattern := regexp.MustCompile(`(?m)^\s*sh\s+(?:\./)?(?:install(?:-cn)?\.sh|bootstrap\.sh|scripts/)`)
 	for jobName, job := range map[string]string{"sign": signJob, "release": releaseJob} {
 		if shellExecutionPattern.MatchString(job) {
 			t.Errorf("isolated %s job may not execute repository shell scripts", jobName)
@@ -168,12 +170,15 @@ func TestReleaseWorkflowSupplyChainBoundaries(t *testing.T) {
 		"yub-wpanel-linux-arm64.sha256.sig",
 		"install.sh.sha256.sig",
 		"install-cn.sh.sha256.sig",
+		"bootstrap.sh.sha256.sig",
 		"yub-wpanel-third-party-licenses.tar.gz.sha256.sig",
 		`CGO_ENABLED=0 go list -deps -f '{{with .Module}}{{.Path}}|{{.Version}}|{{.Dir}}{{end}}' .`,
 		`required_go_version="$(awk '$1 == "toolchain" { print $2; exit }' go.mod)"`,
 		`test "$required_go_version" = 'go1.26.8'`,
 		`INSTALLER_RELEASE_VERSION=\"$version\"`,
 		`BOOTSTRAP_RELEASE_VERSION=\"$version\"`,
+		`BOOTSTRAP_DEFAULT_PREFER_CN=0`,
+		`sudo bash dist/bootstrap.sh --check-platform`,
 		`printf '%s\n' "$version" > "$license_root/RELEASE_VERSION"`,
 		`install -m 0644 "$go_root/LICENSE" "$license_root/go-toolchain/LICENSE"`,
 		"third_party/adminer-6.0.1/LICENSE-APACHE-2.0.txt",
@@ -187,7 +192,8 @@ func TestReleaseWorkflowSupplyChainBoundaries(t *testing.T) {
 		`test "$(uname -m)" = aarch64`,
 		`"$RUNNER_TEMP/yub-wpanel-arm64" --info --config "$preflight_dir/config.json"`,
 		`needs: [build, native-arm64]`,
-		`test "$(find . -mindepth 1 -maxdepth 1 | wc -l)" -eq 15`,
+		`test "$(find . -mindepth 1 -maxdepth 1 | wc -l)" -eq 12`,
+		`test "$(find . -mindepth 1 -maxdepth 1 | wc -l)" -eq 18`,
 		`gh api "/repos/$GH_REPO/git/ref/tags/$RELEASE_TAG"`,
 		`if [[ "$resolved_tag_commit" != "$RELEASE_COMMIT" ]]`,
 		"refusing to replace published assets",
@@ -199,6 +205,8 @@ func TestReleaseWorkflowSupplyChainBoundaries(t *testing.T) {
 		"nine fixed v2.0.2 installer, panel-binary, and license-archive files",
 		`if [[ "$RELEASE_TAG" == 'v2.1.0' ]]`,
 		"IMPORTANT for v2.0.2: its updater does not recognize architecture-qualified assets",
+		`if [[ "$RELEASE_TAG" == 'v2.1.1' ]]`,
+		"https://wpanel.zangyubin.top/install",
 	} {
 		if !strings.Contains(workflow, required) {
 			t.Errorf("release workflow is missing required hardening control %q", required)

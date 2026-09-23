@@ -3,9 +3,10 @@ set -e
 set -o pipefail
 
 # ============================================================
-# YUB WPanel 国内入口脚本
+# YUB WPanel 签名引导脚本
 # 主安装逻辑统一维护在 install.sh。
-# 这里仅启用国内优先策略，并从签名 Release 拉取主脚本。
+# install-cn.sh 默认启用国内优先策略；Release 同时从本文件生成
+# bootstrap.sh，并将默认策略切换为全球直连。
 # ============================================================
 
 RED='\033[0;31m'
@@ -14,6 +15,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 BOOTSTRAP_RELEASE_VERSION="__YUB_WPANEL_RELEASE_VERSION__"
+BOOTSTRAP_DEFAULT_PREFER_CN=1
 GITHUB_INSTALL_URL="https://github.com/zangwp/yub-wpanel/releases/download/${BOOTSTRAP_RELEASE_VERSION}/install.sh"
 CUSTOM_PROXY="${YUB_WPANEL_GITHUB_PROXY:-}"
 CUSTOM_PROXY="${CUSTOM_PROXY%/}"
@@ -21,6 +23,7 @@ RELEASE_PUBLIC_KEY_HEX="7351099720eeaf147f4894bc313a5456c01bbd29ad7d401ab6869bc7
 INSTALLER_ASSET_MAX_BYTES=$((4 * 1024 * 1024))
 CHECKSUM_ASSET_MAX_BYTES=$((4 * 1024))
 SIGNATURE_ASSET_MAX_BYTES=64
+BOOTSTRAP_CHECK_PLATFORM_ONLY=false
 RELEASE_PUBLIC_KEY_PEM='-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAc1EJlyDurxR/SJS8MTpUVsAbvSmtfUAatoabx/f5KvU=
 -----END PUBLIC KEY-----'
@@ -28,6 +31,12 @@ MCowBQYDK2VwAyEAc1EJlyDurxR/SJS8MTpUVsAbvSmtfUAatoabx/f5KvU=
 log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+
+for bootstrap_arg in "$@"; do
+    case "$bootstrap_arg" in
+        --check-platform) BOOTSTRAP_CHECK_PLATFORM_ONLY=true ;;
+    esac
+done
 
 assert_bootstrap_platform() {
     local os_id=""
@@ -64,10 +73,46 @@ assert_bootstrap_platform() {
         log_error "内核架构 ${machine} 与 dpkg 用户空间架构 ${dpkg_arch} 不一致，拒绝安装"
 }
 
-export YUB_WPANEL_PREFER_CN_MIRROR=1
+ensure_bootstrap_dependencies() {
+    local -a packages=()
+
+    command -v apt-get >/dev/null 2>&1 || log_error "缺少 apt-get；仅支持 Debian 13 或 Ubuntu 24.04 LTS"
+    if ! dpkg-query -W -f='${Status}' ca-certificates 2>/dev/null | grep -Fqx 'install ok installed'; then
+        packages+=(ca-certificates)
+    fi
+    command -v openssl >/dev/null 2>&1 || packages+=(openssl)
+    if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
+        packages+=(curl)
+    fi
+    command -v awk >/dev/null 2>&1 || packages+=(mawk)
+    command -v grep >/dev/null 2>&1 || packages+=(grep)
+    for required_cmd in chmod head install mktemp rm sha256sum stat timeout tr wc; do
+        command -v "$required_cmd" >/dev/null 2>&1 || {
+            packages+=(coreutils)
+            break
+        }
+    done
+    [[ "${#packages[@]}" -eq 0 ]] && return 0
+
+    log_info "正在安装引导程序依赖: ${packages[*]}"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends "${packages[@]}"
+}
+
+case "${YUB_WPANEL_PREFER_CN_MIRROR:-$BOOTSTRAP_DEFAULT_PREFER_CN}" in
+    1|true) export YUB_WPANEL_PREFER_CN_MIRROR=1 ;;
+    0|false) export YUB_WPANEL_PREFER_CN_MIRROR=0 ;;
+    *) log_error "YUB_WPANEL_PREFER_CN_MIRROR 只能是 0、1、true 或 false" ;;
+esac
 [[ "$BOOTSTRAP_RELEASE_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || \
     log_error "入口脚本缺少规范的固定 Release 版本；请使用已签名 GitHub Release 资产"
 assert_bootstrap_platform
+ensure_bootstrap_dependencies
+if [[ "$BOOTSTRAP_CHECK_PLATFORM_ONLY" == true ]]; then
+    log_info "YUB WPanel 引导程序平台检查通过"
+    exit 0
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
 
@@ -238,4 +283,8 @@ fi
 
 chmod 0700 "$INSTALL_SCRIPT"
 log_info "主安装脚本 Ed25519 签名与 SHA256 校验通过: $INSTALL_SCRIPT_SOURCE"
-bash "$INSTALL_SCRIPT" --prefer-cn "$@"
+if [[ "$YUB_WPANEL_PREFER_CN_MIRROR" == "1" ]]; then
+    bash "$INSTALL_SCRIPT" --prefer-cn "$@"
+else
+    bash "$INSTALL_SCRIPT" "$@"
+fi

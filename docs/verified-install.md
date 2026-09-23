@@ -1,8 +1,8 @@
 # 验签安装 / Verified installation
 
-YUB WPanel 的正式 Release 为 amd64/arm64 面板二进制、`install.sh`、`install-cn.sh` 和第三方许可归档分别提供 SHA-256 清单及 Ed25519 签名。生产服务器不要把可变分支上的脚本直接通过管道交给 root shell；应先验证安装器，再执行它。安装器随后还会用同一把公钥验证同版本、当前架构的面板二进制和许可归档，并把许可材料安装到 `/usr/share/doc/yub-wpanel`。
+YUB WPanel 的正式 Release 为 amd64/arm64 面板二进制、`bootstrap.sh`、`install.sh`、`install-cn.sh` 和第三方许可归档分别提供 SHA-256 清单及 Ed25519 签名。生产服务器不要把可变分支上的脚本直接通过管道交给 root shell；严格模式应先验证安装器，再执行它。安装器随后还会用同一把公钥验证同版本、当前架构的面板二进制和许可归档，并把许可材料安装到 `/usr/share/doc/yub-wpanel`。
 
-The official YUB WPanel release provides a SHA-256 manifest and Ed25519 signature for its amd64/arm64 panel binaries, `install.sh`, `install-cn.sh`, and the third-party license archive. On a production server, do not pipe a mutable branch script directly into a root shell. Verify the installer first; the installer then verifies the same-version binary for the current architecture and the license archive with the same public key.
+The official YUB WPanel release provides a SHA-256 manifest and Ed25519 signature for its amd64/arm64 panel binaries, `bootstrap.sh`, `install.sh`, `install-cn.sh`, and the third-party license archive. On a production server, do not pipe a mutable branch script directly into a root shell. In strict mode, verify the installer first; the installer then verifies the same-version binary for the current architecture and the license archive with the same public key.
 
 当前发布公钥原始值：
 
@@ -13,6 +13,16 @@ The official YUB WPanel release provides a SHA-256 manifest and Ed25519 signatur
 在信任该公钥之前，最好通过另一个独立渠道核对它。签名证明下载内容与该密钥一致，但不证明软件没有漏洞，也不覆盖 GitHub 自动生成的源码压缩包。签名本身也不提供“这是最新版本”的在线证明；使用第三方反代时还应核对 Release 版本。正式发布的安装器会要求面板二进制版本与安装器固定版本完全一致，并额外拒绝低于最低安全版本的二进制；许可归档也必须包含唯一、单行且完全相同的根级 `RELEASE_VERSION`，从而拒绝较旧但签名有效的许可归档。
 
 Cross-check this key through an independent channel before trusting it. A valid signature proves that the downloaded content matches this key; it does not prove that the software is vulnerability-free, and it does not cover GitHub-generated source archives. A signature alone is not an online freshness proof; when using a third-party proxy, also confirm the Release version. A released installer requires the panel binary version to exactly match its pinned version and additionally rejects binaries below the minimum security version. The license archive must also contain exactly one root-level, single-line `RELEASE_VERSION` equal to that pinned version, so an older but validly signed archive is rejected.
+
+## 快速入口 / Short entry
+
+首页短命令从 `wpanel.zangyubin.top` 获取固定到 `v2.1.1` 的引导脚本。Cloudflare Worker 会先验证该脚本的签名、哈希和内嵌版本，引导脚本再验证正式安装器。这比直接执行 GitHub `main` 更可靠，但首次执行仍信任域名、Cloudflare HTTPS、Worker 配置和内嵌公钥。要求在执行任何远程脚本前独立验签时，请使用下方标准安装方式。
+
+The homepage command fetches a `v2.1.1`-pinned bootstrap through `wpanel.zangyubin.top`. The Cloudflare Worker verifies its signature, digest, and embedded release identity before returning it, and the bootstrap then verifies the main installer. This is safer than executing GitHub `main`, but the first execution still trusts the domain, Cloudflare HTTPS, Worker configuration, and pinned public key. Use the standard procedure below when every remote script must be verified before execution.
+
+```bash
+bash <(curl -fsSL https://wpanel.zangyubin.top/install)
+```
 
 ## 标准安装 / Standard installation
 
@@ -29,7 +39,7 @@ apt-get install -y wget ca-certificates openssl
   trap 'rm -rf -- "$workdir"' EXIT
   cd "$workdir"
 
-  version='v2.1.0'
+  version='v2.1.1'
   base="https://github.com/zangwp/yub-wpanel/releases/download/$version"
   wget --no-config --https-only --no-hsts "$base/install.sh"
   wget --no-config --https-only --no-hsts "$base/install.sh.sha256"

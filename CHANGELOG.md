@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.1.1 — 2026-09-23
+
+- Added the signed `bootstrap.sh` Release asset used by the short `https://wpanel.zangyubin.top/install` entry point.
+- Made the bootstrap install missing download and verification prerequisites, pin the exact Release version, and verify `install.sh` with Ed25519 and SHA-256 before execution.
+- Kept `install-cn.sh` and the global bootstrap on one reviewed source path while generating different default mirror policies during the Release build, avoiding a second copy of the verification implementation.
+- Added an auditable Cloudflare Worker that verifies the bootstrap signature, checksum, filename, and embedded release identity before serving it from the custom domain.
+- Expanded the isolated Release signing workflow from 15 to 18 assets so the bootstrap, manifest, and signature pass through the same protected signing environment.
+
 ## v2.1.0 — 2026-09-23
 
 - Replaced the panel management command with `b` and an equivalent uppercase `B` entry point. Upgrades remove the managed legacy command after both new entry points are installed successfully, while refusing to overwrite unrelated files already occupying either one-character path.

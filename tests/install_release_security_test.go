@@ -82,7 +82,15 @@ func TestCNBootstrapOnlyExecutesSignedReleaseInstaller(t *testing.T) {
 	script := readInstallScript(t, installCNScriptPath)
 	for _, required := range []string{
 		`BOOTSTRAP_RELEASE_VERSION="__YUB_WPANEL_RELEASE_VERSION__"`,
+		`BOOTSTRAP_DEFAULT_PREFER_CN=1`,
+		`BOOTSTRAP_CHECK_PLATFORM_ONLY=false`,
+		`--check-platform) BOOTSTRAP_CHECK_PLATFORM_ONLY=true ;;`,
+		`YUB WPanel 引导程序平台检查通过`,
 		`https://github.com/zangwp/yub-wpanel/releases/download/${BOOTSTRAP_RELEASE_VERSION}/install.sh`,
+		`ensure_bootstrap_dependencies()`,
+		`apt-get install -y --no-install-recommends "${packages[@]}"`,
+		`export YUB_WPANEL_PREFER_CN_MIRROR=1`,
+		`export YUB_WPANEL_PREFER_CN_MIRROR=0`,
 		`download_install_script "${script_url}.sha256"`,
 		`download_install_script "${script_url}.sha256.sig"`,
 		`openssl pkeyutl -verify -pubin`,
@@ -102,6 +110,7 @@ func TestCNBootstrapOnlyExecutesSignedReleaseInstaller(t *testing.T) {
 		`download_install_script "$script_url" "$INSTALL_SCRIPT" "$INSTALLER_ASSET_MAX_BYTES"`,
 		`download_install_script "${script_url}.sha256" "$INSTALL_SHA256_FILE" "$CHECKSUM_ASSET_MAX_BYTES"`,
 		`download_install_script "${script_url}.sha256.sig" "$INSTALL_SIGNATURE_FILE" "$SIGNATURE_ASSET_MAX_BYTES"`,
+		`bash "$INSTALL_SCRIPT" "$@"`,
 	} {
 		if !strings.Contains(script, required) {
 			t.Errorf("install-cn.sh missing signed bootstrap guard %q", required)

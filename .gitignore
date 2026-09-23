@@ -43,6 +43,8 @@ setup.sh
 # Wrangler
 stats-worker/.wrangler/
 stats-worker/wrangler.toml
+deploy/cloudflare/.wrangler/
+.wrangler-tmp/
 
 # Scratch
 scratch/

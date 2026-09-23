@@ -15,29 +15,15 @@ If you want the Chinese project README, see [README.md](README.md).
 
 ## 🚀 Quick Installation
 
-> **Supported targets: Debian 13 (Trixie) and Ubuntu 24.04 LTS (Noble), on amd64 or arm64.** The block below verifies a fixed-version installer before executing it. It does not pipe a mutable branch into a shell.
-
-Enter a root shell first (for example, `sudo -i`), then paste the complete block:
+> **Supported targets: Debian 13 (Trixie) and Ubuntu 24.04 LTS (Noble), on amd64 or arm64.** Run as `root`:
 
 ```bash
-apt-get update
-apt-get install -y wget ca-certificates openssl
-(
-  set -euo pipefail
-  umask 077
-  workdir="$(mktemp -d /tmp/yub-wpanel-quick.XXXXXXXXXX)"
-  trap 'rm -rf -- "$workdir"' EXIT
-  cd "$workdir"
-  base='https://github.com/zangwp/yub-wpanel/releases/download/v2.1.0'
-  wget --no-config --https-only --no-hsts "$base/install.sh" "$base/install.sh.sha256" "$base/install.sh.sha256.sig"
-  printf '%s\n' '-----BEGIN PUBLIC KEY-----' 'MCowBQYDK2VwAyEAc1EJlyDurxR/SJS8MTpUVsAbvSmtfUAatoabx/f5KvU=' '-----END PUBLIC KEY-----' > release-public-key.pem
-  openssl pkeyutl -verify -pubin -inkey release-public-key.pem -rawin -in install.sh.sha256 -sigfile install.sh.sha256.sig
-  sha256sum --check --strict install.sh.sha256
-  bash install.sh
-)
+bash <(curl -fsSL https://wpanel.zangyubin.top/install)
 ```
 
-The installer detects the OS and CPU architecture, downloads the matching signed binary, and rejects unlisted platforms. See the **[verified installation guide](docs/verified-install.md)** for China-friendly and offline paths.
+The short domain is pinned to the `v2.1.1` Release. Its Cloudflare Worker verifies the Ed25519 signature and SHA-256 digest of `bootstrap.sh`; the bootstrap installs missing prerequisites, verifies the fixed-version `install.sh` again, and only then starts the installer. It never executes a mutable script from GitHub `main`.
+
+If `curl` is not installed, first run `apt-get update && apt-get install -y curl`. Use the **[complete verified installation guide](docs/verified-install.md)** when you need to verify every remote script before execution, or for China-friendly and offline installation paths.
 
 ## Positioning
 
@@ -341,8 +327,9 @@ Verify the China-friendly `install-cn.sh` release asset and configure an HTTPS G
 ├── templates/            # HTML templates
 ├── static/               # generated and embedded CSS / JS / logo
 ├── assets/               # branding, community artwork, and frontend source
+├── deploy/cloudflare/    # auditable Worker for the short install domain
 ├── install.sh            # one-click installer
-├── install-cn.sh         # China-friendly installer
+├── install-cn.sh         # shared signed-bootstrap source and China entry
 ├── tests/                # installer and cross-package constraint tests
 ├── security/             # security notes
 └── yub-wpanel-optimizer/   # bundled WordPress plugin

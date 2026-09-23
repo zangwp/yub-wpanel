@@ -1,0 +1,13 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+  "name": "yub-wpanel-entry",
+  "main": "wpanel-entry.js",
+  "compatibility_date": "2026-09-23",
+  "workers_dev": false,
+  "routes": [
+    {
+      "pattern": "wpanel.zangyubin.top",
+      "custom_domain": true
+    }
+  ]
+}

@@ -19,29 +19,15 @@ The full English project guide is available here: [README.en.md](README.en.md).
 
 ## 🚀 快速安装
 
-> **支持范围：Debian 13 (Trixie) / Ubuntu 24.04 LTS (Noble)，amd64 / arm64。** 下面是一段可整体复制的固定版本验签安装命令；它不会执行 GitHub `main` 分支上的可变脚本，也不会用 `curl | bash` 跳过校验。
-
-先进入 root shell（例如执行 `sudo -i`），再复制整段命令：
+> **支持范围：Debian 13 (Trixie) / Ubuntu 24.04 LTS (Noble)，amd64 / arm64。** 使用 `root` 用户执行：
 
 ```bash
-apt-get update
-apt-get install -y wget ca-certificates openssl
-(
-  set -euo pipefail
-  umask 077
-  workdir="$(mktemp -d /tmp/yub-wpanel-quick.XXXXXXXXXX)"
-  trap 'rm -rf -- "$workdir"' EXIT
-  cd "$workdir"
-  base='https://github.com/zangwp/yub-wpanel/releases/download/v2.1.0'
-  wget --no-config --https-only --no-hsts "$base/install.sh" "$base/install.sh.sha256" "$base/install.sh.sha256.sig"
-  printf '%s\n' '-----BEGIN PUBLIC KEY-----' 'MCowBQYDK2VwAyEAc1EJlyDurxR/SJS8MTpUVsAbvSmtfUAatoabx/f5KvU=' '-----END PUBLIC KEY-----' > release-public-key.pem
-  openssl pkeyutl -verify -pubin -inkey release-public-key.pem -rawin -in install.sh.sha256 -sigfile install.sh.sha256.sig
-  sha256sum --check --strict install.sh.sha256
-  bash install.sh
-)
+bash <(curl -fsSL https://wpanel.zangyubin.top/install)
 ```
 
-安装器会自动识别系统和 CPU 架构、下载对应的已签名二进制，并拒绝未列入支持范围的发行版或架构。国内网络与离线安装方式见 **[验签安装指南](docs/verified-install.md)**。
+短域名入口固定到 `v2.1.1` Release。Cloudflare Worker 会先验证 `bootstrap.sh` 的 Ed25519 签名和 SHA-256；引导脚本随后安装缺少的基础依赖，再次验签固定版本的 `install.sh`，最后才启动安装。它不会执行 GitHub `main` 分支上的可变脚本。
+
+系统尚未安装 `curl` 时，先执行 `apt-get update && apt-get install -y curl`。需要在执行任何远程脚本前自行验签，或进行国内网络、离线安装时，请使用 **[完整验签安装指南](docs/verified-install.md)**。
 
 ## 定位
 
@@ -300,8 +286,9 @@ systemctl start yub-wpanel
 ├── templates/            # HTML 模板
 ├── static/               # 已生成并嵌入的 CSS / JS / Logo
 ├── assets/               # 品牌、社区图片与前端源文件
+├── deploy/cloudflare/    # 短安装域名的可审计 Worker 配置
 ├── install.sh            # 一键安装脚本
-├── install-cn.sh         # 国内优化版安装脚本
+├── install-cn.sh         # 国内入口及 bootstrap.sh 的共享验签源
 ├── tests/                # 安装器与跨包约束测试
 ├── security/             # 安全说明文档
 └── yub-wpanel-optimizer/   # WordPress 配套插件

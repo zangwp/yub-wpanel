@@ -56,10 +56,17 @@ jobs:
           set -euo pipefail
           bash -n install.sh
           bash -n install-cn.sh
+          sed \
+            -e 's/^BOOTSTRAP_RELEASE_VERSION=.*/BOOTSTRAP_RELEASE_VERSION="v0.0.0"/' \
+            -e 's/^BOOTSTRAP_DEFAULT_PREFER_CN=.*/BOOTSTRAP_DEFAULT_PREFER_CN=0/' \
+            install-cn.sh > "$RUNNER_TEMP/bootstrap.sh"
+          bash -n "$RUNNER_TEMP/bootstrap.sh"
 
       - name: Validate installer on the native Ubuntu architecture
         shell: bash
-        run: sudo bash install.sh --check-platform
+        run: |
+          sudo bash install.sh --check-platform
+          sudo bash "$RUNNER_TEMP/bootstrap.sh" --check-platform
 
       - name: Validate installer on Debian 13 amd64
         if: matrix.arch == 'amd64'
