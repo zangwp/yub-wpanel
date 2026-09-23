@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -33,8 +34,16 @@ type overviewResponse struct {
 	Data    overviewData `json:"data"`
 }
 
+type noopCronMutationLocks struct{}
+
+func (noopCronMutationLocks) Close() error { return nil }
+
 func setupBackupOverviewTestDB(t *testing.T) {
 	t.Helper()
+	oldAcquireLocks := acquireCronJobMutationLocks
+	acquireCronJobMutationLocks = func([]int) (io.Closer, error) {
+		return noopCronMutationLocks{}, nil
+	}
 	oldDB := database.DB
 	if err := database.Open(filepath.Join(t.TempDir(), "panel.db")); err != nil {
 		t.Fatalf("open db: %v", err)
@@ -45,6 +54,7 @@ func setupBackupOverviewTestDB(t *testing.T) {
 	t.Cleanup(func() {
 		database.Close()
 		database.DB = oldDB
+		acquireCronJobMutationLocks = oldAcquireLocks
 	})
 }
 

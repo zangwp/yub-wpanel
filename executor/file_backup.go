@@ -22,13 +22,16 @@ import (
 var errScheduledWorkNotAllowed = errors.New("网站当前不允许运行自动任务")
 
 const (
-	fileBackupCommandTimeout  = 6 * time.Hour
-	fileBackupLockWaitTimeout = 2 * time.Hour
-	fileBackupLockRetry       = 250 * time.Millisecond
-	fileBackupLockPath        = "/run/yub-wpanel/file-backup.lock"
+	fileBackupCommandTimeout    = 6 * time.Hour
+	fileBackupLockWaitTimeout   = 2 * time.Hour
+	fileBackupLockRetry         = 250 * time.Millisecond
+	canonicalFileBackupLockPath = "/run/yub-wpanel/file-backup.lock"
 )
 
-var fileBackupArchiveSequence atomic.Uint64
+var (
+	fileBackupArchiveSequence atomic.Uint64
+	fileBackupLockPath        = canonicalFileBackupLockPath
+)
 
 func ExecuteFileBackup(siteID int, mode string, keepCount int) (string, error) {
 	return ExecuteFileBackupContext(context.Background(), siteID, mode, keepCount)

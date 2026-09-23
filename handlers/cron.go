@@ -31,7 +31,10 @@ type CronHandler struct{}
 // policy endpoint.
 var cronMutationMu sync.Mutex
 
-var renderManagedCron = executor.RenderCronConfig
+var (
+	renderManagedCron           = executor.RenderCronConfig
+	acquireCronJobMutationLocks = executor.AcquireCronJobMutationLocks
+)
 
 func renderCronForRequest(c *gin.Context, db *sql.DB, affectedWPCronSites []int, compensate func() error) bool {
 	result := renderManagedCron()
@@ -352,7 +355,7 @@ func (h *CronHandler) Update(c *gin.Context) {
 		c.JSON(http.StatusConflict, models.ErrorResponse("任务正在执行中，不能修改"))
 		return
 	}
-	mutationLocks, lockErr := executor.AcquireCronJobMutationLocks([]int{id})
+	mutationLocks, lockErr := acquireCronJobMutationLocks([]int{id})
 	if lockErr != nil {
 		if errors.Is(lockErr, executor.ErrCronJobAlreadyRunning) {
 			c.JSON(http.StatusConflict, models.ErrorResponse("任务正在执行中，不能修改"))
@@ -487,7 +490,7 @@ func (h *CronHandler) Delete(c *gin.Context) {
 		c.JSON(http.StatusConflict, models.ErrorResponse("任务正在执行中，不能删除"))
 		return
 	}
-	mutationLocks, lockErr := executor.AcquireCronJobMutationLocks([]int{id})
+	mutationLocks, lockErr := acquireCronJobMutationLocks([]int{id})
 	if lockErr != nil {
 		if errors.Is(lockErr, executor.ErrCronJobAlreadyRunning) {
 			c.JSON(http.StatusConflict, models.ErrorResponse("任务正在执行中，不能删除"))

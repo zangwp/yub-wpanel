@@ -121,7 +121,7 @@ func SaveBackupPolicy(c *gin.Context) {
 		c.JSON(http.StatusConflict, models.ErrorResponse("备份任务正在执行中，暂时不能修改策略"))
 		return
 	}
-	mutationLocks, err := executor.AcquireCronJobMutationLocks(jobIDs)
+	mutationLocks, err := acquireCronJobMutationLocks(jobIDs)
 	if err != nil {
 		if errors.Is(err, executor.ErrCronJobAlreadyRunning) {
 			c.JSON(http.StatusConflict, models.ErrorResponse("备份任务正在执行中，暂时不能修改策略"))

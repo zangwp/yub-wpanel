@@ -154,9 +154,7 @@ func TestManagedCronLinesFailsClosedOnRowErrors(t *testing.T) {
 
 func setupCronGateTest(t *testing.T) *sql.DB {
 	t.Helper()
-	oldLockDir := cronJobLockDir
-	cronJobLockDir = t.TempDir()
-	t.Cleanup(func() { cronJobLockDir = oldLockDir })
+	useTempCronJobLockDir(t)
 	oldLogFile := cronLogFile
 	cronLogFile = filepath.Join(t.TempDir(), "cron.log")
 	t.Cleanup(func() { cronLogFile = oldLogFile })
@@ -165,6 +163,18 @@ func setupCronGateTest(t *testing.T) *sql.DB {
 	db := database.GetDB()
 	mustExec(t, db, `UPDATE websites SET status='paused',system_user='wp_paused' WHERE id=1`)
 	return db
+}
+
+func useTempCronJobLockDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatalf("secure temporary cron lock directory: %v", err)
+	}
+	oldLockDir := cronJobLockDir
+	cronJobLockDir = dir
+	t.Cleanup(func() { cronJobLockDir = oldLockDir })
+	return dir
 }
 
 func TestRunScheduledCronSkipsPausedSiteWithoutChangingLastResult(t *testing.T) {
@@ -275,9 +285,7 @@ func TestRunScheduledCronSkipsWhenSameJobIsAlreadyRunning(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	oldLockDir := cronJobLockDir
-	cronJobLockDir = t.TempDir()
-	t.Cleanup(func() { cronJobLockDir = oldLockDir })
+	useTempCronJobLockDir(t)
 	lock, err := acquireCronJobExecutionLock(17)
 	if err != nil {
 		t.Fatal(err)
@@ -308,9 +316,7 @@ func TestManualCronUsesSameExecutionLockAsScheduledCron(t *testing.T) {
 		(id,name,cron_expression,command,task_type,site_id,enabled,running)
 		VALUES(19,'manual overlap','* * * * *','exit 99','command',1,1,1)`)
 
-	oldLockDir := cronJobLockDir
-	cronJobLockDir = t.TempDir()
-	t.Cleanup(func() { cronJobLockDir = oldLockDir })
+	useTempCronJobLockDir(t)
 	lock, err := acquireCronJobExecutionLock(19)
 	if err != nil {
 		t.Fatal(err)
@@ -331,9 +337,7 @@ func TestManualCronUsesSameExecutionLockAsScheduledCron(t *testing.T) {
 }
 
 func TestAcquireCronJobMutationLocksSortsDeduplicatesAndReleases(t *testing.T) {
-	oldLockDir := cronJobLockDir
-	cronJobLockDir = t.TempDir()
-	t.Cleanup(func() { cronJobLockDir = oldLockDir })
+	useTempCronJobLockDir(t)
 
 	locks, err := AcquireCronJobMutationLocks([]int{9, 3, 9, 5})
 	if err != nil {
@@ -369,9 +373,7 @@ func TestAcquireCronJobMutationLocksSortsDeduplicatesAndReleases(t *testing.T) {
 }
 
 func TestCronJobLockRejectsWorldAccessibleDirectory(t *testing.T) {
-	oldLockDir := cronJobLockDir
-	cronJobLockDir = t.TempDir()
-	t.Cleanup(func() { cronJobLockDir = oldLockDir })
+	useTempCronJobLockDir(t)
 	if err := os.Chmod(cronJobLockDir, 0777); err != nil {
 		t.Fatal(err)
 	}
@@ -381,9 +383,7 @@ func TestCronJobLockRejectsWorldAccessibleDirectory(t *testing.T) {
 }
 
 func TestCronJobLockRejectsPrecreatedUnsafeFile(t *testing.T) {
-	oldLockDir := cronJobLockDir
-	cronJobLockDir = t.TempDir()
-	t.Cleanup(func() { cronJobLockDir = oldLockDir })
+	useTempCronJobLockDir(t)
 	path := filepath.Join(cronJobLockDir, "yub-wpanel-cron-8.lock")
 	if err := os.WriteFile(path, nil, 0666); err != nil {
 		t.Fatal(err)
@@ -408,9 +408,7 @@ func TestScheduledCronDoesNotClearManualRunningClaim(t *testing.T) {
 	mustExec(t, db, `INSERT INTO cron_jobs
 		(id,name,cron_expression,command,task_type,site_id,enabled,running)
 		VALUES(20,'scheduled result','* * * * *','true','command',1,1,1)`)
-	oldLockDir := cronJobLockDir
-	cronJobLockDir = t.TempDir()
-	t.Cleanup(func() { cronJobLockDir = oldLockDir })
+	useTempCronJobLockDir(t)
 
 	result := RunScheduledCron(20)
 	if !result.Success {

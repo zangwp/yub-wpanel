@@ -209,10 +209,20 @@ func TestPutFileToS3UsesMultipartForLargeFiles(t *testing.T) {
 }
 
 func TestPutFileToS3StopsHTTPAtCallerDeadline(t *testing.T) {
+	requestStarted := make(chan struct{}, 1)
+	releaseHandler := make(chan struct{})
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		<-r.Context().Done()
+		requestStarted <- struct{}{}
+		select {
+		case <-r.Context().Done():
+		case <-releaseHandler:
+		}
 	}))
 	defer server.Close()
+	// An HTTP/1 server handler that performs no further reads or writes is not
+	// guaranteed to observe the peer disconnect immediately. Release it before
+	// httptest.Server.Close so a test failure cannot strand cleanup indefinitely.
+	defer close(releaseHandler)
 	withS3TestClient(t, server)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -221,6 +231,11 @@ func TestPutFileToS3StopsHTTPAtCallerDeadline(t *testing.T) {
 	err := putFileToS3(ctx, server.URL, "yub-wpanel-backups", "auto", "access-key_123", "secret", "yub-wpanel/site.tar.gz", seedS3TestFile(t, 1))
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("putFileToS3 error = %v, want context deadline", err)
+	}
+	select {
+	case <-requestStarted:
+	default:
+		t.Fatal("S3 upload did not reach the HTTP server")
 	}
 	if elapsed := time.Since(started); elapsed > 2*time.Second {
 		t.Fatalf("S3 HTTP upload ignored caller deadline: %s", elapsed)
@@ -308,13 +323,17 @@ func TestPutFileToS3RejectsEmbeddedCompleteErrorAndAborts(t *testing.T) {
 
 func TestPutFileToS3DeadlineStillAbortsMultipart(t *testing.T) {
 	abortContextLive := make(chan bool, 1)
+	releasePartHandler := make(chan struct{})
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.RawQuery == "uploads=":
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`<InitiateMultipartUploadResult><UploadId>upload-deadline</UploadId></InitiateMultipartUploadResult>`))
 		case r.Method == http.MethodPut && strings.Contains(r.URL.RawQuery, "partNumber="):
-			<-r.Context().Done()
+			select {
+			case <-r.Context().Done():
+			case <-releasePartHandler:
+			}
 		case r.Method == http.MethodDelete && r.URL.Query().Get("uploadId") == "upload-deadline":
 			abortContextLive <- r.Context().Err() == nil
 			w.WriteHeader(http.StatusNoContent)
@@ -324,6 +343,7 @@ func TestPutFileToS3DeadlineStillAbortsMultipart(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+	defer close(releasePartHandler)
 	withS3TestClient(t, server)
 	restore := withS3MultipartSettings(t, 1, 5*1024*1024)
 	defer restore()
@@ -452,10 +472,17 @@ func seedS3TestFile(t *testing.T, size int64) string {
 
 func TestRemoteHasFullFileBackupContextStopsS3ProbeAtCallerDeadline(t *testing.T) {
 	openTestDB(t)
+	requestStarted := make(chan struct{}, 1)
+	releaseHandler := make(chan struct{})
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		<-r.Context().Done()
+		requestStarted <- struct{}{}
+		select {
+		case <-r.Context().Done():
+		case <-releaseHandler:
+		}
 	}))
 	defer server.Close()
+	defer close(releaseHandler)
 	withS3TestClient(t, server)
 
 	db := database.GetDB()
@@ -472,6 +499,11 @@ func TestRemoteHasFullFileBackupContextStopsS3ProbeAtCallerDeadline(t *testing.T
 	_, err := RemoteHasFullFileBackupContext(ctx, "example.com")
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("RemoteHasFullFileBackupContext error = %v, want context deadline", err)
+	}
+	select {
+	case <-requestStarted:
+	default:
+		t.Fatal("S3 baseline probe did not reach the HTTP server")
 	}
 	if elapsed := time.Since(started); elapsed > 2*time.Second {
 		t.Fatalf("S3 baseline probe ignored caller deadline: %s", elapsed)

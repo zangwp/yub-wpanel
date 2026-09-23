@@ -178,6 +178,13 @@ func TestMaintainRemoteBackupsWithRebuildsOnlyWhenAllowed(t *testing.T) {
 
 func TestScheduledRemoteMaintenanceRebuildSkipsPausedSite(t *testing.T) {
 	setupCronGateTest(t)
+	lockDir := t.TempDir()
+	if err := os.Chmod(lockDir, 0o700); err != nil {
+		t.Fatalf("secure temporary file-backup lock directory: %v", err)
+	}
+	oldLockPath := fileBackupLockPath
+	fileBackupLockPath = filepath.Join(lockDir, "file-backup.lock")
+	t.Cleanup(func() { fileBackupLockPath = oldLockPath })
 
 	err := productionRemoteMaintenanceDeps(true).rebuild(1)
 	if !errors.Is(err, errScheduledWorkNotAllowed) {

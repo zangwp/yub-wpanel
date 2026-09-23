@@ -42,10 +42,10 @@ YUB WPanel also embeds or statically links these components:
 - Go 1.26.8 runtime and standard library — <https://go.dev/>
   - Copyright 2009 The Go Authors. All rights reserved.
 
-The release asset `yub-wpanel-third-party-licenses.tar.gz` contains this
-notice, the YUB WPanel Open Source License (`GPL-3.0-only`) and YUB WPanel project
-notice, the Apache-2.0
-license and attribution for the embedded Adminer 6.0.1 source, the exact
+The release asset `yub-wpanel-third-party-licenses.tar.gz` contains this notice,
+the YUB WPanel Open Source License (`GPL-3.0-only`), the YUB WPanel project notice,
+the Apache-2.0 license and attribution for the embedded Adminer 6.0.1 source,
+the exact
 LICENSE (and PATENTS file when present) from the Go toolchain used for the
 release, and the exact top-level license/notice files from every non-standard
 Go module linked into that release. Its root-level `RELEASE_VERSION` binds the

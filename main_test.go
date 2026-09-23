@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -34,14 +35,22 @@ func TestSiteMigrationMachineRoutePassesRealScanDefenseStack(t *testing.T) {
 	cfg.Panel.TLSCertPath = filepath.Join(t.TempDir(), "unused.crt")
 	engine := router.SetupRouter(cfg, TemplatesFS, StaticFS, "test-version", "")
 
-	request := httptest.NewRequest(http.MethodPost, "/api/site-migration/v1/pair/redeem", strings.NewReader(`{}`))
+	server := httptest.NewServer(engine)
+	t.Cleanup(server.Close)
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/api/site-migration/v1/pair/redeem", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("User-Agent", "Go-http-client/1.1")
-	request.RemoteAddr = "203.0.113.10:12345"
-	recorder := httptest.NewRecorder()
-	engine.ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusUnauthorized {
-		t.Fatalf("status=%d, want downstream pairing rejection %d", recorder.Code, http.StatusUnauthorized)
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, response.Body)
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status=%d, want downstream pairing rejection %d", response.StatusCode, http.StatusUnauthorized)
 	}
 	var bans int
 	if err := database.GetDB().QueryRow(`SELECT COUNT(*) FROM firewall_bans WHERE source_jail='panel_scan'`).Scan(&bans); err != nil {

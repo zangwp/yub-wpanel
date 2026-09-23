@@ -13,6 +13,12 @@ import (
 	"github.com/zangwp/yub-wpanel/database"
 )
 
+func TestCanonicalFileBackupLockPathUsesPrivateRuntimeDirectory(t *testing.T) {
+	if canonicalFileBackupLockPath != "/run/yub-wpanel/file-backup.lock" {
+		t.Fatalf("canonicalFileBackupLockPath=%q", canonicalFileBackupLockPath)
+	}
+}
+
 func TestFileBackupCommandsHonorCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
