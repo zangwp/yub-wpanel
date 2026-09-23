@@ -1,8 +1,9 @@
 /** @type {import('tailwindcss').Config} */
 module.exports = {
-  content: [
-    "./templates/**/*.html",
-  ],
+  content: {
+    relative: true,
+    files: ["../../templates/**/*.html"],
+  },
   theme: {
     borderRadius: {
       none: "0",

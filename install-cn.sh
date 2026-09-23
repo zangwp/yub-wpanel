@@ -32,6 +32,7 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 assert_bootstrap_platform() {
     local os_id=""
     local version_id=""
+    local codename=""
     local machine=""
     local dpkg_arch=""
     local required_cmd=""
@@ -40,19 +41,27 @@ assert_bootstrap_platform() {
     for required_cmd in dpkg head sed tr uname; do
         command -v "$required_cmd" >/dev/null 2>&1 || log_error "缺少平台检测命令: $required_cmd"
     done
-    [[ -r /etc/os-release ]] || log_error "无法读取 /etc/os-release；仅支持 Debian 13 amd64"
+    [[ -r /etc/os-release ]] || log_error "无法读取 /etc/os-release；仅支持 Debian 13 或 Ubuntu 24.04 LTS（amd64/arm64）"
     os_id=$(sed -n 's/^ID=//p' /etc/os-release | head -n 1 | tr -d '"')
     version_id=$(sed -n 's/^VERSION_ID=//p' /etc/os-release | head -n 1 | tr -d '"')
+    codename=$(sed -n 's/^VERSION_CODENAME=//p' /etc/os-release | head -n 1 | tr -d '"')
     machine=$(uname -m 2>/dev/null || true)
     dpkg_arch=$(dpkg --print-architecture 2>/dev/null || true)
-    [[ "$os_id" == "debian" ]] || log_error "此脚本仅支持 Debian 13，当前系统: ${os_id:-unknown}"
-    [[ "$version_id" == "13" ]] || log_error "此脚本仅支持 Debian 13，当前版本: ${version_id:-unknown}"
-    case "$machine" in
-        x86_64|amd64) ;;
-        *) log_error "当前只发布 amd64/x86_64 二进制，检测到架构: ${machine:-unknown}" ;;
+    case "${os_id}:${version_id}:${codename}" in
+        debian:13:trixie|ubuntu:24.04:noble) ;;
+        *) log_error "仅支持 Debian 13 (trixie) 或 Ubuntu 24.04 LTS (noble)，当前系统: ${os_id:-unknown} ${version_id:-unknown} ${codename:-unknown}" ;;
     esac
-    [[ "$dpkg_arch" == "amd64" ]] || \
-        log_error "当前只支持 Debian amd64 用户空间，检测到 dpkg 架构: ${dpkg_arch:-unknown}"
+    case "$machine" in
+        x86_64|amd64) machine="amd64" ;;
+        aarch64|arm64) machine="arm64" ;;
+        *) log_error "仅支持 amd64/x86_64 或 arm64/aarch64，检测到架构: ${machine:-unknown}" ;;
+    esac
+    case "$dpkg_arch" in
+        amd64|arm64) ;;
+        *) log_error "仅支持 amd64 或 arm64 用户空间，检测到 dpkg 架构: ${dpkg_arch:-unknown}" ;;
+    esac
+    [[ "$machine" == "$dpkg_arch" ]] || \
+        log_error "内核架构 ${machine} 与 dpkg 用户空间架构 ${dpkg_arch} 不一致，拒绝安装"
 }
 
 export YUB_WPANEL_PREFER_CN_MIRROR=1

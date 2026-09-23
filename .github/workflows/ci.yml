@@ -23,8 +23,16 @@ env:
 
 jobs:
   verify:
-    name: Test, vet, and build
-    runs-on: ubuntu-24.04
+    name: Test, vet, and build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
       - name: Check out source
@@ -48,6 +56,15 @@ jobs:
           set -euo pipefail
           bash -n install.sh
           bash -n install-cn.sh
+
+      - name: Validate installer on the native Ubuntu architecture
+        shell: bash
+        run: sudo bash install.sh --check-platform
+
+      - name: Validate installer on Debian 13 amd64
+        if: matrix.arch == 'amd64'
+        shell: bash
+        run: docker run --rm -v "$PWD:/src:ro" debian:13 bash /src/install.sh --check-platform
 
       - name: Download and verify Go modules
         shell: bash
@@ -80,4 +97,4 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          CGO_ENABLED=0 go build -trimpath -buildvcs=true ./
+          CGO_ENABLED=0 go build -trimpath -buildvcs=true -o "$RUNNER_TEMP/yub-wpanel-${{ matrix.arch }}" ./

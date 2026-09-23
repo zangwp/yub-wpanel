@@ -95,6 +95,7 @@ jobs:
           esac
 
           bash -n install.sh install-cn.sh
+          sudo bash install.sh --check-platform
 
           # These vendored browser assets are part of the reviewed Git commit.
           # Release builds must never replace them with live CDN downloads.
@@ -155,15 +156,16 @@ jobs:
           source_date_epoch="$(git show -s --format=%ct HEAD)"
           build_time="$(date --utc --date="@$source_date_epoch" '+%Y-%m-%dT%H:%M:%SZ')"
 
-          CGO_ENABLED=0 go build \
-            -trimpath \
-            -buildvcs=true \
-            -ldflags="-s -w -buildid= -X main.Version=$version -X main.BuildTime=$build_time" \
-            -o dist/yub-wpanel \
-            .
-
-          test -s dist/yub-wpanel
-          test "$(od -An -tx1 -N4 dist/yub-wpanel | tr -d ' \n')" = '7f454c46'
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build \
+              -trimpath \
+              -buildvcs=true \
+              -ldflags="-s -w -buildid= -X main.Version=$version -X main.BuildTime=$build_time" \
+              -o "dist/yub-wpanel-linux-$arch" \
+              .
+            test -s "dist/yub-wpanel-linux-$arch"
+            test "$(od -An -tx1 -N4 "dist/yub-wpanel-linux-$arch" | tr -d ' \n')" = '7f454c46'
+          done
 
           preflight_dir="$RUNNER_TEMP/yub-wpanel-release-preflight"
           install -d -m 0700 "$preflight_dir"
@@ -189,7 +191,7 @@ jobs:
           }
           EOF
           chmod 0600 "$preflight_dir/config.json"
-          ./dist/yub-wpanel --info --config "$preflight_dir/config.json" > "$preflight_dir/info.txt"
+          ./dist/yub-wpanel-linux-amd64 --info --config "$preflight_dir/config.json" > "$preflight_dir/info.txt"
           grep -Fq 'YUB WPanel' "$preflight_dir/info.txt"
           grep -Fq "版本: $version " "$preflight_dir/info.txt"
 
@@ -306,7 +308,8 @@ jobs:
 
           cd dist
           for asset in \
-            yub-wpanel \
+            yub-wpanel-linux-amd64 \
+            yub-wpanel-linux-arm64 \
             install.sh \
             install-cn.sh \
             yub-wpanel-third-party-licenses.tar.gz; do
@@ -320,8 +323,10 @@ jobs:
         with:
           name: unsigned-release-${{ env.RELEASE_COMMIT }}
           path: |
-            dist/yub-wpanel
-            dist/yub-wpanel.unsigned.sha256
+            dist/yub-wpanel-linux-amd64
+            dist/yub-wpanel-linux-amd64.unsigned.sha256
+            dist/yub-wpanel-linux-arm64
+            dist/yub-wpanel-linux-arm64.unsigned.sha256
             dist/install.sh
             dist/install.sh.unsigned.sha256
             dist/install-cn.sh
@@ -334,9 +339,68 @@ jobs:
           overwrite: false
           include-hidden-files: false
 
+  native-arm64:
+    name: Native ARM64 release verification
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      GOFLAGS: -mod=readonly
+      GOPROXY: https://proxy.golang.org
+      GOSUMDB: sum.golang.org
+      GOVCS: '*:off'
+      GOTOOLCHAIN: local
+    steps:
+      - name: Check out reviewed source
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.RELEASE_COMMIT }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Go
+        # actions/setup-go v7.0.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.26.8'
+          check-latest: false
+          cache: true
+
+      - name: Test and execute natively on ARM64
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          sudo bash install.sh --check-platform
+          go mod download
+          go mod verify
+          packages_file="$RUNNER_TEMP/release-arm64-packages"
+          go list ./... | grep -v '/scratch$' > "$packages_file"
+          mapfile -t packages < "$packages_file"
+          test "${#packages[@]}" -gt 0
+          go test -trimpath "${packages[@]}"
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=true -o "$RUNNER_TEMP/yub-wpanel-arm64" .
+          test -x "$RUNNER_TEMP/yub-wpanel-arm64"
+          preflight_dir="$RUNNER_TEMP/yub-wpanel-arm64-preflight"
+          install -d -m 0700 "$preflight_dir"
+          cat > "$preflight_dir/config.json" <<EOF
+          {
+            "panel": {"port": 8888, "tls_port": 8443, "random_suffix": "arm64-preflight", "data_dir": "$preflight_dir", "backup_dir": "$preflight_dir", "log_dir": "$preflight_dir"},
+            "sqlite": {"path": "$preflight_dir/preflight.db"},
+            "mariadb": {"root_password": "arm64-preflight-only"},
+            "admin": {"username": "preflight", "password_hash": "preflight"},
+            "paths": {"cron_file": "/etc/cron.d/yub_wpanel_cron"},
+            "systemd": {"service_name": "yub-wpanel", "service_path": "/etc/systemd/system/yub-wpanel.service", "binary_path": "/usr/local/bin/yub-wpanel"}
+          }
+          EOF
+          "$RUNNER_TEMP/yub-wpanel-arm64" --info --config "$preflight_dir/config.json" > "$preflight_dir/info.txt"
+          grep -Fq 'YUB WPanel' "$preflight_dir/info.txt"
+
   sign:
     name: Sign release assets
-    needs: build
+    needs: [build, native-arm64]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment:
@@ -360,9 +424,10 @@ jobs:
         working-directory: release-assets
         run: |
           set -euo pipefail
-          test "$(find . -mindepth 1 -maxdepth 1 | wc -l)" -eq 8
+          test "$(find . -mindepth 1 -maxdepth 1 | wc -l)" -eq 10
           for asset in \
-            yub-wpanel \
+            yub-wpanel-linux-amd64 \
+            yub-wpanel-linux-arm64 \
             install.sh \
             install-cn.sh \
             yub-wpanel-third-party-licenses.tar.gz; do
@@ -417,7 +482,8 @@ jobs:
           fi
 
           for checksum in \
-            yub-wpanel.sha256 \
+            yub-wpanel-linux-amd64.sha256 \
+            yub-wpanel-linux-arm64.sha256 \
             install.sh.sha256 \
             install-cn.sh.sha256 \
             yub-wpanel-third-party-licenses.tar.gz.sha256; do
@@ -438,9 +504,12 @@ jobs:
         with:
           name: signed-release-${{ env.RELEASE_COMMIT }}
           path: |
-            release-assets/yub-wpanel
-            release-assets/yub-wpanel.sha256
-            release-assets/yub-wpanel.sha256.sig
+            release-assets/yub-wpanel-linux-amd64
+            release-assets/yub-wpanel-linux-amd64.sha256
+            release-assets/yub-wpanel-linux-amd64.sha256.sig
+            release-assets/yub-wpanel-linux-arm64
+            release-assets/yub-wpanel-linux-arm64.sha256
+            release-assets/yub-wpanel-linux-arm64.sha256.sig
             release-assets/install.sh
             release-assets/install.sh.sha256
             release-assets/install.sh.sha256.sig
@@ -479,7 +548,7 @@ jobs:
         working-directory: release-assets
         run: |
           set -euo pipefail
-          test "$(find . -mindepth 1 -maxdepth 1 | wc -l)" -eq 12
+          test "$(find . -mindepth 1 -maxdepth 1 | wc -l)" -eq 15
 
           public_pem="$RUNNER_TEMP/release-signing-public.pem"
           cleanup() {
@@ -493,7 +562,8 @@ jobs:
             '-----END PUBLIC KEY-----' > "$public_pem"
           openssl pkey -pubin -in "$public_pem" -noout
           for asset in \
-            yub-wpanel \
+            yub-wpanel-linux-amd64 \
+            yub-wpanel-linux-arm64 \
             install.sh \
             install-cn.sh \
             yub-wpanel-third-party-licenses.tar.gz; do
@@ -521,7 +591,8 @@ jobs:
         run: |
           set -euo pipefail
           assets=(
-            yub-wpanel yub-wpanel.sha256 yub-wpanel.sha256.sig
+            yub-wpanel-linux-amd64 yub-wpanel-linux-amd64.sha256 yub-wpanel-linux-amd64.sha256.sig
+            yub-wpanel-linux-arm64 yub-wpanel-linux-arm64.sha256 yub-wpanel-linux-arm64.sha256.sig
             install.sh install.sh.sha256 install.sh.sha256.sig
             install-cn.sh install-cn.sh.sha256 install-cn.sh.sha256.sig
             yub-wpanel-third-party-licenses.tar.gz
@@ -575,6 +646,9 @@ jobs:
           fi
           if [[ "$RELEASE_TAG" == 'v2.0.2' ]]; then
             release_notes="IMPORTANT for v2.0.1: do not use the binary-only online updater for this upgrade because it will not synchronize /usr/share/doc/yub-wpanel. Download the nine fixed v2.0.2 installer, panel-binary, and license-archive files, verify all three bundles, then run install.sh and select repair. $release_notes"
+          fi
+          if [[ "$RELEASE_TAG" == 'v2.1.0' ]]; then
+            release_notes="Adds Debian 13 and Ubuntu 24.04 LTS support on amd64 and arm64, architecture-aware signed binaries, native ARM64 verification, and the b/B management command. IMPORTANT for v2.0.2: its updater does not recognize architecture-qualified assets; verify the fixed v2.1.0 installer, matching panel binary, and license archive, then run install.sh and select repair. $release_notes"
           fi
           gh release create "$RELEASE_TAG" "${assets[@]}" \
             --verify-tag \

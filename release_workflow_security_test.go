@@ -158,13 +158,14 @@ func TestReleaseWorkflowSupplyChainBoundaries(t *testing.T) {
 		`git merge-base --is-ancestor "$RELEASE_COMMIT" refs/remotes/origin/main`,
 		"bash -n install.sh install-cn.sh",
 		"go mod verify",
-		`./dist/yub-wpanel --info --config "$preflight_dir/config.json"`,
+		`./dist/yub-wpanel-linux-amd64 --info --config "$preflight_dir/config.json"`,
 		"sha256sum --check --strict",
 		"openssl pkeyutl -sign -rawin",
 		"openssl pkeyutl -verify -rawin -pubin",
 		"RELEASE_PUBLIC_KEY_HEX",
 		"RELEASE_PUBLIC_KEY_SPKI_B64",
-		"yub-wpanel.sha256.sig",
+		"yub-wpanel-linux-amd64.sha256.sig",
+		"yub-wpanel-linux-arm64.sha256.sig",
 		"install.sh.sha256.sig",
 		"install-cn.sh.sha256.sig",
 		"yub-wpanel-third-party-licenses.tar.gz.sha256.sig",
@@ -182,7 +183,11 @@ func TestReleaseWorkflowSupplyChainBoundaries(t *testing.T) {
 		`case "$module_dir_real" in`,
 		`"$gomodcache_real"/*) ;;`,
 		`No top-level license or notice found for $module_path@$module_version`,
-		`test "$(find . -mindepth 1 -maxdepth 1 | wc -l)" -eq 12`,
+		`runs-on: ubuntu-24.04-arm`,
+		`test "$(uname -m)" = aarch64`,
+		`"$RUNNER_TEMP/yub-wpanel-arm64" --info --config "$preflight_dir/config.json"`,
+		`needs: [build, native-arm64]`,
+		`test "$(find . -mindepth 1 -maxdepth 1 | wc -l)" -eq 15`,
 		`gh api "/repos/$GH_REPO/git/ref/tags/$RELEASE_TAG"`,
 		`if [[ "$resolved_tag_commit" != "$RELEASE_COMMIT" ]]`,
 		"refusing to replace published assets",
@@ -192,6 +197,8 @@ func TestReleaseWorkflowSupplyChainBoundaries(t *testing.T) {
 		`if [[ "$RELEASE_TAG" == 'v2.0.2' ]]`,
 		"IMPORTANT for v2.0.1: do not use the binary-only online updater",
 		"nine fixed v2.0.2 installer, panel-binary, and license-archive files",
+		`if [[ "$RELEASE_TAG" == 'v2.1.0' ]]`,
+		"IMPORTANT for v2.0.2: its updater does not recognize architecture-qualified assets",
 	} {
 		if !strings.Contains(workflow, required) {
 			t.Errorf("release workflow is missing required hardening control %q", required)
@@ -221,6 +228,16 @@ func TestCIWorkflowUsesExactPinnedGoToolchain(t *testing.T) {
 	}
 	if !strings.Contains(workflow, "GOTOOLCHAIN: local") {
 		t.Fatal("CI workflow must forbid implicit toolchain downloads")
+	}
+	for _, required := range []string{
+		"runner: ubuntu-24.04",
+		"runner: ubuntu-24.04-arm",
+		"sudo bash install.sh --check-platform",
+		`docker run --rm -v "$PWD:/src:ro" debian:13 bash /src/install.sh --check-platform`,
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Errorf("CI workflow is missing platform verification %q", required)
+		}
 	}
 }
 

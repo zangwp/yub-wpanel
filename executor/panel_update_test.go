@@ -391,6 +391,44 @@ func TestCanonicalStableTag(t *testing.T) {
 	}
 }
 
+func TestPanelReleaseAssetNameSupportsPublishedLinuxArchitectures(t *testing.T) {
+	for arch, want := range map[string]string{
+		"amd64": "yub-wpanel-linux-amd64",
+		"arm64": "yub-wpanel-linux-arm64",
+	} {
+		got, err := panelReleaseAssetName("linux", arch)
+		if err != nil {
+			t.Fatalf("linux/%s rejected: %v", arch, err)
+		}
+		if got != want {
+			t.Fatalf("linux/%s asset = %q, want %q", arch, got, want)
+		}
+	}
+	for _, target := range [][2]string{{"windows", "amd64"}, {"linux", "386"}, {"linux", "arm"}} {
+		if _, err := panelReleaseAssetName(target[0], target[1]); err == nil {
+			t.Fatalf("unsupported target %s/%s accepted", target[0], target[1])
+		}
+	}
+}
+
+func TestResolvePanelAssetsSelectsOnlyRequestedArchitecture(t *testing.T) {
+	release := &GithubRelease{Assets: []struct {
+		Name               string `json:"name"`
+		BrowserDownloadURL string `json:"browser_download_url"`
+	}{
+		{Name: "yub-wpanel-linux-amd64", BrowserDownloadURL: "https://example.invalid/amd64"},
+		{Name: "yub-wpanel-linux-amd64.sha256", BrowserDownloadURL: "https://example.invalid/amd64.sha256"},
+		{Name: "yub-wpanel-linux-amd64.sha256.sig", BrowserDownloadURL: "https://example.invalid/amd64.sig"},
+		{Name: "yub-wpanel-linux-arm64", BrowserDownloadURL: "https://example.invalid/arm64"},
+		{Name: "yub-wpanel-linux-arm64.sha256", BrowserDownloadURL: "https://example.invalid/arm64.sha256"},
+		{Name: "yub-wpanel-linux-arm64.sha256.sig", BrowserDownloadURL: "https://example.invalid/arm64.sig"},
+	}}
+	binary, checksum, signature := resolvePanelAssets(release, "yub-wpanel-linux-arm64")
+	if binary != "https://example.invalid/arm64" || checksum != "https://example.invalid/arm64.sha256" || signature != "https://example.invalid/arm64.sig" {
+		t.Fatalf("unexpected ARM64 assets: %q %q %q", binary, checksum, signature)
+	}
+}
+
 func TestParsePanelInfoVersion(t *testing.T) {
 	got, err := parsePanelInfoVersion([]byte("YUB WPanel 面板信息\n版本: v2.0.1 (构建: test)\n"))
 	if err != nil {

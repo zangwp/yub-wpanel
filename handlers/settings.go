@@ -500,8 +500,8 @@ func getNTPEnabled() bool {
 	return err == nil && strings.TrimSpace(string(out)) == "yes"
 }
 
-// detectNTPTimeSyncUnit 返回 Debian 13 上实际安装的时间同步 systemd 单元。
-// Debian 13 云服务商镜像常预装 chrony 并且不再提供 systemd-timesyncd 单元；
+// detectNTPTimeSyncUnit 返回受支持系统上实际安装的时间同步 systemd 单元。
+// 云服务商镜像常预装 chrony，也可能不提供 systemd-timesyncd 单元；
 // timedatectl set-ntp 本身对两者都有效，但重启动作必须作用于真实存在的
 // 单元，否则 systemctl restart 会因为单元不存在直接报错。
 func detectNTPTimeSyncUnit() string {

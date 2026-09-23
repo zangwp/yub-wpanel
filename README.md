@@ -2,11 +2,11 @@
 
 <p><img src="static/logo.png" alt="YUB WPanel" width="120"></p>
 
-WordPress 专用服务器管理面板。一行命令，纯净 Debian 13 变身 WordPress 托管平台。
+WordPress 专用服务器管理面板。面向 Debian 13 与 Ubuntu 24.04 LTS 的纯净服务器，支持 amd64 和 arm64。
 
 YUB WPanel 遵循 GNU GPL v3.0 only（SPDX：`GPL-3.0-only`）。源码、安装脚本和已签名发行版位于 [zangwp/yub-wpanel](https://github.com/zangwp/yub-wpanel)。
 
-WordPress server management panel for Debian 13 VPS environments, focused on site isolation, SSL, backups, security, and day-to-day WordPress hosting operations.
+WordPress server management panel for Debian 13 and Ubuntu 24.04 LTS VPS environments on amd64 or arm64, focused on site isolation, SSL, backups, security, and day-to-day WordPress hosting operations.
 
 ## English Documentation
 
@@ -16,6 +16,32 @@ The full English project guide is available here: [README.en.md](README.en.md).
 [![Go](https://img.shields.io/badge/Go-1.26-00ADD8.svg)](https://go.dev/)
 
 ---
+
+## 🚀 快速安装
+
+> **支持范围：Debian 13 (Trixie) / Ubuntu 24.04 LTS (Noble)，amd64 / arm64。** 下面是一段可整体复制的固定版本验签安装命令；它不会执行 GitHub `main` 分支上的可变脚本，也不会用 `curl | bash` 跳过校验。
+
+先进入 root shell（例如执行 `sudo -i`），再复制整段命令：
+
+```bash
+apt-get update
+apt-get install -y wget ca-certificates openssl
+(
+  set -euo pipefail
+  umask 077
+  workdir="$(mktemp -d /tmp/yub-wpanel-quick.XXXXXXXXXX)"
+  trap 'rm -rf -- "$workdir"' EXIT
+  cd "$workdir"
+  base='https://github.com/zangwp/yub-wpanel/releases/download/v2.1.0'
+  wget --no-config --https-only --no-hsts "$base/install.sh" "$base/install.sh.sha256" "$base/install.sh.sha256.sig"
+  printf '%s\n' '-----BEGIN PUBLIC KEY-----' 'MCowBQYDK2VwAyEAc1EJlyDurxR/SJS8MTpUVsAbvSmtfUAatoabx/f5KvU=' '-----END PUBLIC KEY-----' > release-public-key.pem
+  openssl pkeyutl -verify -pubin -inkey release-public-key.pem -rawin -in install.sh.sha256 -sigfile install.sh.sha256.sig
+  sha256sum --check --strict install.sh.sha256
+  bash install.sh
+)
+```
+
+安装器会自动识别系统和 CPU 架构、下载对应的已签名二进制，并拒绝未列入支持范围的发行版或架构。国内网络与离线安装方式见 **[验签安装指南](docs/verified-install.md)**。
 
 ## 定位
 
@@ -46,16 +72,18 @@ YUB WPanel 只做一件事：**在 VPS 上高效管理 WordPress 网站**。不�
 | **告警通知** | 可通过邮件接收资源不足、服务异常、证书到期、网站到期和可用更新等提醒，每类提醒可单独开关 |
 | **软件与运行环境** | 在面板中管理 PHP、Nginx、MariaDB 和 Redis，查看日志，并按网站调整 PHP 或 Nginx 设置 |
 | **面板安全** | 使用不公开的登录入口和两次登录验证；连续输错密码或频繁扫描错误地址时会自动限制来源 |
-| **安全更新** | 面板和 Debian 系统软件都可检查更新；面板更新会验签并在健康检查失败时尝试回滚 |
+| **安全更新** | 面板和当前 Debian/Ubuntu 系统软件都可检查更新；面板更新会验签并在健康检查失败时尝试回滚 |
 | **备份与异地保存** | 自动备份网站和面板数据，并可把网站备份同步到另一台服务器或对象存储，减少单机故障造成的损失 |
 
-## 验签安装
+## 验签安装说明
 
 生产服务器请从 GitHub Release 下载安装器、SHA-256 清单和 Ed25519 签名，验签成功后再以 root 执行。不要把可变分支脚本直接通过管道交给 shell。国内入口同样必须先验签，并支持管理员明确配置的 HTTPS GitHub 反代。
 
 完整可复制命令、公钥与本地发布包说明见 **[验签安装指南](docs/verified-install.md)**。
 
 > **升级提示：** v2.0.0 到 v2.0.1，以及 v2.0.1 到 v2.0.2，都必须从目标版本的固定 Release 下载 `install.sh`、`yub-wpanel`、第三方许可归档及各自的 SHA-256 清单和 Ed25519 签名（共九个文件），逐组验签后运行本地 `install.sh` 并选择 repair。v2.0.2 此路径还会同步 `/usr/share/doc/yub-wpanel`；不要使用只替换二进制的面板在线更新器完成这次升级。详见[升级兼容性说明](docs/upgrade-compatibility.md)。
+
+> **v2.1.0 升级提示：** v2.0.2 的在线更新器不认识新的架构化资产名。升级到 v2.1.0 时同样必须使用固定 Release 安装器 repair，并下载与服务器匹配的 `yub-wpanel-linux-amd64` 或 `yub-wpanel-linux-arm64` 三件套。
 
 安装完成后输出面板地址和两层登录凭据（BasicAuth + Web 登录）。
 
@@ -141,18 +169,18 @@ YUB WPanel 支持在两台相同版本的面板之间搬迁 WordPress 或通用 
 
 | 项目 | 要求 |
 |------|------|
-| 操作系统 | Debian 13 (Trixie) |
+| 操作系统 | Debian 13 (Trixie) 或 Ubuntu 24.04 LTS (Noble)；暂不自动延伸到其他大版本 |
 | CPU | 1 核及以上 |
 | 内存 | 1 GB 及以上（物理内存不超过 8 GB、未启用 Swap 且磁盘条件满足时，安装器可能创建 2 GB Swap） |
-| 架构 | x86_64 |
+| 架构 | amd64/x86_64 或 arm64/aarch64（内核与 dpkg 用户空间架构必须一致） |
 
 > 各云厂商定制镜像可能带来兼容性差异。请先保存日志并排查网络、APT、签名和系统版本。第三方重装项目不由 YUB WPanel 维护；重装系统会清除数据，只应在新机或已验证完整快照后使用。
 
 ## 为什么选择这些技术方案
 
-**为什么是 Debian 13？**
+**为什么锁定 Debian 13 与 Ubuntu 24.04 LTS？**
 
-Debian 是服务器领域稳定性最高的发行版之一。Trixie（Debian 13）在面板开发启动时是最新稳定版，拥有最新内核、较新的软件包版本，同时保持 Debian 一贯的保守稳定策略。选择这个版本意味着面板可以享受长周期的安全更新支持，用户无需频繁升级系统。
+安装器会修改软件源、安装并配置 PHP、Nginx、MariaDB、Redis、Fail2ban 与 systemd 服务，因此兼容性必须按发行版版本验证。当前只接受 Debian 13/Trixie 和 Ubuntu 24.04/Noble，不会因为同属 Debian/Ubuntu 家族就放宽到未经测试的旧版或新版。Ubuntu 使用 Noble 自带的 PHP 8.3；Debian 使用经过固定 keyring 校验的 PHP 源。
 
 **为什么锁定 PHP 8.3？**
 
@@ -160,7 +188,7 @@ WordPress 官方推荐 PHP 8.3 或更高版本。8.3 在 WordPress 生态中经�
 
 **为什么是 MariaDB 而非 MySQL？**
 
-WordPress 官方推荐 MariaDB 10.6 或更高版本。Debian 自带的 MariaDB 满足此要求。MariaDB 是由社区驱动的 GPL 分支，兼容 MySQL，并可直接获得 Debian 软件源提供的安全更新，无需添加第三方数据库仓库。
+WordPress 官方推荐 MariaDB 10.6 或更高版本。当前支持的 Debian 与 Ubuntu 系统源提供兼容版本。MariaDB 是由社区驱动的 GPL 分支，兼容 MySQL，并可直接获得发行版软件源提供的安全更新，无需添加第三方数据库仓库。
 
 **为什么是自己编的 Go 二进制，不用 Docker/PM2？**
 
@@ -172,11 +200,11 @@ WordPress 官方推荐 MariaDB 10.6 或更高版本。Debian 自带的 MariaDB �
 
 | 组件 | 说明 |
 |------|------|
-| PHP 8.3 | Ondřej Surý 源，独立 FPM Pool 隔离 |
-| MariaDB | Debian 自带 LTS 版本 |
-| Nginx | Debian 自带稳定版 |
-| Redis | Debian 自带 |
-| Fail2ban + nftables | Debian 自带 |
+| PHP 8.3 | Debian 使用经校验的 Ondřej Surý 源；Ubuntu 使用 Noble 原生包；独立 FPM Pool 隔离 |
+| MariaDB | 当前发行版系统源 |
+| Nginx | 当前发行版系统源 |
+| Redis | 当前发行版系统源 |
+| Fail2ban + nftables | 当前发行版系统源 |
 
 ## 技术架构
 
@@ -187,16 +215,16 @@ WordPress 官方推荐 MariaDB 10.6 或更高版本。Debian 自带的 MariaDB �
 
 ## SSH 管理命令
 
-安装后面板提供 `yubw` 命令行工具：
+从 `v2.1.0` 起，安装后面板提供 `b` 命令行工具，并兼容完全相同的大写入口 `B`：
 
 | 命令 | 说明 |
 |------|------|
-| `yubw` | 查看面板信息 |
-| `yubw restart` | 重启面板 |
-| `yubw password` | 一键重置管理员账号密码 |
-| `yubw info` | 查看版本/端口/入口 |
-| `yubw status` | 查看运行状态 |
-| `yubw unban` | 清空所有 IP 封禁（管理员被误封时紧急恢复） |
+| `b` 或 `B` | 查看面板信息 |
+| `b restart` | 重启面板 |
+| `b password` | 一键重置管理员账号密码 |
+| `b info` | 查看版本/端口/入口 |
+| `b status` | 查看运行状态 |
+| `b unban` | 清空所有 IP 封禁（管理员被误封时紧急恢复） |
 
 ## 面板数据库备份与恢复
 
@@ -270,13 +298,16 @@ systemctl start yub-wpanel
 ├── executor/             # 任务执行器
 ├── collector/            # 系统指标采集
 ├── templates/            # HTML 模板
-├── static/               # JS
-├── input.css             # TailwindCSS 源文件
+├── static/               # 已生成并嵌入的 CSS / JS / Logo
+├── assets/               # 品牌、社区图片与前端源文件
 ├── install.sh            # 一键安装脚本
 ├── install-cn.sh         # 国内优化版安装脚本
+├── tests/                # 安装器与跨包约束测试
 ├── security/             # 安全说明文档
 └── yub-wpanel-optimizer/   # WordPress 配套插件
 ```
+
+为什么部分 Go 测试仍留在根目录、哪些重复资产是有意保留的，见[仓库结构说明](docs/repository-layout.md)。
 
 ## YUB WPanel 开源许可
 

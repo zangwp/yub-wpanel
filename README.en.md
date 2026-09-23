@@ -2,7 +2,7 @@
 
 <p><img src="static/logo.png" alt="YUB WPanel" width="120"></p>
 
-YUB WPanel is a WordPress-focused server management panel for Debian 13 VPS environments. It helps you provision and operate WordPress sites with a single Go binary, embedded templates, and a workflow centered on security, isolation, backups, SSL, PHP-FPM, Nginx, MariaDB, and daily site operations.
+YUB WPanel is a WordPress-focused server management panel for clean Debian 13 and Ubuntu 24.04 LTS servers on amd64 or arm64. It helps you provision and operate WordPress sites with a single Go binary, embedded templates, and a workflow centered on security, isolation, backups, SSL, PHP-FPM, Nginx, MariaDB, and daily site operations.
 
 YUB WPanel is licensed under GNU GPL v3.0 only (SPDX: `GPL-3.0-only`). Its source, installer, and signed releases are maintained at [zangwp/yub-wpanel](https://github.com/zangwp/yub-wpanel).
 
@@ -12,6 +12,32 @@ If you want the Chinese project README, see [README.md](README.md).
 [![Go](https://img.shields.io/badge/Go-1.26-00ADD8.svg)](https://go.dev/)
 
 ---
+
+## 🚀 Quick Installation
+
+> **Supported targets: Debian 13 (Trixie) and Ubuntu 24.04 LTS (Noble), on amd64 or arm64.** The block below verifies a fixed-version installer before executing it. It does not pipe a mutable branch into a shell.
+
+Enter a root shell first (for example, `sudo -i`), then paste the complete block:
+
+```bash
+apt-get update
+apt-get install -y wget ca-certificates openssl
+(
+  set -euo pipefail
+  umask 077
+  workdir="$(mktemp -d /tmp/yub-wpanel-quick.XXXXXXXXXX)"
+  trap 'rm -rf -- "$workdir"' EXIT
+  cd "$workdir"
+  base='https://github.com/zangwp/yub-wpanel/releases/download/v2.1.0'
+  wget --no-config --https-only --no-hsts "$base/install.sh" "$base/install.sh.sha256" "$base/install.sh.sha256.sig"
+  printf '%s\n' '-----BEGIN PUBLIC KEY-----' 'MCowBQYDK2VwAyEAc1EJlyDurxR/SJS8MTpUVsAbvSmtfUAatoabx/f5KvU=' '-----END PUBLIC KEY-----' > release-public-key.pem
+  openssl pkeyutl -verify -pubin -inkey release-public-key.pem -rawin -in install.sh.sha256 -sigfile install.sh.sha256.sig
+  sha256sum --check --strict install.sh.sha256
+  bash install.sh
+)
+```
+
+The installer detects the OS and CPU architecture, downloads the matching signed binary, and rejects unlisted platforms. See the **[verified installation guide](docs/verified-install.md)** for China-friendly and offline paths.
 
 ## Positioning
 
@@ -42,7 +68,7 @@ YUB WPanel focuses on one job: **running WordPress sites efficiently on VPS serv
 | **Alerts** | Receive email alerts for low resources, stopped services, expiring certificates or sites, and available updates; each alert type can be switched separately |
 | **Software and runtime** | Manage PHP, Nginx, MariaDB, and Redis, inspect logs, and adjust PHP or Nginx settings for individual sites |
 | **Panel security** | Use a private login path and two login checks; repeated password failures or repeated scans of invalid paths are restricted automatically |
-| **Safe updates** | Check for panel and Debian software updates; panel packages are signature-verified and the updater attempts rollback after a failed health check |
+| **Safe updates** | Check for panel and current Debian/Ubuntu software updates; panel packages are signature-verified and the updater attempts rollback after a failed health check |
 | **Backups and offsite copies** | Back up sites and panel data automatically, and copy site backups to another server or object storage to reduce single-server risk |
 
 ## Verified Installation
@@ -52,6 +78,8 @@ On a production server, download the installer, SHA-256 manifest, and Ed25519 si
 See the **[verified installation guide](docs/verified-install.md)** for copyable commands, the public key, and local release-bundle instructions.
 
 > **Upgrade notice:** Both v2.0.0 to v2.0.1 and v2.0.1 to v2.0.2 require the fixed target Release bundles for `install.sh`, `yub-wpanel`, and the third-party license archive, each with its SHA-256 manifest and Ed25519 signature (nine files total). Verify all three bundles, run the local `install.sh`, and select repair. For v2.0.2 this also synchronizes `/usr/share/doc/yub-wpanel`; do not use the panel's binary-only online updater for this upgrade. See the [upgrade compatibility note](docs/upgrade-compatibility.md).
+
+> **v2.1.0 upgrade notice:** The v2.0.2 updater does not recognize the new architecture-qualified asset names. Use the fixed v2.1.0 installer in repair mode and download the `yub-wpanel-linux-amd64` or `yub-wpanel-linux-arm64` bundle matching the server.
 
 After installation, the script prints the panel URL and the two login layers: BasicAuth and web login.
 
@@ -64,11 +92,11 @@ After installation, the script prints the panel URL and the two login layers: Ba
 1. Verify and run the release installer.
 2. Open the panel URL printed by the installer.
 3. Sign in with BasicAuth first, then complete the web login.
-4. Run `yubw info` to confirm the panel version, port, and entry path.
-5. Run `yubw status` to check whether the panel is healthy.
-6. Use `yubw restart` if you need a quick restart.
-7. Use `yubw password` if you need to reset the administrator password.
-8. Use `yubw unban` if the administrator account or your IP was banned by mistake.
+4. Run `b info` to confirm the panel version, port, and entry path.
+5. Run `b status` to check whether the panel is healthy.
+6. Use `b restart` if you need a quick restart.
+7. Use `b password` if you need to reset the administrator password.
+8. Use `b unban` if the administrator account or your IP was banned by mistake.
 
 If you need a fresh WordPress site, use the site management pages in the panel UI to create one. The panel will handle the isolated user, web root, PHP-FPM pool, and MariaDB database for that site.
 
@@ -155,18 +183,18 @@ White-hat researchers are welcome to test this project. If you find a security i
 
 | Item | Requirement |
 |------|------|
-| Operating system | Debian 13 (Trixie) |
+| Operating system | Debian 13 (Trixie) or Ubuntu 24.04 LTS (Noble); other major releases are not accepted automatically |
 | CPU | 1 core or more |
 | Memory | 1 GB or more (the installer may create a 2 GB swap file when RAM is at most 8 GB, no swap is active, and disk checks pass) |
-| Architecture | x86_64 |
+| Architecture | amd64/x86_64 or arm64/aarch64; kernel and dpkg user-space architectures must match |
 
 > Cloud-vendor images can introduce compatibility differences. Preserve logs and check networking, APT, signatures, and the OS version first. Third-party reinstall projects are not maintained by YUB WPanel; reinstalling an OS erases data and should only be considered on a new host or after verifying a complete snapshot.
 
 ## Why These Tech Choices
 
-**Why Debian 13?**
+**Why exactly Debian 13 and Ubuntu 24.04 LTS?**
 
-Debian is one of the most stable server distributions available. Trixie (Debian 13) was the latest stable release when development started. It gives us a recent kernel, newer package versions, and Debian's usual conservative stability policy. That means long-term security updates without forcing users to upgrade their base OS too often.
+The installer changes package sources and configures PHP, Nginx, MariaDB, Redis, Fail2ban, and systemd. Compatibility therefore has to be validated per distribution release. The current allowlist is Debian 13/Trixie and Ubuntu 24.04/Noble; belonging to the Debian or Ubuntu family does not make an untested older or newer release supported. Ubuntu uses Noble's native PHP 8.3 packages, while Debian uses a PHP repository whose keyring is pinned and verified.
 
 **Why lock to PHP 8.3?**
 
@@ -174,7 +202,7 @@ The WordPress project recommends PHP 8.3 or newer. PHP 8.3 is already widely tes
 
 **Why MariaDB instead of MySQL?**
 
-WordPress recommends MariaDB 10.6 or newer, and Debian 12/13 ships compatible MariaDB releases out of the box. Oracle MySQL comes with license and feature constraints. MariaDB is a fully compatible GPL fork driven by the community, and Debian's LTS packages provide security updates through 2028 without third-party repositories.
+WordPress recommends MariaDB 10.6 or newer, and the supported Debian and Ubuntu repositories provide compatible releases. MariaDB is a community-driven GPL fork compatible with MySQL, and distribution packages provide security updates without adding a third-party database repository.
 
 **Why build a Go binary instead of using Docker or PM2?**
 
@@ -186,11 +214,11 @@ The server-stack components below are installed through APT. The panel binary co
 
 | Component | Notes |
 |------|------|
-| PHP 8.3 | Installed from Ondřej Surý's repository with isolated FPM pools |
-| MariaDB | Debian-provided LTS release |
-| Nginx | Debian stable package |
-| Redis | Debian package |
-| Fail2ban + nftables | Debian package |
+| PHP 8.3 | Verified Ondřej Surý repository on Debian; native Noble packages on Ubuntu; isolated FPM pools |
+| MariaDB | Current distribution repository |
+| Nginx | Current distribution repository |
+| Redis | Current distribution repository |
+| Fail2ban + nftables | Current distribution repository |
 
 ## Technical Architecture
 
@@ -201,16 +229,16 @@ The server-stack components below are installed through APT. The panel binary co
 
 ## SSH Management Commands
 
-After installation, the panel provides a `yubw` command-line helper:
+Starting with `v2.1.0`, the panel provides a `b` command-line helper with an equivalent uppercase `B` entry point:
 
 | Command | Description |
 |------|------|
-| `yubw` | Show panel information |
-| `yubw restart` | Restart the panel |
-| `yubw password` | Reset the administrator password in one step |
-| `yubw info` | Show version, port, and entry path |
-| `yubw status` | Show runtime status |
-| `yubw unban` | Clear all IP bans for emergency recovery |
+| `b` or `B` | Show panel information |
+| `b restart` | Restart the panel |
+| `b password` | Reset the administrator password in one step |
+| `b info` | Show version, port, and entry path |
+| `b status` | Show runtime status |
+| `b unban` | Clear all IP bans for emergency recovery |
 
 ## Panel Database Backup and Restore
 
@@ -311,13 +339,16 @@ Verify the China-friendly `install-cn.sh` release asset and configure an HTTPS G
 ├── executor/             # task executor
 ├── collector/            # system metrics collector
 ├── templates/            # HTML templates
-├── static/               # JS assets
-├── input.css             # TailwindCSS source
+├── static/               # generated and embedded CSS / JS / logo
+├── assets/               # branding, community artwork, and frontend source
 ├── install.sh            # one-click installer
 ├── install-cn.sh         # China-friendly installer
+├── tests/                # installer and cross-package constraint tests
 ├── security/             # security notes
 └── yub-wpanel-optimizer/   # bundled WordPress plugin
 ```
+
+See the [repository layout note](docs/repository-layout.md) for the root-file policy and intentionally retained packaged-asset copies.
 
 ## YUB WPanel Open Source License
 

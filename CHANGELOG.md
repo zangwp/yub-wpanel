@@ -1,11 +1,23 @@
 # Changelog
 
+## v2.1.0 — 2026-09-23
+
+- Replaced the panel management command with `b` and an equivalent uppercase `B` entry point. Upgrades remove the managed legacy command after both new entry points are installed successfully, while refusing to overwrite unrelated files already occupying either one-character path.
+- Added an exact platform allowlist for Debian 13/Trixie and Ubuntu 24.04/Noble on amd64 and arm64, including kernel/userspace architecture consistency checks.
+- Added architecture-qualified, signed release binaries and taught both the installer and online updater to select the matching asset without cross-architecture fallback.
+- Added native ARM64 CI and release verification on GitHub's `ubuntu-24.04-arm` runner, alongside amd64 and arm64 release builds.
+- Added a separate Ubuntu APT profile using Noble's native PHP 8.3 packages, architecture-aware Ubuntu mirrors, and restoration of installer-managed APT sources on failure or uninstall.
+- Made the system-update page distribution-aware so Debian hosts link to the Trixie package index and Ubuntu hosts link to the Noble package index, with shared non-Debian-specific update warnings.
+- Added prominent fixed-version, signature-verifying quick-install instructions and updated offline/repair guidance for the `v2.0.2` to `v2.1.0` asset-name transition.
+- Moved standalone frontend source/configuration and community artwork out of the repository root, while keeping Go package files, embedded runtime assets, and conventional project metadata in place.
+- Audited exact file duplication and release/update asset-selection logic. The only identical runtime artwork copies remain intentionally separate because the panel binary and WordPress companion plugin are independently packaged consumers.
+
 ## v2.0.2 — 2026-09-23
 
 Security, reliability, and bounded-resource maintenance release.
 
 - Added a version-bound runtime health gate to fresh installs and repairs, including process/listener ownership checks. Fresh installs are enabled only after passing the gate and are stopped and disabled on failure. Repair now stops an originally active panel immediately before its snapshot, keeps it stopped through deployment, and restores its original runtime state after success or rollback.
-- Removed administrator and database passwords from process arguments during installation and removed the legacy plaintext-password `--passwd` reset path; use `yubw password` (the random `--reset-admin` flow) instead.
+- Removed administrator and database passwords from process arguments during installation and removed the legacy plaintext-password `--passwd` reset path; use the panel CLI's random `--reset-admin` flow instead.
 - Hardened public site-migration endpoints with authentication before body reads where possible, bounded body-read time, and concurrency limits against slow-request exhaustion.
 - Bounded task admission and completed-task retention, redacted retained task state, and synchronized task status updates.
 - Made Cron mutations transactional across database, managed WP-Cron markers, and system-Cron rendering; bounded command output and log retention, terminated full process groups on timeout, and moved execution locks into a verified root-private runtime directory.

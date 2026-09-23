@@ -185,7 +185,7 @@
                             </div>
                             <div class="flex items-center space-x-3">
                                 <span class="text-xs text-gray-400" x-text="pkg.version"></span>
-                                <a :href="'https://packages.debian.org/trixie/' + pkg.name" target="_blank" class="text-xs text-blue-400 hover:text-blue-300" title="{{t .Lang "settings.package_detail_title"}}">{{t .Lang "settings.query"}}</a>
+                                <a x-show="packageCatalogURL" :href="packageDetailsURL(pkg.name)" target="_blank" rel="noopener noreferrer" class="text-xs text-blue-400 hover:text-blue-300" title="{{t .Lang "settings.package_detail_title"}}">{{t .Lang "settings.query"}}</a>
                             </div>
                         </div>
                     </template>
@@ -877,6 +877,8 @@ function systemUpdate() {
         updating: false,
         msg: '',
         ok: false,
+        distribution: '',
+        packageCatalogURL: '',
         pollTimer: null,
         init() {
             this.resume();
@@ -892,10 +894,15 @@ function systemUpdate() {
                 if (r.success) {
                     this.packages = r.data.packages || [];
                     this.count = r.data.count || 0;
+                    this.distribution = r.data.distribution || '';
+                    this.packageCatalogURL = r.data.package_catalog_url || '';
                     this.checked = true;
                 }
             } catch(e) { showToast(e.message, 'error'); }
             this.checking = false;
+        },
+        packageDetailsURL(name) {
+            return this.packageCatalogURL + encodeURIComponent(name);
         },
         async resume() {
             this.pollTimer = null;

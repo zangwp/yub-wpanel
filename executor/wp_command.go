@@ -2,13 +2,14 @@ package executor
 
 import (
 	"bufio"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 )
 
-const wpScript = `#!/bin/bash
-# YUB WPanel CLI — yubw
+const panelCommandScript = `#!/bin/bash
+# YUB WPanel CLI — b
 
 BIN=/usr/local/bin/yub-wpanel
 CFG=/www/server/panel/config.json
@@ -120,11 +121,11 @@ case "${1:-}" in
                 journalctl -u "$SVC" -n 20 --no-pager 2>/dev/null | tail -20
                 echo "── 结束 ──"
                 echo ""
-                echo "→ 运行 'yubw status' 进行完整诊断"
+                echo "→ 运行 'b status' 进行完整诊断"
             fi
         else
             red "systemctl restart 失败，服务可能未安装"
-            echo "→ 运行 'yubw status' 进行诊断"
+            echo "→ 运行 'b status' 进行诊断"
         fi
         ;;
     password)
@@ -164,76 +165,151 @@ case "${1:-}" in
             diag
         fi
         echo ""
-        echo "用法: yubw <命令>"
-        echo "  yubw restart     重启面板"
-        echo "  yubw status      完整诊断检查"
-        echo "  yubw log [N]     查看最近 N 条日志（默认30）"
-        echo "  yubw password    一键重置管理员账号密码"
-        echo "  yubw unban       一键清空所有IP封禁"
+        echo "用法: b <命令>（也可使用大写 B）"
+        echo "  b restart     重启面板"
+        echo "  b status      完整诊断检查"
+        echo "  b log [N]     查看最近 N 条日志（默认30）"
+        echo "  b password    一键重置管理员账号密码"
+        echo "  b unban       一键清空所有IP封禁"
         ;;
 esac
 `
 
-// legacyWPCommandMarker is the exact second line of the pre-yubw-rename
+const (
+	panelCommandMarker      = "# YUB WPanel CLI — b"
+	legacyYUBWCommandMarker = "# YUB WPanel CLI — yubw"
+	legacyWPCommandMarker   = "# YUB WPanel CLI — wp"
+	managedMarkerScanLines  = 5
+)
+
+// legacyWPCommandMarker is the exact second line of the pre-panel-CLI-rename
 // script (see git history of this file). It's used to recognize a leftover
 // /usr/local/bin/wp created by an older version of this panel, as opposed
 // to a real WP-CLI install that happens to live at the same path. Matching
 // requires an exact, line-anchored match — not a substring — so it can't be
-// tripped by "yubw" or by unrelated text elsewhere in a user's own script.
-const legacyWPCommandMarker = "# YUB WPanel CLI — wp"
+// tripped by unrelated text elsewhere in a user's own script.
 
-// legacyMarkerScanLines caps how many lines of a candidate legacy file are
-// inspected, so a user file placed at the same path is never read in full.
-const legacyMarkerScanLines = 5
-
-func EnsureWPCommand() {
-	path := "/usr/local/bin/yubw"
-	if err := writeFileAtomic(path, []byte(wpScript), 0755); err != nil {
-		log.Printf("yubw 命令安装失败 (%s): %v", path, err)
+// EnsurePanelCommands installs the short lowercase and uppercase CLI entry
+// points. Because these are generic one-character names, existing paths are
+// replaced only when they already carry YUB WPanel's exact ownership marker.
+func EnsurePanelCommands() {
+	paths := []string{"/usr/local/bin/b", "/usr/local/bin/B"}
+	if err := migratePanelCommandsAt(paths, "/usr/local/bin/yubw"); err != nil {
+		log.Printf("面板 b/B 命令迁移失败: %v", err)
+		return
 	}
 	removeLegacyWPCommand()
 }
 
+func migratePanelCommandsAt(paths []string, legacyPath string) error {
+	if err := ensurePanelCommandsAt(paths...); err != nil {
+		return err
+	}
+	if err := removeManagedCommandAt(legacyPath, legacyYUBWCommandMarker); err != nil {
+		return fmt.Errorf("remove managed legacy command %s: %w", legacyPath, err)
+	}
+	return nil
+}
+
+func ensurePanelCommandsAt(paths ...string) error {
+	if len(paths) == 0 {
+		return fmt.Errorf("no panel command paths supplied")
+	}
+	for _, path := range paths {
+		replaceable, err := managedCommandPathReplaceable(path, panelCommandMarker)
+		if err != nil {
+			return fmt.Errorf("inspect %s: %w", path, err)
+		}
+		if !replaceable {
+			return fmt.Errorf("refusing to replace non-YUB command at %s", path)
+		}
+	}
+	for _, path := range paths {
+		if err := writeFileAtomic(path, []byte(panelCommandScript), 0755); err != nil {
+			return fmt.Errorf("install %s: %w", path, err)
+		}
+	}
+	return nil
+}
+
+func managedCommandPathReplaceable(path, marker string) (bool, error) {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.Mode().IsRegular() {
+		return false, nil
+	}
+	return fileHasExactMarker(path, marker)
+}
+
 // removeLegacyWPCommand cleans up the old /usr/local/bin/wp shortcut from
-// versions prior to the yubw rename, so it stops shadowing a real WP-CLI
+// versions prior to the dedicated panel command, so it stops shadowing WP-CLI
 // install. It only removes the file if one of its first few lines is an
 // exact match for legacyWPCommandMarker; a user-installed WP-CLI (or any
 // other file) at the same path is left untouched.
 func removeLegacyWPCommand() {
-	removeLegacyWPCommandAt("/usr/local/bin/wp")
+	if err := removeManagedCommandAt("/usr/local/bin/wp", legacyWPCommandMarker); err != nil {
+		log.Printf("清理旧版 wp 命令失败 (/usr/local/bin/wp): %v", err)
+	}
 }
 
 // removeLegacyWPCommandAt implements removeLegacyWPCommand against an
 // explicit path so it can be exercised against a temp file in tests.
 func removeLegacyWPCommandAt(legacyPath string) {
-	file, err := os.Open(legacyPath)
-	if err != nil {
-		return
-	}
-	defer file.Close()
-
-	matched := false
-	scanner := bufio.NewScanner(file)
-	for i := 0; i < legacyMarkerScanLines && scanner.Scan(); i++ {
-		if scanner.Text() == legacyWPCommandMarker {
-			matched = true
-			break
-		}
-	}
-	if !matched {
-		return
-	}
-	if err := os.Remove(legacyPath); err != nil {
+	if err := removeManagedCommandAt(legacyPath, legacyWPCommandMarker); err != nil {
 		log.Printf("清理旧版 wp 命令失败 (%s): %v", legacyPath, err)
 	}
 }
 
+func removeManagedCommandAt(path, marker string) error {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return nil
+	}
+	matched, err := fileHasExactMarker(path, marker)
+	if err != nil {
+		return err
+	}
+	if !matched {
+		return nil
+	}
+	return os.Remove(path)
+}
+
+// fileHasExactMarker only scans the first few lines, so an unrelated file is
+// never read in full merely because it occupies a managed command path.
+func fileHasExactMarker(path, marker string) (bool, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for i := 0; i < managedMarkerScanLines && scanner.Scan(); i++ {
+		if scanner.Text() == marker {
+			return true, nil
+		}
+	}
+	return false, scanner.Err()
+}
+
 // writeFileAtomic writes data to path via a temp file + rename in the same
-// directory, so a concurrent reader (e.g. someone running yubw mid-upgrade)
+// directory, so a concurrent reader (e.g. someone running b mid-upgrade)
 // never observes a partially-written script.
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".yubw-*.tmp")
+	tmp, err := os.CreateTemp(dir, ".yub-wpanel-cli-*.tmp")
 	if err != nil {
 		return err
 	}

@@ -12,7 +12,7 @@ const redisHealthCheckTimeout = 5 * time.Second
 
 // RedisReady 检查 Redis 是否真的能响应 PING（不只是 systemd 认为它在运行）。
 //
-// 面板从未修改过 Debian redis-server 包默认的监听方式（只改 maxmemory 一行），
+// 面板从未修改过发行版 redis-server 包默认的监听方式（只改 maxmemory 一行），
 // 所以固定用本机默认 TCP 地址 127.0.0.1:6379，跟面板生成/编辑的 redis.conf
 // 实际生效的监听配置一致；如果以后面板开始允许修改 bind/port，这里需要跟着改。
 func RedisReady(ctx context.Context) error {

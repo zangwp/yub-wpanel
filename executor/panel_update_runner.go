@@ -162,7 +162,11 @@ func ExecutePanelUpdate(opts PanelUpdateOptions) (*GithubRelease, error) {
 	}
 
 	setPanelUpdateStep("resolve_assets", "正在准备更新文件...", 10)
-	downloadURL, sha256URL, sigURL := resolvePanelAssets(latest)
+	assetName, err := panelReleaseAssetName(runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		return nil, panelUpdateFail(trigger, latest.TagName, "resolve_assets", err.Error())
+	}
+	downloadURL, sha256URL, sigURL := resolvePanelAssets(latest, assetName)
 	if downloadURL == "" {
 		return nil, panelUpdateFail(trigger, latest.TagName, "resolve_assets", "未找到适用于当前系统的二进制文件")
 	}
@@ -171,7 +175,7 @@ func ExecutePanelUpdate(opts PanelUpdateOptions) (*GithubRelease, error) {
 	}
 	if sigURL == "" {
 		setPanelUpdateFailed("未找到 Ed25519 签名文件，等待签名发布")
-		recordPanelUpdateStage(trigger, latest.TagName, "waiting_signature", "waiting", "未找到 yub-wpanel.sha256.sig，等待签名发布")
+		recordPanelUpdateStage(trigger, latest.TagName, "waiting_signature", "waiting", "未找到 "+assetName+".sha256.sig，等待签名发布")
 		return latest, errWaitingSignature
 	}
 
@@ -182,7 +186,7 @@ func ExecutePanelUpdate(opts PanelUpdateOptions) (*GithubRelease, error) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	newBinary := filepath.Join(tmpDir, panelBinaryName)
+	newBinary := filepath.Join(tmpDir, assetName)
 	setPanelUpdateStep("download_binary", "正在下载更新包...", 15)
 	if err := downloadFileWithProgress(proxyURL(opts.Proxy, downloadURL), newBinary, 10*time.Minute, panelBinaryMaxBytes, setPanelBinaryDownloadProgress); err != nil {
 		return nil, panelUpdateFail(trigger, latest.TagName, "download_binary", "更新包下载失败: "+err.Error())
@@ -192,12 +196,12 @@ func ExecutePanelUpdate(opts PanelUpdateOptions) (*GithubRelease, error) {
 	}
 
 	setPanelUpdateStep("download_sha256", "正在下载校验文件...", 62)
-	shaFile := filepath.Join(tmpDir, panelBinaryName+".sha256")
+	shaFile := filepath.Join(tmpDir, assetName+".sha256")
 	if err := downloadFile(proxyURL(opts.Proxy, sha256URL), shaFile, panelChecksumMaxBytes); err != nil {
 		return nil, panelUpdateFail(trigger, latest.TagName, "download_sha256", "SHA256 校验文件下载失败: "+err.Error())
 	}
 	setPanelUpdateStep("download_signature", "正在下载签名文件...", 66)
-	sigFile := filepath.Join(tmpDir, panelBinaryName+".sha256.sig")
+	sigFile := filepath.Join(tmpDir, assetName+".sha256.sig")
 	if err := downloadFile(proxyURL(opts.Proxy, sigURL), sigFile, panelSignatureMaxBytes); err != nil {
 		return nil, panelUpdateFail(trigger, latest.TagName, "download_signature", "签名文件下载失败: "+err.Error())
 	}
@@ -565,14 +569,26 @@ func proxyURL(proxy, original string) string {
 	return original
 }
 
-func resolvePanelAssets(latest *GithubRelease) (binaryURL, sha256URL, sigURL string) {
+func panelReleaseAssetName(goos, goarch string) (string, error) {
+	if goos != "linux" {
+		return "", fmt.Errorf("仅支持 Linux 服务器更新")
+	}
+	switch goarch {
+	case "amd64", "arm64":
+		return panelBinaryName + "-linux-" + goarch, nil
+	default:
+		return "", fmt.Errorf("当前架构 %s 没有受支持的发布二进制", goarch)
+	}
+}
+
+func resolvePanelAssets(latest *GithubRelease, assetName string) (binaryURL, sha256URL, sigURL string) {
 	for _, a := range latest.Assets {
 		switch a.Name {
-		case panelBinaryName:
+		case assetName:
 			binaryURL = a.BrowserDownloadURL
-		case panelBinaryName + ".sha256":
+		case assetName + ".sha256":
 			sha256URL = a.BrowserDownloadURL
-		case panelBinaryName + ".sha256.sig":
+		case assetName + ".sha256.sig":
 			sigURL = a.BrowserDownloadURL
 		}
 	}
@@ -1040,9 +1056,14 @@ func runPanelAutoUpdateCheck(currentVersion, configPath string, cfg *config.Conf
 		recordPanelUpdateStage("auto", latest.TagName, "waiting_release_delay", "waiting", "等待发布成熟期: "+wait.String())
 		return
 	}
-	_, _, sigURL := resolvePanelAssets(latest)
+	assetName, assetErr := panelReleaseAssetName(runtime.GOOS, runtime.GOARCH)
+	if assetErr != nil {
+		recordPanelUpdateStage("auto", latest.TagName, "resolve_assets", "failed", assetErr.Error())
+		return
+	}
+	_, _, sigURL := resolvePanelAssets(latest, assetName)
 	if sigURL == "" {
-		handleWaitingSignature(settings, latest.TagName)
+		handleWaitingSignature(settings, latest.TagName, assetName)
 		return
 	}
 	_, err = ExecutePanelUpdate(PanelUpdateOptions{
@@ -1172,7 +1193,7 @@ func shouldWaitForReleaseDelay(settings autoUpdateSettings, version string) (tim
 	return remaining, remaining > 0
 }
 
-func handleWaitingSignature(settings autoUpdateSettings, version string) {
+func handleWaitingSignature(settings autoUpdateSettings, version, assetName string) {
 	waitAt := settings.LastSignatureWaitAt
 	if settings.LastSignatureWaitVersion != version || waitAt.IsZero() {
 		waitAt = time.Now()
@@ -1180,12 +1201,12 @@ func handleWaitingSignature(settings autoUpdateSettings, version string) {
 		setSecuritySetting("panel_auto_update_signature_wait_at", waitAt.Format(time.RFC3339))
 	}
 	if time.Since(waitAt) > settings.SignatureTimeout {
-		msg := "等待签名文件超时，未找到 yub-wpanel.sha256.sig"
+		msg := "等待签名文件超时，未找到 " + assetName + ".sha256.sig"
 		recordPanelUpdateStage("auto", version, "waiting_signature", "failed", msg)
 		sendPanelUpdateMail(false, version, "waiting_signature", msg)
 		return
 	}
-	recordPanelUpdateStage("auto", version, "waiting_signature", "waiting", "未找到 yub-wpanel.sha256.sig，等待签名发布")
+	recordPanelUpdateStage("auto", version, "waiting_signature", "waiting", "未找到 "+assetName+".sha256.sig，等待签名发布")
 }
 
 func withinAutoUpdateWindow(window string, now time.Time) bool {

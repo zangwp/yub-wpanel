@@ -167,9 +167,9 @@ func TestInstallerVerifiesReleaseBeforeExecutionAndDeployment(t *testing.T) {
 		`download_file "https://wordpress.org/latest.zip" "$WP_ZIP_TMP" 60 "$WORDPRESS_ZIP_MAX_BYTES"`,
 		`download_file "https://ip.sb" "$PUBLIC_IP_FILE" 15 "$PUBLIC_IP_MAX_BYTES"`,
 		`download_file "https://ifconfig.me/ip" "$PUBLIC_IP_FILE" 15 "$PUBLIC_IP_MAX_BYTES"`,
-		`file_size_within_limit "$script_dir/yub-wpanel" "$PANEL_ASSET_MAX_BYTES"`,
-		`file_size_within_limit "$script_dir/yub-wpanel.sha256" "$CHECKSUM_ASSET_MAX_BYTES"`,
-		`file_size_within_limit "$script_dir/yub-wpanel.sha256.sig" "$SIGNATURE_ASSET_MAX_BYTES"`,
+		`file_size_within_limit "$panel_asset_path" "$PANEL_ASSET_MAX_BYTES"`,
+		`file_size_within_limit "${panel_asset_path}.sha256" "$CHECKSUM_ASSET_MAX_BYTES"`,
+		`file_size_within_limit "${panel_asset_path}.sha256.sig" "$SIGNATURE_ASSET_MAX_BYTES"`,
 		`file_size_within_limit "$script_dir/yub-wpanel-third-party-licenses.tar.gz" "$LICENSE_ARCHIVE_MAX_BYTES"`,
 		`file_size_within_limit "$script_dir/yub-wpanel-third-party-licenses.tar.gz.sha256" "$CHECKSUM_ASSET_MAX_BYTES"`,
 		`file_size_within_limit "$script_dir/yub-wpanel-third-party-licenses.tar.gz.sha256.sig" "$SIGNATURE_ASSET_MAX_BYTES"`,
@@ -394,19 +394,51 @@ func TestInstallerPlatformAndArtifactPreflightPrecedeSystemWrites(t *testing.T) 
 		t.Fatalf("early safety order invalid: platform=%d workdir=%d artifact=%d first_system_write=%d", platform, workdir, artifact, lock)
 	}
 	for _, required := range []string{
-		`[[ "$os_id" == "debian" ]]`,
-		`[[ "$version_id" == "13" ]]`,
-		`x86_64|amd64) ;;`,
-		`[[ "$dpkg_arch" == "amd64" ]]`,
+		`debian:13:trixie|ubuntu:24.04:noble) ;;`,
+		`x86_64|amd64) machine="amd64" ;;`,
+		`aarch64|arm64) machine="arm64" ;;`,
+		`amd64|arm64) ;;`,
+		`[[ "$machine" == "$dpkg_arch" ]]`,
+		`PANEL_ASSET_NAME="yub-wpanel-linux-${PLATFORM_ARCH}"`,
+		`select_platform_source`,
+		`Ubuntu 24.04 使用系统原生 PHP 8.3`,
 	} {
 		if !strings.Contains(script, required) {
 			t.Errorf("install.sh missing platform restriction %q", required)
+		}
+		if !strings.Contains(cnScript, required) && strings.Contains(required, "machine=") {
+			t.Errorf("install-cn.sh missing architecture restriction %q", required)
 		}
 	}
 	cnPlatform := requiredIndex(t, cnScript, "assert_bootstrap_platform\n")
 	cnWorkdir := requiredIndex(t, cnScript, "CN_WORKDIR=$(mktemp -d")
 	if cnPlatform >= cnWorkdir {
 		t.Fatalf("install-cn platform check offset=%d must precede temporary write offset=%d", cnPlatform, cnWorkdir)
+	}
+}
+
+func TestInstallerUsesSeparateRestorableDistributionSources(t *testing.T) {
+	script := readInstallScript(t, installScriptPath)
+	for _, required := range []string{
+		`select_debian_source "$PLATFORM_CODENAME"`,
+		`select_ubuntu_source "$PLATFORM_CODENAME"`,
+		`https://ports.ubuntu.com/ubuntu-ports`,
+		`https://archive.ubuntu.com/ubuntu`,
+		`Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg`,
+		`Ubuntu 24.04 使用系统原生 PHP 8.3 软件包`,
+		`# Managed by YUB WPanel`,
+		`assert_managed_source_target /etc/apt/sources.list.d/yub-wpanel-php.sources`,
+		`remove_managed_source_file /etc/apt/sources.list.d/yub-wpanel-debian.sources`,
+		`remove_managed_source_file /etc/apt/sources.list.d/yub-wpanel-ubuntu.sources`,
+		`remove_managed_source_file /etc/apt/sources.list.d/yub-wpanel-php.sources`,
+		`restore_managed_apt_sources`,
+	} {
+		if !strings.Contains(script, required) {
+			t.Errorf("install.sh missing distribution source control %q", required)
+		}
+	}
+	if strings.Contains(script, `> /etc/apt/sources.list.d/php.sources`) {
+		t.Fatal("installer may overwrite a generic third-party php.sources file")
 	}
 }
 

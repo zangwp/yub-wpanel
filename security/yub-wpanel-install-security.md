@@ -23,7 +23,7 @@ YUB WPanel 要安装和管理 Nginx、PHP-FPM、MariaDB、Redis、Fail2ban、nft
 
 Release 签名只覆盖以下四组资产及各自的校验清单：
 
-- `yub-wpanel`、`yub-wpanel.sha256`、`yub-wpanel.sha256.sig`
+- `yub-wpanel-linux-amd64` / `yub-wpanel-linux-arm64` 及对应 `.sha256`、`.sha256.sig`
 - `install.sh`、`install.sh.sha256`、`install.sh.sha256.sig`
 - `install-cn.sh`、`install-cn.sh.sha256`、`install-cn.sh.sha256.sig`
 - `yub-wpanel-third-party-licenses.tar.gz`、对应 `.sha256` 与 `.sha256.sig`
@@ -35,7 +35,7 @@ Release 签名只覆盖以下四组资产及各自的校验清单：
 `install.sh` 在第一次持久化系统写入前执行以下步骤：
 
 1. 要求 root；
-2. 严格检查 Debian 13、`x86_64` 内核与 `amd64` 用户空间；
+2. 严格检查 Debian 13/Trixie 或 Ubuntu 24.04/Noble，并要求 `amd64`/`arm64` 内核与 dpkg 用户空间架构一致；
 3. 创建权限为 `0700` 的随机临时目录，并注册精确清理逻辑；
 4. 从与安装器相同的固定 GitHub Release（或同目录离线包）获取面板二进制和许可归档及各自的校验清单与签名；
 5. 使用内置 Ed25519 公钥验证两份清单签名；
@@ -62,7 +62,7 @@ Release 签名只覆盖以下四组资产及各自的校验清单：
 
 ## 3. 支持范围
 
-安装器面向专用、干净的 Debian 13 amd64 主机。它不是通用的“接管任意现有 LEMP 环境”工具。
+安装器面向专用、干净的 Debian 13/Trixie 或 Ubuntu 24.04/Noble 主机，支持 amd64 与 arm64。它不是通用的“接管任意现有 LEMP 环境”工具，也不会把支持范围自动延伸到其他大版本。
 
 - 现有 MariaDB 已设置未知 root 密码时，fresh install 不会自动导入该密码，可能失败；
 - 由不同发行身份创建的面板不能通过手动改名或 repair 安全迁移，见[升级兼容性说明](../docs/upgrade-compatibility.md)；
@@ -75,7 +75,7 @@ Release 签名只覆盖以下四组资产及各自的校验清单：
 
 安装器会进行广泛的主机级修改，包括但不限于：
 
-- 配置 Debian 与 PHP 软件源并安装/启用系统包；
+- 配置当前发行版的软件源并安装/启用系统包；Debian 使用经固定 keyring 校验的 PHP 源，Ubuntu 使用 Noble 原生 PHP 8.3；
 - 写入 sysctl、文件描述符、Swap 与 systemd 配置；
 - 安装并配置 Nginx、PHP-FPM、MariaDB、Redis、Fail2ban 与 nftables/UFW 规则；
 - 创建 `/www/server/panel`、网站/日志/证书目录和面板服务；
@@ -111,13 +111,14 @@ openssl x509 -in /www/server/panel/certs/panel.crt -noout -fingerprint -sha256
 |---|---|---|
 | 已签名发布资产 | GitHub Releases | 可使用管理员明确配置的 HTTPS 反代 |
 | Debian 包与元数据 | Debian 官方源或所选镜像 | 部分 APT 镜像 URL 使用 HTTP，完整性依赖 APT 签名链 |
-| PHP 8.3 仓库 | packages.sury.org 或所选镜像 | 下载固定版本的仓库 keyring 与已签名包 |
+| Ubuntu 包与元数据 | Ubuntu 官方源或所选镜像 | amd64 使用 Ubuntu archive，arm64 使用 Ubuntu ports；完整性依赖 APT 签名链 |
+| PHP 8.3 仓库 | Debian 使用 packages.sury.org 或所选镜像；Ubuntu 使用 Noble 系统源 | Debian 下载固定版本仓库 keyring 与已签名包 |
 | WordPress 备用包 | wordpress.org | 下载失败时安装可继续，但后续建站仍需网络并可能失败 |
 | 公网地址显示 | ip.sb、ifconfig.me | 仅用于安装完成页；服务会看到连接源 IP |
 
 安装器本身不发送安装遥测。运行时遥测是另一项功能：默认关闭、没有预设端点，只有配置自定义端点并启用后才发送稳定伪匿名 ID 与版本。JSON 不含业务数据或 IP 字段，但接收端仍会看到网络源 IP 与时间。
 
-PHP 仓库引导固定使用 `debsuryorg-archive-keyring` `2025.11.18`，其 `.deb` 的 SHA-256 必须是 `7511384559c9ddf1d5ce5f60be429ae9d4e7d01d9480d6f1b7a30c0810cf8b60`。安装器先核对完整哈希、包名、版本和架构，全部匹配后才允许 `dpkg` 执行；下载失败或任何字段不匹配都会换下一个来源，不会复用未由本次安装验证的本机 keyring。上游轮换 keyring 时，必须先审计新包并在新的 YUB WPanel 版本中更新这些固定值。
+Debian 的 PHP 仓库引导固定使用 `debsuryorg-archive-keyring` `2025.11.18`，其 `.deb` 的 SHA-256 必须是 `7511384559c9ddf1d5ce5f60be429ae9d4e7d01d9480d6f1b7a30c0810cf8b60`。安装器先核对完整哈希、包名、版本和架构，全部匹配后才允许 `dpkg` 执行；下载失败或任何字段不匹配都会换下一个来源，不会复用未由本次安装验证的本机 keyring。Ubuntu 24.04 不执行该第三方 keyring 包。上游轮换 keyring 时，必须先审计新包并在新的 YUB WPanel 版本中更新这些固定值。
 
 ## 6. repair 的保护与限制
 
@@ -138,7 +139,7 @@ repair 预检会：
 
 普通卸载会永久删除 `/www/server/panel`，包括面板数据库、`config.json`、面板 TLS 身份、本地面板/站点备份和远程备份凭据。所需文件必须先复制到该目录之外。
 
-普通卸载的目标是保留 `/www/wwwroot`、`/www/wwwlogs`、站点证书、MariaDB 数据和已安装软件，同时清理已知的 YUB WPanel 服务/任务入口。它不承诺把主机精确恢复到安装前状态，也不替代卸载后审计。
+普通卸载的目标是保留 `/www/wwwroot`、`/www/wwwlogs`、站点证书、MariaDB 数据和已安装软件，同时清理已知的 YUB WPanel 服务/任务入口。安装器会删除带有 YUB 所有权标记的专用 APT 源，并恢复它曾禁用且未发生路径冲突的系统源；后来由管理员创建的同名文件不会被覆盖。它不承诺把主机精确恢复到安装前状态，也不替代卸载后审计。
 
 “彻底清空”是面向专用主机的破坏性操作。它会删除所有 Nginx site 配置、PHP-FPM pool、`/www` 下的网站/日志/证书并卸载共享服务，可能破坏非 YUB 工作负载。它不是安全擦除，MariaDB 数据和部分用户、APT、防火墙或自定义配置仍可能残留。只应在已有可恢复整机快照时使用，并认真核对二次确认提示。
 
@@ -147,9 +148,9 @@ repair 预检会：
 本地提供面板二进制时必须同时提供同一 Release 的六个文件：
 
 ```text
-yub-wpanel
-yub-wpanel.sha256
-yub-wpanel.sha256.sig
+yub-wpanel-linux-<arch>
+yub-wpanel-linux-<arch>.sha256
+yub-wpanel-linux-<arch>.sha256.sig
 yub-wpanel-third-party-licenses.tar.gz
 yub-wpanel-third-party-licenses.tar.gz.sha256
 yub-wpanel-third-party-licenses.tar.gz.sha256.sig

@@ -138,7 +138,7 @@ Nginx、PHP、MariaDB、Redis、Fail2ban 等主要服务器组件通过 APT 获�
 
 建议：
 
-- 订阅 Debian、PHP、WordPress 与 YUB WPanel 安全公告；
+- 订阅当前 Debian/Ubuntu 发行版、PHP、WordPress 与 YUB WPanel 安全公告；
 - 在应用系统或面板更新前保存可恢复备份；
 - 先在同版本测试机验证关键业务；
 - 定期运行 `apt update`、检查可升级包和服务重启需求；

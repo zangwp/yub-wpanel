@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -36,10 +37,7 @@ func (h *SystemUpdateHandler) Check(c *gin.Context) {
 	if c.Query("fresh") != "1" && time.Now().Before(sysPkgCache.expireAt) {
 		pkgs := sysPkgCache.pkgs
 		sysPkgCache.mu.Unlock()
-		c.JSON(http.StatusOK, models.SuccessResponse(gin.H{
-			"packages": pkgs,
-			"count":    len(pkgs),
-		}))
+		c.JSON(http.StatusOK, models.SuccessResponse(systemUpdateCheckResponse(pkgs)))
 		return
 	}
 	sysPkgCache.mu.Unlock()
@@ -51,10 +49,49 @@ func (h *SystemUpdateHandler) Check(c *gin.Context) {
 	sysPkgCache.pkgs = pkgs
 	sysPkgCache.mu.Unlock()
 
-	c.JSON(http.StatusOK, models.SuccessResponse(gin.H{
-		"packages": pkgs,
-		"count":    len(pkgs),
-	}))
+	c.JSON(http.StatusOK, models.SuccessResponse(systemUpdateCheckResponse(pkgs)))
+}
+
+type systemPackageCatalog struct {
+	Distribution string
+	BaseURL      string
+}
+
+func systemUpdateCheckResponse(pkgs []systemPackage) gin.H {
+	catalog := readSystemPackageCatalog("/etc/os-release")
+	return gin.H{
+		"packages":            pkgs,
+		"count":               len(pkgs),
+		"distribution":        catalog.Distribution,
+		"package_catalog_url": catalog.BaseURL,
+	}
+}
+
+func readSystemPackageCatalog(path string) systemPackageCatalog {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return systemPackageCatalog{}
+	}
+	return parseSystemPackageCatalog(string(data))
+}
+
+func parseSystemPackageCatalog(osRelease string) systemPackageCatalog {
+	fields := make(map[string]string)
+	for _, line := range strings.Split(osRelease, "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		fields[key] = strings.Trim(strings.TrimSpace(value), `"'`)
+	}
+	switch fields["ID"] + ":" + fields["VERSION_ID"] + ":" + fields["VERSION_CODENAME"] {
+	case "debian:13:trixie":
+		return systemPackageCatalog{Distribution: "Debian 13", BaseURL: "https://packages.debian.org/trixie/"}
+	case "ubuntu:24.04:noble":
+		return systemPackageCatalog{Distribution: "Ubuntu 24.04 LTS", BaseURL: "https://packages.ubuntu.com/noble/"}
+	default:
+		return systemPackageCatalog{}
+	}
 }
 
 func (h *SystemUpdateHandler) Update(c *gin.Context) {

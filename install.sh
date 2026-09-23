@@ -3,8 +3,8 @@ set -e
 set -o pipefail
 
 # ============================================================
-# YUB WPanel 安装脚本 — 适用于 Debian 13 (Trixie)，建议使用纯净系统
-# 自动为 PHP 8.3 源选择官方源或国内镜像源，兼容海外和国内 VPS
+# YUB WPanel 安装脚本 — 适用于 Debian 13 / Ubuntu 24.04 LTS，建议使用纯净系统
+# 自动选择当前架构的已签名二进制，并按发行版配置 PHP 8.3 与 APT 源
 # ============================================================
 
 RED='\033[0;31m'
@@ -25,6 +25,13 @@ MYSQL_PASS=""
 GHPROXY="${YUB_WPANEL_GITHUB_PROXY:-}"
 PREFER_CN=false
 PHP_SOURCE_MODE="${YUB_WPANEL_PHP_SOURCE:-auto}"
+CHECK_PLATFORM_ONLY=false
+PLATFORM_ID=""
+PLATFORM_VERSION=""
+PLATFORM_CODENAME=""
+PLATFORM_ARCH=""
+PANEL_ASSET_NAME=""
+APT_SOURCES_MUTATED=false
 REPAIR_MODE=false
 REPAIR_BACKUP_DIR=""
 REPAIR_SERVICE_WAS_ACTIVE=false
@@ -84,6 +91,7 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 assert_supported_platform() {
     local os_id=""
     local version_id=""
+    local codename=""
     local machine=""
     local dpkg_arch=""
     local platform_cmd=""
@@ -91,20 +99,49 @@ assert_supported_platform() {
     for platform_cmd in dpkg head sed tr uname; do
         command -v "$platform_cmd" >/dev/null 2>&1 || log_error "缺少平台检测命令: ${platform_cmd}"
     done
-    [[ -r /etc/os-release ]] || log_error "无法读取 /etc/os-release；仅支持 Debian 13 amd64"
+    [[ -r /etc/os-release ]] || log_error "无法读取 /etc/os-release；仅支持 Debian 13 或 Ubuntu 24.04 LTS（amd64/arm64）"
     os_id=$(sed -n 's/^ID=//p' /etc/os-release | head -n 1 | tr -d '"')
     version_id=$(sed -n 's/^VERSION_ID=//p' /etc/os-release | head -n 1 | tr -d '"')
+    codename=$(sed -n 's/^VERSION_CODENAME=//p' /etc/os-release | head -n 1 | tr -d '"')
     machine=$(uname -m 2>/dev/null || true)
     dpkg_arch=$(dpkg --print-architecture 2>/dev/null || true)
 
-    [[ "$os_id" == "debian" ]] || log_error "此脚本仅支持 Debian 13，当前系统: ${os_id:-unknown}"
-    [[ "$version_id" == "13" ]] || log_error "此脚本仅支持 Debian 13，当前版本: ${version_id:-unknown}"
-    case "$machine" in
-        x86_64|amd64) ;;
-        *) log_error "当前只发布 amd64/x86_64 二进制，检测到架构: ${machine:-unknown}" ;;
+    case "${os_id}:${version_id}:${codename}" in
+        debian:13:trixie|ubuntu:24.04:noble) ;;
+        *) log_error "仅支持 Debian 13 (trixie) 或 Ubuntu 24.04 LTS (noble)，当前系统: ${os_id:-unknown} ${version_id:-unknown} ${codename:-unknown}" ;;
     esac
-    [[ "$dpkg_arch" == "amd64" ]] || \
-        log_error "当前只支持 Debian amd64 用户空间，检测到 dpkg 架构: ${dpkg_arch:-unknown}"
+    case "$machine" in
+        x86_64|amd64) machine="amd64" ;;
+        aarch64|arm64) machine="arm64" ;;
+        *) log_error "仅支持 amd64/x86_64 或 arm64/aarch64，检测到架构: ${machine:-unknown}" ;;
+    esac
+    case "$dpkg_arch" in
+        amd64|arm64) ;;
+        *) log_error "仅支持 amd64 或 arm64 用户空间，检测到 dpkg 架构: ${dpkg_arch:-unknown}" ;;
+    esac
+    [[ "$machine" == "$dpkg_arch" ]] || \
+        log_error "内核架构 ${machine} 与 dpkg 用户空间架构 ${dpkg_arch} 不一致，拒绝安装"
+
+    PLATFORM_ID="$os_id"
+    PLATFORM_VERSION="$version_id"
+    PLATFORM_CODENAME="$codename"
+    PLATFORM_ARCH="$dpkg_arch"
+    PANEL_ASSET_NAME="yub-wpanel-linux-${PLATFORM_ARCH}"
+}
+
+assert_panel_command_paths_available() {
+    local command_path=""
+
+    for command_path in /usr/local/bin/b /usr/local/bin/B; do
+        if [[ ! -e "$command_path" ]] && [[ ! -L "$command_path" ]]; then
+            continue
+        fi
+        if [[ -f "$command_path" ]] && [[ ! -L "$command_path" ]] && \
+           head -n 5 -- "$command_path" 2>/dev/null | grep -Fqx -- '# YUB WPanel CLI — b'; then
+            continue
+        fi
+        log_error "命令路径 ${command_path} 已被非 YUB WPanel 文件占用；为避免覆盖用户文件，安装已停止"
+    done
 }
 
 init_install_workdir() {
@@ -180,13 +217,16 @@ installer_exit() {
         cleanup_failed_fresh_panel_service
     fi
 	cleanup_atomic_stage_file
+    if [[ $exit_code -ne 0 ]] && [[ "$APT_SOURCES_MUTATED" == true ]]; then
+        restore_managed_apt_sources
+    fi
     cleanup_install_workdir
     if [[ $exit_code -ne 0 ]]; then
         echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo -e "${RED}  安装未完成 / Installation incomplete${NC}"
         echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo -e "  请先保存本次终端完整输出，不要在未定位原因前直接重装系统。"
-        echo -e "  优先检查：网络/DNS 与系统时间、APT 错误、发行包哈希/签名、Debian 13 amd64 平台检测，以及现有服务冲突。"
+        echo -e "  优先检查：网络/DNS 与系统时间、APT 错误、发行包哈希/签名、受支持平台检测，以及现有服务冲突。"
         echo -e "  可结合 ${BOLD}journalctl -u yub-wpanel -n 100 --no-pager${NC} 和 APT 输出排查，再携带已脱敏日志提交 GitHub Issue。"
         echo -e "  Save the complete terminal output first. Check networking/DNS, system time, APT, release hash/signature, platform validation, and existing service conflicts before considering an OS reinstall."
         echo ""
@@ -299,6 +339,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --php-source=*)
             PHP_SOURCE_MODE="${1#*=}"
+            shift
+            ;;
+        --check-platform)
+            CHECK_PLATFORM_ONLY=true
             shift
             ;;
         *)
@@ -431,7 +475,7 @@ verify_signed_release_asset() {
 }
 
 verify_panel_release_bundle() {
-    verify_signed_release_asset "$1" "$2" "$3" "yub-wpanel" "$PANEL_ASSET_MAX_BYTES"
+    verify_signed_release_asset "$1" "$2" "$3" "$PANEL_ASSET_NAME" "$PANEL_ASSET_MAX_BYTES"
 }
 
 verify_license_release_bundle() {
@@ -782,7 +826,7 @@ validate_fresh_panel_cron_location() {
 		validate_existing_panel_cron_file
 		return
 	fi
-	# Minimal Debian images may not have /etc/cron.d until cron-daemon-common is
+	# Minimal supported images may not have /etc/cron.d until the cron package is
 	# installed. Reject broken links and validate the nearest existing parent;
 	# after package installation the exact /etc/cron.d directory is rechecked.
 	while [[ ! -e "$nearest_parent" ]]; do
@@ -801,16 +845,17 @@ validate_fresh_panel_cron_location() {
 
 copy_local_release_bundle() {
     local script_dir="$1"
+    local panel_asset_path="${script_dir}/${PANEL_ASSET_NAME}"
 
-    file_size_within_limit "$script_dir/yub-wpanel" "$PANEL_ASSET_MAX_BYTES" || return 1
-    file_size_within_limit "$script_dir/yub-wpanel.sha256" "$CHECKSUM_ASSET_MAX_BYTES" || return 1
-    file_size_within_limit "$script_dir/yub-wpanel.sha256.sig" "$SIGNATURE_ASSET_MAX_BYTES" || return 1
+    file_size_within_limit "$panel_asset_path" "$PANEL_ASSET_MAX_BYTES" || return 1
+    file_size_within_limit "${panel_asset_path}.sha256" "$CHECKSUM_ASSET_MAX_BYTES" || return 1
+    file_size_within_limit "${panel_asset_path}.sha256.sig" "$SIGNATURE_ASSET_MAX_BYTES" || return 1
     file_size_within_limit "$script_dir/yub-wpanel-third-party-licenses.tar.gz" "$LICENSE_ARCHIVE_MAX_BYTES" || return 1
     file_size_within_limit "$script_dir/yub-wpanel-third-party-licenses.tar.gz.sha256" "$CHECKSUM_ASSET_MAX_BYTES" || return 1
     file_size_within_limit "$script_dir/yub-wpanel-third-party-licenses.tar.gz.sha256.sig" "$SIGNATURE_ASSET_MAX_BYTES" || return 1
-    install -m 0600 "$script_dir/yub-wpanel" "$PANEL_CANDIDATE"
-    install -m 0600 "$script_dir/yub-wpanel.sha256" "$PANEL_SHA256_FILE"
-    install -m 0600 "$script_dir/yub-wpanel.sha256.sig" "$PANEL_SIGNATURE_FILE"
+    install -m 0600 "$panel_asset_path" "$PANEL_CANDIDATE"
+    install -m 0600 "${panel_asset_path}.sha256" "$PANEL_SHA256_FILE"
+    install -m 0600 "${panel_asset_path}.sha256.sig" "$PANEL_SIGNATURE_FILE"
     install -m 0600 "$script_dir/yub-wpanel-third-party-licenses.tar.gz" "$LICENSE_ARCHIVE"
     install -m 0600 "$script_dir/yub-wpanel-third-party-licenses.tar.gz.sha256" "$LICENSE_SHA256_FILE"
     install -m 0600 "$script_dir/yub-wpanel-third-party-licenses.tar.gz.sha256.sig" "$LICENSE_SIGNATURE_FILE"
@@ -818,7 +863,7 @@ copy_local_release_bundle() {
 
 download_release_bundle() {
     local release_base_url="$1"
-    local binary_url="${release_base_url}/yub-wpanel"
+    local binary_url="${release_base_url}/${PANEL_ASSET_NAME}"
     local license_url="${release_base_url}/yub-wpanel-third-party-licenses.tar.gz"
 
     rm -f \
@@ -1239,6 +1284,28 @@ php_package_available() {
     apt_package_available "$pkg"
 }
 
+assert_managed_source_target() {
+    local source_path="$1"
+
+    if [[ ! -e "$source_path" ]] && [[ ! -L "$source_path" ]]; then
+        return 0
+    fi
+    [[ -f "$source_path" ]] && [[ ! -L "$source_path" ]] && \
+        head -n 1 -- "$source_path" 2>/dev/null | grep -Fqx -- '# Managed by YUB WPanel' || \
+        log_error "APT 源路径已被非 YUB WPanel 文件占用: $source_path"
+}
+
+remove_managed_source_file() {
+    local source_path="$1"
+
+    [[ -f "$source_path" ]] && [[ ! -L "$source_path" ]] || return 0
+    if head -n 1 -- "$source_path" 2>/dev/null | grep -Fqx -- '# Managed by YUB WPanel'; then
+        rm -f -- "$source_path"
+    else
+        log_warn "保留非 YUB WPanel 管理的 APT 源文件: $source_path"
+    fi
+}
+
 set_debian_source_meta() {
     case "$1" in
         nju)
@@ -1267,31 +1334,47 @@ set_debian_source_meta() {
     esac
 }
 
-backup_default_debian_sources() {
+backup_default_distribution_sources() {
+    local primary_source="$1"
+    local source_pattern="$2"
     local source_file=""
+    local backup_path="${primary_source}.yub-wpanel.bak"
+    local disabled_path="${primary_source}.yub-wpanel.disabled"
 
     mkdir -p /etc/apt/sources.list.d
-
-    if [[ -f /etc/apt/sources.list.d/debian.sources ]]; then
-        if [[ ! -f /etc/apt/sources.list.d/debian.sources.yub-wpanel.bak ]]; then
-            cp /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list.d/debian.sources.yub-wpanel.bak
+    if [[ -f "$primary_source" ]]; then
+        if [[ -e "$backup_path" ]] || [[ -L "$backup_path" ]] || \
+           [[ -e "$disabled_path" ]] || [[ -L "$disabled_path" ]]; then
+            log_error "发现旧的 APT 源备份/禁用文件，拒绝覆盖: $primary_source"
         fi
-        mv /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list.d/debian.sources.yub-wpanel.disabled
+        cp -- "$primary_source" "$backup_path"
+        APT_SOURCES_MUTATED=true
+        mv -- "$primary_source" "$disabled_path"
     fi
-
     for source_file in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
         [[ -f "$source_file" ]] || continue
-        if [[ ! -f "${source_file}.yub-wpanel.bak" ]]; then
-            cp "$source_file" "${source_file}.yub-wpanel.bak"
+        grep -Eq "$source_pattern" "$source_file" || continue
+        if [[ -e "${source_file}.yub-wpanel.bak" ]] || [[ -L "${source_file}.yub-wpanel.bak" ]]; then
+            log_error "发现旧的 APT 源备份，拒绝覆盖: ${source_file}.yub-wpanel.bak"
         fi
-        sed -i -E '/^[[:space:]]*deb(-src)?[[:space:]].*(\/debian-security|\/debian([[:space:]\/]|$)|deb\.debian\.org|security\.debian\.org)/ s/^/# disabled by YUB WPanel: /' "$source_file"
+        cp -- "$source_file" "${source_file}.yub-wpanel.bak"
+        APT_SOURCES_MUTATED=true
+        sed -i -E "\@${source_pattern}@ s@^@# disabled by YUB WPanel: @" "$source_file"
     done
+}
+
+backup_default_debian_sources() {
+    backup_default_distribution_sources \
+        /etc/apt/sources.list.d/debian.sources \
+        '^[[:space:]]*deb(-src)?[[:space:]].*(/debian-security|/debian([[:space:]/]|$)|deb\.debian\.org|security\.debian\.org)'
 }
 
 write_debian_sources() {
     local codename="$1"
 
+    assert_managed_source_target /etc/apt/sources.list.d/yub-wpanel-debian.sources
     cat > /etc/apt/sources.list.d/yub-wpanel-debian.sources << DEBIANSOURCESEOF
+# Managed by YUB WPanel
 Types: deb
 URIs: ${DEBIAN_REPO_URL}
 Suites: ${codename} ${codename}-updates
@@ -1304,9 +1387,10 @@ Suites: ${codename}-security
 Components: main contrib non-free non-free-firmware
 Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
 DEBIANSOURCESEOF
+    APT_SOURCES_MUTATED=true
 }
 
-debian_packages_available() {
+base_packages_available() {
     local packages=(ca-certificates wget curl gnupg lsb-release iproute2 nginx mariadb-server redis-server)
     local pkg=""
 
@@ -1328,7 +1412,7 @@ configure_debian_source() {
     log_info "尝试 Debian 源: ${DEBIAN_SOURCE_LABEL}"
     write_debian_sources "$codename"
 
-    if apt-get update > "$apt_log" 2>&1 && debian_packages_available; then
+    if apt-get update > "$apt_log" 2>&1 && base_packages_available; then
         rm -f "$apt_log"
         log_info "Debian 源可用: ${DEBIAN_SOURCE_LABEL}"
         return 0
@@ -1353,7 +1437,7 @@ select_debian_source() {
     else
         log_info "使用系统默认 Debian APT 源"
         apt-get update
-        debian_packages_available || log_error "系统默认 APT 源缺少关键包，请检查 /etc/apt/sources.list 或 /etc/apt/sources.list.d/"
+        base_packages_available || log_error "系统默认 APT 源缺少关键包，请检查 /etc/apt/sources.list 或 /etc/apt/sources.list.d/"
         return 0
     fi
 
@@ -1367,6 +1451,116 @@ select_debian_source() {
     done
 
     log_error "所有 Debian APT 源均不可用。请检查网络、DNS、系统时间，或手动配置可用镜像源后重试。"
+}
+
+set_ubuntu_source_meta() {
+    local source_id="$1"
+    local mirror_path="ubuntu"
+
+    [[ "$PLATFORM_ARCH" == "arm64" ]] && mirror_path="ubuntu-ports"
+    case "$source_id" in
+        ustc)
+            UBUNTU_SOURCE_LABEL="中科大 Ubuntu 镜像"
+            UBUNTU_REPO_URL="https://mirrors.ustc.edu.cn/${mirror_path}"
+            UBUNTU_SECURITY_URL="$UBUNTU_REPO_URL"
+            ;;
+        tuna)
+            UBUNTU_SOURCE_LABEL="清华大学 Ubuntu 镜像"
+            UBUNTU_REPO_URL="https://mirrors.tuna.tsinghua.edu.cn/${mirror_path}"
+            UBUNTU_SECURITY_URL="$UBUNTU_REPO_URL"
+            ;;
+        official)
+            UBUNTU_SOURCE_LABEL="Ubuntu 官方源"
+            if [[ "$PLATFORM_ARCH" == "arm64" ]]; then
+                UBUNTU_REPO_URL="https://ports.ubuntu.com/ubuntu-ports"
+                UBUNTU_SECURITY_URL="$UBUNTU_REPO_URL"
+            else
+                UBUNTU_REPO_URL="https://archive.ubuntu.com/ubuntu"
+                UBUNTU_SECURITY_URL="https://security.ubuntu.com/ubuntu"
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+backup_default_ubuntu_sources() {
+    backup_default_distribution_sources \
+        /etc/apt/sources.list.d/ubuntu.sources \
+        '^[[:space:]]*deb(-src)?[[:space:]].*(archive\.ubuntu\.com|security\.ubuntu\.com|ports\.ubuntu\.com|/ubuntu([[:space:]/]|$)|/ubuntu-ports([[:space:]/]|$))'
+}
+
+write_ubuntu_sources() {
+    local codename="$1"
+
+    assert_managed_source_target /etc/apt/sources.list.d/yub-wpanel-ubuntu.sources
+    cat > /etc/apt/sources.list.d/yub-wpanel-ubuntu.sources << UBUNTUSOURCESEOF
+# Managed by YUB WPanel
+Types: deb
+URIs: ${UBUNTU_REPO_URL}
+Suites: ${codename} ${codename}-updates ${codename}-backports
+Components: main universe restricted multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+URIs: ${UBUNTU_SECURITY_URL}
+Suites: ${codename}-security
+Components: main universe restricted multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+UBUNTUSOURCESEOF
+    APT_SOURCES_MUTATED=true
+}
+
+configure_ubuntu_source() {
+    local source_id="$1"
+    local codename="$2"
+    local apt_log="$INSTALL_WORKDIR/ubuntu-apt-update.log"
+
+    set_ubuntu_source_meta "$source_id" || return 1
+    log_info "尝试 Ubuntu 源: ${UBUNTU_SOURCE_LABEL}"
+    write_ubuntu_sources "$codename"
+    if apt-get update > "$apt_log" 2>&1 && base_packages_available && \
+       php_package_available php8.3-cli && php_package_available php8.3-fpm; then
+        rm -f "$apt_log"
+        log_info "Ubuntu 源可用: ${UBUNTU_SOURCE_LABEL}"
+        return 0
+    fi
+    log_warn "${UBUNTU_SOURCE_LABEL} 不可用或同步不完整，准备尝试下一个 Ubuntu 源"
+    [[ ! -f "$apt_log" ]] || tail -n 8 "$apt_log" 2>/dev/null || true
+    rm -f "$apt_log"
+    return 1
+}
+
+select_ubuntu_source() {
+    local codename="$1"
+    local candidates=()
+    local source_id=""
+
+    if $PREFER_CN; then
+        candidates=(ustc tuna official)
+        backup_default_ubuntu_sources
+    else
+        log_info "使用系统默认 Ubuntu APT 源"
+        apt-get update
+        base_packages_available || log_error "系统默认 Ubuntu APT 源缺少关键系统包"
+        php_package_available php8.3-cli && php_package_available php8.3-fpm || \
+            log_error "系统默认 Ubuntu APT 源缺少 PHP 8.3；请确认 noble 的 main/universe 仓库已启用"
+        return 0
+    fi
+    for source_id in "${candidates[@]}"; do
+        if configure_ubuntu_source "$source_id" "$codename"; then
+            [[ "$source_id" != "official" ]] || log_warn "国内镜像不可用，已回退 Ubuntu 官方源"
+            return 0
+        fi
+    done
+    log_error "所有 Ubuntu APT 源均不可用。请检查网络、DNS、系统时间，或恢复系统源后重试。"
+}
+
+select_platform_source() {
+    case "$PLATFORM_ID" in
+        debian) select_debian_source "$PLATFORM_CODENAME" ;;
+        ubuntu) select_ubuntu_source "$PLATFORM_CODENAME" ;;
+        *) log_error "内部错误：未知平台 ${PLATFORM_ID:-empty}" ;;
+    esac
 }
 
 configure_php_source() {
@@ -1420,13 +1614,16 @@ configure_php_source() {
         return 1
     }
 
-    cat > /etc/apt/sources.list.d/php.sources << PHPSOURCESEOF
+    assert_managed_source_target /etc/apt/sources.list.d/yub-wpanel-php.sources
+    cat > /etc/apt/sources.list.d/yub-wpanel-php.sources << PHPSOURCESEOF
+# Managed by YUB WPanel
 Types: deb
 URIs: ${PHP_REPO_URL}
 Suites: ${codename}
 Components: main
 Signed-By: ${keyring_file}
 PHPSOURCESEOF
+    APT_SOURCES_MUTATED=true
 
     if apt-get update > "$apt_log" 2>&1 && \
         php_package_available php8.3-cli && \
@@ -1447,6 +1644,14 @@ PHPSOURCESEOF
 select_php_source() {
     local codename="$1"
     local candidates=()
+    local source_id=""
+
+    if [[ "$PLATFORM_ID" == "ubuntu" ]]; then
+        php_package_available php8.3-cli && php_package_available php8.3-fpm || \
+            log_error "Ubuntu 24.04 系统源缺少 PHP 8.3 软件包"
+        log_info "Ubuntu 24.04 使用系统原生 PHP 8.3 软件包，不添加 Debian Sury 源"
+        return 0
+    fi
 
     case "$PHP_SOURCE_MODE" in
         auto|"")
@@ -1472,6 +1677,44 @@ select_php_source() {
     done
 
     log_error "所有 PHP 8.3 源均不可用。请检查网络、DNS、证书时间，或稍后重试。"
+}
+
+restore_managed_apt_sources() {
+    local original=""
+    local backup=""
+    local disabled=""
+
+    remove_managed_source_file /etc/apt/sources.list.d/yub-wpanel-debian.sources
+    remove_managed_source_file /etc/apt/sources.list.d/yub-wpanel-ubuntu.sources
+    remove_managed_source_file /etc/apt/sources.list.d/yub-wpanel-php.sources
+
+    for original in \
+        /etc/apt/sources.list.d/debian.sources \
+        /etc/apt/sources.list.d/ubuntu.sources; do
+        backup="${original}.yub-wpanel.bak"
+        disabled="${original}.yub-wpanel.disabled"
+        [[ -f "$backup" ]] || continue
+        if [[ -e "$original" ]] || [[ -L "$original" ]]; then
+            log_warn "未覆盖后来创建的 APT 源文件: $original；备份保留在 $backup"
+            continue
+        fi
+        rm -f -- "$disabled"
+        mv -- "$backup" "$original"
+    done
+
+    for backup in /etc/apt/sources.list.yub-wpanel.bak /etc/apt/sources.list.d/*.list.yub-wpanel.bak; do
+        [[ -f "$backup" ]] || continue
+        original="${backup%.yub-wpanel.bak}"
+        if [[ -f "$original" ]] && [[ ! -L "$original" ]]; then
+            sed -i 's/^# disabled by YUB WPanel: //' "$original" 2>/dev/null || true
+            rm -f -- "$backup"
+        elif [[ ! -e "$original" ]] && [[ ! -L "$original" ]]; then
+            mv -- "$backup" "$original"
+        else
+            log_warn "无法安全恢复 APT 源文件: $original；备份保留在 $backup"
+        fi
+    done
+    APT_SOURCES_MUTATED=false
 }
 
 # ============================================================
@@ -1554,6 +1797,17 @@ cleanup_yub_runtime_integrations() {
     systemctl daemon-reload 2>/dev/null || true
 }
 
+remove_managed_panel_command() {
+    local command_path="$1"
+    local ownership_marker="$2"
+
+    [[ -f "$command_path" ]] || return 0
+    [[ ! -L "$command_path" ]] || return 0
+    if head -n 5 -- "$command_path" 2>/dev/null | grep -Fqx -- "$ownership_marker"; then
+        rm -f -- "$command_path"
+    fi
+}
+
 do_uninstall() {
     echo ""
     echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -1574,10 +1828,13 @@ do_uninstall() {
 
     echo -e "  → 删除面板文件..."
     rm -f "$BIN_PATH"
-    rm -f /usr/local/bin/yubw
-    grep -qx '# YUB WPanel CLI — wp' /usr/local/bin/wp 2>/dev/null && rm -f /usr/local/bin/wp
+    remove_managed_panel_command /usr/local/bin/b '# YUB WPanel CLI — b'
+    remove_managed_panel_command /usr/local/bin/B '# YUB WPanel CLI — b'
+    remove_managed_panel_command /usr/local/bin/yubw '# YUB WPanel CLI — yubw'
+    remove_managed_panel_command /usr/local/bin/wp '# YUB WPanel CLI — wp'
     rm -rf "$INSTALL_DIR"
     rm -rf -- "$LICENSE_DOC_DIR"
+    restore_managed_apt_sources
     echo -e "  ${GREEN}✓${NC} 面板文件已删除"
 
     echo -e "  → 重新加载 Nginx..."
@@ -1653,10 +1910,13 @@ do_purge() {
 
     echo -e "  → 删除面板文件..."
     rm -f "$BIN_PATH"
-    rm -f /usr/local/bin/yubw
-    grep -qx '# YUB WPanel CLI — wp' /usr/local/bin/wp 2>/dev/null && rm -f /usr/local/bin/wp
+    remove_managed_panel_command /usr/local/bin/b '# YUB WPanel CLI — b'
+    remove_managed_panel_command /usr/local/bin/B '# YUB WPanel CLI — b'
+    remove_managed_panel_command /usr/local/bin/yubw '# YUB WPanel CLI — yubw'
+    remove_managed_panel_command /usr/local/bin/wp '# YUB WPanel CLI — wp'
     rm -rf "$INSTALL_DIR"
     rm -rf -- "$LICENSE_DOC_DIR"
+    restore_managed_apt_sources
     echo -e "  ${GREEN}✓${NC} 面板文件已删除"
 
     echo -e "  → 删除网站数据..."
@@ -1683,11 +1943,16 @@ if [[ $EUID -ne 0 ]]; then
     log_error "请使用 root 权限运行此脚本"
 fi
 assert_supported_platform
+if $CHECK_PLATFORM_ONLY; then
+    log_info "平台检查通过: ${PLATFORM_ID} ${PLATFORM_VERSION} (${PLATFORM_CODENAME}) ${PLATFORM_ARCH}"
+    trap - EXIT
+    exit 0
+fi
 init_install_workdir
 prepare_panel_candidate
 exec 9>/run/lock/yub-wpanel-install.lock
 flock -n 9 || log_error "另一个 YUB WPanel 安装或 repair 进程正在运行"
-log_info "权限、Debian 13 amd64 平台与发布包安全预检通过"
+log_info "权限、${PLATFORM_ID} ${PLATFORM_VERSION} ${PLATFORM_ARCH} 平台与发布包安全预检通过"
 
 # ============================================================
 # 重复安装/残留安装检测
@@ -1791,6 +2056,8 @@ elif $INSTALL_TRACES; then
         esac
     fi
 fi
+
+assert_panel_command_paths_available
 
 if $REPAIR_MODE; then
     prepare_panel_candidate
@@ -1904,27 +2171,17 @@ fi
 # ============================================================
 log_info "配置 APT 源..."
 export DEBIAN_FRONTEND=noninteractive
-DEBIAN_CODENAME=""
-if command -v lsb_release &>/dev/null; then
-    DEBIAN_CODENAME=$(lsb_release -sc 2>/dev/null || true)
-fi
-if [[ -z "$DEBIAN_CODENAME" ]] && [[ -f /etc/os-release ]]; then
-    DEBIAN_CODENAME=$(grep '^VERSION_CODENAME=' /etc/os-release 2>/dev/null | cut -d= -f2 || true)
-fi
-if [[ -z "$DEBIAN_CODENAME" ]]; then
-    log_error "无法识别 Debian 版本代号"
-fi
-log_info "Debian 版本: ${DEBIAN_CODENAME}"
+log_info "检测到平台: ${PLATFORM_ID} ${PLATFORM_VERSION} (${PLATFORM_CODENAME}) ${PLATFORM_ARCH}"
 
-# 国内模式会优先选择 Debian 镜像，并同时覆盖 debian-security / debian-updates。
+# 国内模式会优先选择对应发行版镜像，并同时覆盖 updates / security。
 if ! $REPAIR_MODE; then
-select_debian_source "$DEBIAN_CODENAME"
+select_platform_source
 
 # 安装基础依赖
 apt-get install -y curl wget unzip ca-certificates gnupg lsb-release
 
-# PHP 8.3 源单独做多重兜底，国内模式优先中科大 / 上交镜像。
-select_php_source "$DEBIAN_CODENAME"
+# Debian 13 使用校验后安装的 Sury keyring；Ubuntu 24.04 使用原生 PHP 8.3。
+select_php_source "$PLATFORM_CODENAME"
 
 # ============================================================
 # 安装基础组件
@@ -2498,12 +2755,13 @@ echo -e "  面板程序 / Panel binary: /usr/local/bin/yub-wpanel"
 echo -e "  面板数据 / Panel data:   /www/server/panel/"
 echo -e "  SSL 证书 / SSL certs:    ${CERT_DIR}/"
 echo ""
-echo -e "${BOLD}面板 CLI (yubw):${NC}"
-echo -e "  yubw              查看面板信息 / Show panel info"
-echo -e "  yubw restart      重启面板 / Restart panel"
-echo -e "  yubw password     一键重置管理员密码 / Reset admin password"
-echo -e "  yubw unban        一键清空所有IP封禁 / Clear all IP bans"
-echo -e "  yubw status       查看运行状态 / Show runtime status"
+echo -e "${BOLD}面板 CLI (b / B):${NC}"
+echo -e "  b              查看面板信息 / Show panel info"
+echo -e "  b restart      重启面板 / Restart panel"
+echo -e "  b password     一键重置管理员密码 / Reset admin password"
+echo -e "  b unban        一键清空所有IP封禁 / Clear all IP bans"
+echo -e "  b status       查看运行状态 / Show runtime status"
+echo -e "  大写 B 与小写 b 完全兼容 / Uppercase B is fully equivalent to lowercase b"
 echo ""
 if ! $REPAIR_MODE; then
     echo -e "${YELLOW}请立即保存以上凭据，此信息仅显示一次${NC}"

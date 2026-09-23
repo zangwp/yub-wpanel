@@ -349,7 +349,7 @@ func main() {
 	log.Println("Nginx 日志 map 配置已就绪")
 	log.Println("FastCGI 缓存配置已就绪")
 	log.Println("Fail2ban 配置初始化完成")
-	executor.EnsureWPCommand()
+	executor.EnsurePanelCommands()
 	// 远程备份密码认证依赖 sshpass；启动路径只提示，不自动修改服务器软件状态。
 	if _, err := exec.LookPath("sshpass"); err != nil {
 		log.Println("sshpass 未安装，远程备份密码认证功能不可用；请通过安装脚本或包管理器手动安装")

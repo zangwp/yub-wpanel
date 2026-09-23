@@ -156,6 +156,38 @@ func TestUninstallCleanupUsesExactYUBOwnedResources(t *testing.T) {
 	}
 }
 
+func TestPanelCommandMigrationProtectsUnrelatedOneCharacterCommands(t *testing.T) {
+	script := readUninstallSafetyScript(t)
+	for _, required := range []string{
+		"assert_panel_command_paths_available() {",
+		"for command_path in /usr/local/bin/b /usr/local/bin/B",
+		"# YUB WPanel CLI — b",
+		"命令路径 ${command_path} 已被非 YUB WPanel 文件占用",
+		"remove_managed_panel_command() {",
+		"remove_managed_panel_command /usr/local/bin/b '# YUB WPanel CLI — b'",
+		"remove_managed_panel_command /usr/local/bin/B '# YUB WPanel CLI — b'",
+		"remove_managed_panel_command /usr/local/bin/yubw '# YUB WPanel CLI — yubw'",
+		"remove_managed_panel_command /usr/local/bin/wp '# YUB WPanel CLI — wp'",
+		"面板 CLI (b / B)",
+	} {
+		if !strings.Contains(script, required) {
+			t.Errorf("installer is missing panel command migration control %q", required)
+		}
+	}
+	if got := strings.Count(script, "\nassert_panel_command_paths_available\n"); got != 1 {
+		t.Fatalf("panel command collision guard call count = %d, want 1", got)
+	}
+	for _, forbidden := range []string{
+		"rm -f /usr/local/bin/b",
+		"rm -f /usr/local/bin/B",
+		"rm -f /usr/local/bin/yubw",
+	} {
+		if strings.Contains(script, forbidden) {
+			t.Errorf("installer contains unguarded panel command deletion %q", forbidden)
+		}
+	}
+}
+
 func TestExactPurgeConfirmationRejectsNearMisses(t *testing.T) {
 	bash, err := exec.LookPath("bash")
 	if err != nil {
