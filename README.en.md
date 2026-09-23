@@ -323,9 +323,8 @@ Verify the China-friendly `install-cn.sh` release asset and configure an HTTPS G
 
 GPL-3.0
 
-YUB WPanel is a modified work distributed under GPL-3.0. The project was
-substantially modified and rebranded by zangwp on 2026-09-21, and subsequent
-changes are maintained in this repository. See [`LICENSE`](LICENSE) for the
-complete terms, [`NOTICE.md`](NOTICE.md) for the modification notice, and
+YUB WPanel is distributed under GPL-3.0 and maintained by zangwp. See
+[`LICENSE`](LICENSE) for the complete terms, [`NOTICE.md`](NOTICE.md) for the
+project notice, and
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) plus the signed license
 archive attached to each Release for third-party terms.

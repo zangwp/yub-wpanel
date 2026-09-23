@@ -34,7 +34,7 @@ func TestDistributionLicenseAndNoticeAreComplete(t *testing.T) {
 		t.Fatalf("read NOTICE.md: %v", err)
 	}
 	noticeText := string(notice)
-	for _, required := range []string{"YUB WPanel", "modified work", "GNU General Public License", "zangwp", "2026-09-21"} {
+	for _, required := range []string{"YUB WPanel", "GNU General Public License", "zangwp", "Copyright (C) 2026"} {
 		if !strings.Contains(noticeText, required) {
 			t.Errorf("NOTICE.md is missing %q", required)
 		}

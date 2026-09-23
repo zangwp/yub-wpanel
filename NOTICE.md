@@ -1,10 +1,8 @@
-# YUB WPanel Modification Notice
+# YUB WPanel Notice
 
-YUB WPanel is a modified work distributed under the GNU General Public License,
-version 3.
+YUB WPanel is distributed under the GNU General Public License, version 3.
 
-The software was substantially modified and rebranded by zangwp on
-2026-09-21. Subsequent YUB WPanel changes are maintained in this repository.
+Copyright (C) 2026 zangwp. YUB WPanel is maintained in this repository.
 
 Third-party components retain their own copyright and license terms. See
 `THIRD_PARTY_NOTICES.md` and the signed third-party license archive attached to

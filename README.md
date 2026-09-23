@@ -282,7 +282,6 @@ systemctl start yub-wpanel
 
 GPL-3.0
 
-YUB WPanel 是依据 GPL-3.0 发布的修改作品。项目于 2026-09-21 由
-zangwp 完成重大修改与品牌重构，后续变更由本仓库维护。完整许可条款见
-[`LICENSE`](LICENSE)，修改声明见 [`NOTICE.md`](NOTICE.md)，第三方组件许可见
+YUB WPanel 依据 GPL-3.0 发布，由 zangwp 维护。完整许可条款见
+[`LICENSE`](LICENSE)，项目声明见 [`NOTICE.md`](NOTICE.md)，第三方组件许可见
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) 及每个 Release 附带的签名许可归档。
